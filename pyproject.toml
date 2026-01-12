@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "orchestrator-b"
 version = "0.1.0"
@@ -10,6 +14,9 @@ dependencies = [
 
 [project.scripts]
 orchestrator-b = "src.main:main"
+
+[tool.setuptools]
+packages = ["src", "src.adapters", "src.artifacts", "src.gates", "src.utils"]
 
 [tool.ruff]
 line-length = 100
