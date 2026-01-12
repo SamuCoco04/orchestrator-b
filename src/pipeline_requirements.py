@@ -102,6 +102,13 @@ class RequirementsPipeline:
         response = adapter.complete(full_prompt)
         write_text(raw_path, response.raw_text)
         parsed = extract_json(response.raw_text)
+        if schema_name == "normalized_requirements.schema.json" and isinstance(parsed, dict):
+            if "requirements" not in parsed and {"id", "text", "priority"}.issubset(parsed.keys()):
+                parsed = {
+                    "requirements": [parsed],
+                    "assumptions": [],
+                    "constraints": [],
+                }
         if schema_name:
             schema = self._load_schema(schema_name)
             validate(instance=parsed, schema=schema)
