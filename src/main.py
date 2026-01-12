@@ -8,6 +8,21 @@ from src.pipeline_code import CodePipeline
 from src.utils.io import write_text
 from src.utils.time import utc_timestamp
 
+DEFAULT_BRIEF_TEMPLATE = """# Project Brief
+
+## Goal
+Describe the outcome you want this orchestration to deliver.
+
+## Scope
+List in-scope and out-of-scope items.
+
+## Constraints
+List technical, timing, and compliance constraints.
+
+## Success Criteria
+Define measurable success criteria.
+"""
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orchestrator B")
@@ -31,6 +46,12 @@ def main() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
     brief_path = Path(args.brief)
+    if not brief_path.exists():
+        write_text(brief_path, DEFAULT_BRIEF_TEMPLATE)
+        print(
+            f"Brief template created at {brief_path}. Please edit it with project details."
+        )
+
     write_text(inputs_dir / "brief.md", brief_path.read_text(encoding="utf-8"))
 
     architecture = ArchitecturePipeline(args.mode, base_dir)
