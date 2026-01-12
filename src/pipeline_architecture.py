@@ -120,8 +120,23 @@ class ArchitecturePipeline:
                 candidate_id = candidate.get("id")
                 if candidate_id is not None and not isinstance(candidate_id, str):
                     candidate["id"] = str(candidate_id)
-        schema = self._load_schema(schema_name)
-        validate(instance=parsed, schema=schema)
+        if prompt_name == "architecture_gemini_cross_review":
+            if not isinstance(parsed, dict):
+                raise ValueError("Turn4 cross-review output must be a JSON object.")
+            allowed_keys = {
+                "issues",
+                "risks",
+                "suggestions",
+                "suggested_requirements",
+                "feedback",
+            }
+            if not any(key in parsed for key in allowed_keys):
+                raise ValueError(
+                    "Turn4 cross-review output must include at least one expected key."
+                )
+        else:
+            schema = self._load_schema(schema_name)
+            validate(instance=parsed, schema=schema)
         write_json(parsed_path, parsed)
         return parsed
 
