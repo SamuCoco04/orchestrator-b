@@ -129,10 +129,16 @@ class ArchitecturePipeline:
                 "suggestions",
                 "suggested_requirements",
                 "feedback",
+                "review",
+                "findings",
+                "normalized_requirements",
+                "requirements",
             }
             if not any(key in parsed for key in allowed_keys):
+                keys = ", ".join(sorted(parsed.keys()))
                 raise ValueError(
-                    "Turn4 cross-review output must include at least one expected key."
+                    "Turn4 cross-review output must include at least one expected key. "
+                    f"Found keys: {keys}"
                 )
         else:
             schema = self._load_schema(schema_name)
