@@ -13,6 +13,12 @@ quality gates, and reproducible artifacts.
 python -m src.main --mode mock --brief path/to/brief.md
 ```
 
+Windows setup helper:
+
+```powershell
+scripts\setup.ps1
+```
+
 This creates a new run directory under `runs/<run_id>/` with raw LLM outputs, parsed JSON,
 artifacts, and quality gate logs.
 
