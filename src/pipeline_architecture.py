@@ -114,6 +114,12 @@ class ArchitecturePipeline:
         response = adapter.complete(full_prompt)
         write_text(raw_path, response.raw_text)
         parsed = extract_json(response.raw_text)
+        if schema_name == "architecture_candidates.schema.json":
+            # Normalize candidate IDs to strings to satisfy strict schema requirements.
+            for candidate in parsed.get("candidates", []):
+                candidate_id = candidate.get("id")
+                if candidate_id is not None and not isinstance(candidate_id, str):
+                    candidate["id"] = str(candidate_id)
         schema = self._load_schema(schema_name)
         validate(instance=parsed, schema=schema)
         write_json(parsed_path, parsed)
