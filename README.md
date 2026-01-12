@@ -29,11 +29,17 @@ Create a `.env` file in the repository root (you can copy `.env.example`) and ad
 - `OPENAI_API_KEY`: Create one at https://platform.openai.com/account/api-keys
 - `GEMINI_API_KEY`: Create one at https://aistudio.google.com/app/apikey
 
-Then run:
+Then run the requirements pipeline:
 
 ```bash
 python -m src.main --pipeline requirements --mode live --brief brief.md
 ```
+
+Evidence locations for requirements runs:
+- Raw prompts: `runs/<run_id>/raw/*_prompt.txt`
+- Raw responses: `runs/<run_id>/raw/*_response.txt`
+- Parsed artifacts: `runs/<run_id>/artifacts/*.json`
+- ADRs: `runs/<run_id>/artifacts/adrs/ADR-XX.md`
 
 You can also adjust generation controls:
 
@@ -52,6 +58,8 @@ python -m src.main --pipeline requirements --mode live --brief brief.md
 Outputs:
 - `runs/<run_id>/artifacts/requirements.md`
 - `runs/<run_id>/artifacts/requirements.json`
+- `runs/<run_id>/artifacts/requirements_review.json`
+- `runs/<run_id>/artifacts/turnr2_gemini_cross_review.json`
 - `runs/<run_id>/artifacts/adrs/ADR-XX.md`
 
 ### Architecture pipeline
