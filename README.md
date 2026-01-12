@@ -10,7 +10,7 @@ quality gates, and reproducible artifacts.
 ## Quick start (mock mode)
 
 ```bash
-python -m src.main --mode mock --brief path/to/brief.md
+python -m src.main --pipeline requirements --mode mock --brief path/to/brief.md
 ```
 
 Windows setup helper:
@@ -32,14 +32,56 @@ Create a `.env` file in the repository root (you can copy `.env.example`) and ad
 Then run:
 
 ```bash
-python -m src.main --mode live --brief brief.md
+python -m src.main --pipeline requirements --mode live --brief brief.md
 ```
 
 You can also adjust generation controls:
 
 ```bash
-python -m src.main --mode live --brief brief.md --max-output-tokens 800 --temperature 0.2
+python -m src.main --pipeline requirements --mode live --brief brief.md --max-output-tokens 800 --temperature 0.2
 ```
+
+## Pipelines
+
+### Requirements pipeline
+
+```bash
+python -m src.main --pipeline requirements --mode live --brief brief.md
+```
+
+Outputs:
+- `runs/<run_id>/artifacts/requirements.md`
+- `runs/<run_id>/artifacts/requirements.json`
+- `runs/<run_id>/artifacts/adrs/ADR-XX.md`
+
+### Architecture pipeline
+
+```bash
+python -m src.main --pipeline architecture --mode live --brief brief.md
+```
+
+Outputs:
+- `runs/<run_id>/artifacts/decision_matrix.csv`
+- `runs/<run_id>/artifacts/architecture_summary.md`
+- `runs/<run_id>/artifacts/adrs/ADR-XX.md`
+
+### Code pipeline
+
+```bash
+python -m src.main --pipeline code --mode live --brief brief.md --gate-cmd "pytest -q"
+```
+
+Load requirements/architecture from a previous run:
+
+```bash
+python -m src.main --pipeline code --mode live --brief brief.md --inputs-from-run <run_id>
+```
+
+Outputs:
+- `runs/<run_id>/artifacts/turnc1_code_tasks.json`
+- `runs/<run_id>/artifacts/audit_report.json`
+- `runs/<run_id>/artifacts/audit_report_chatgpt.json`
+- `runs/<run_id>/quality_gates/*.log`
 
 ## Real provider setup
 

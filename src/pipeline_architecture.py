@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 
 from jsonschema import validate
 
@@ -81,9 +81,12 @@ class ArchitecturePipeline:
             artifacts_dir / "turn5_adr.json",
         )
 
-        write_requirements(artifacts_dir / "requirements.md", cross_review)
+        write_requirements(artifacts_dir / "requirements.md", normalized)
         write_decision_matrix(artifacts_dir / "decision_matrix.csv", candidates, scoring)
         write_adr(adrs_dir / f"{adr['adr_id']}.md", adr)
+        self._write_architecture_summary(
+            artifacts_dir / "architecture_summary.md", candidates, scoring
+        )
 
         return {
             "candidates": candidates,
@@ -145,6 +148,40 @@ class ArchitecturePipeline:
             validate(instance=parsed, schema=schema)
         write_json(parsed_path, parsed)
         return parsed
+
+    def _write_architecture_summary(
+        self, path: Path, candidates: Dict, scoring: Dict
+    ) -> None:
+        score_map = {item["candidate_id"]: item for item in scoring.get("scores", [])}
+        ordered: List[dict] = sorted(
+            candidates.get("candidates", []),
+            key=lambda item: score_map.get(item["id"], {}).get("total_score", 0),
+            reverse=True,
+        )
+        lines = ["# Architecture Summary", ""]
+        for index, candidate in enumerate(ordered, start=1):
+            score = score_map.get(candidate["id"], {})
+            total = score.get("total_score", "n/a")
+            lines.extend(
+                [
+                    f"## {index}. {candidate['name']} ({candidate['id']})",
+                    "",
+                    candidate.get("summary", ""),
+                    "",
+                    f"Total score: {total}",
+                    "",
+                    "### Pros",
+                    *[f"- {item}" for item in candidate.get("pros", [])],
+                    "",
+                    "### Cons",
+                    *[f"- {item}" for item in candidate.get("cons", [])],
+                    "",
+                    "### Risks",
+                    *[f"- {item}" for item in candidate.get("risks", [])],
+                    "",
+                ]
+            )
+        write_text(path, "\n".join(lines).strip() + "\n")
 
     def _load_schema(self, name: str) -> Dict:
         return json.loads(read_text(self.schemas_dir / name))

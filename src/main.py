@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from src.pipeline_architecture import ArchitecturePipeline
 from src.pipeline_code import CodePipeline
+from src.pipeline_requirements import RequirementsPipeline
 from src.utils.io import write_text
 from src.utils.time import utc_timestamp
 
@@ -29,9 +30,11 @@ Define measurable success criteria.
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orchestrator B")
+    parser.add_argument("--pipeline", choices=["requirements", "architecture", "code"], default="requirements")
     parser.add_argument("--mode", choices=["mock", "live"], required=True)
     parser.add_argument("--brief", required=True)
     parser.add_argument("--gate-cmd", action="append", default=[], help="Quality gate command")
+    parser.add_argument("--inputs-from-run", help="Load inputs from a previous run ID")
     parser.add_argument("--max-output-tokens", type=int, default=800)
     parser.add_argument("--temperature", type=float, default=0.2)
     return parser
@@ -80,11 +83,15 @@ def main() -> None:
 
     write_text(inputs_dir / "brief.md", brief_path.read_text(encoding="utf-8"))
 
-    architecture = ArchitecturePipeline(args.mode, base_dir)
-    architecture.run(brief_path, run_dir)
-
-    code_pipeline = CodePipeline(args.mode, base_dir)
-    code_pipeline.run(run_dir, args.gate_cmd)
+    if args.pipeline == "requirements":
+        pipeline = RequirementsPipeline(args.mode, base_dir)
+        pipeline.run(brief_path, run_dir)
+    elif args.pipeline == "architecture":
+        pipeline = ArchitecturePipeline(args.mode, base_dir)
+        pipeline.run(brief_path, run_dir)
+    else:
+        pipeline = CodePipeline(args.mode, base_dir)
+        pipeline.run(run_dir, args.gate_cmd, brief_path, args.inputs_from_run)
 
 
 if __name__ == "__main__":
