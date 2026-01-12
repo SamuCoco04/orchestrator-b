@@ -110,17 +110,49 @@ class RequirementsPipeline:
         return OpenAIAdapter()
 
     def _parse_lead_output(self, raw_text: str) -> Tuple[Dict, Dict]:
-        match = re.search(
-            r"REVIEW_JSON:\s*(\{.*?\})\s*REQUIREMENTS_JSON:\s*(\{.*\})",
-            raw_text,
-            flags=re.DOTALL,
+        label_pattern = (
+            r"REVIEW_JSON\s*:?[\r\n]+(.*?)"
+            r"REQUIREMENTS_JSON\s*:?[\r\n]+(.*)"
         )
-        if not match:
-            raise ValueError("Lead output must include REVIEW_JSON and REQUIREMENTS_JSON blocks.")
-        review_text, requirements_text = match.groups()
-        review_json = extract_json(review_text)
-        requirements_json = extract_json(requirements_text)
-        return review_json, requirements_json
+        match = re.search(label_pattern, raw_text, flags=re.DOTALL | re.IGNORECASE)
+        if match:
+            review_text, requirements_text = match.groups()
+            review_json = extract_json(review_text)
+            requirements_json = extract_json(requirements_text)
+            return review_json, requirements_json
+
+        decoder = json.JSONDecoder()
+        found: list[dict] = []
+        keys_seen: list[list[str]] = []
+        idx = 0
+        while idx < len(raw_text) and len(found) < 2:
+            start = self._find_next_json_start(raw_text, idx)
+            if start == -1:
+                break
+            try:
+                parsed, end = decoder.raw_decode(raw_text[start:])
+                found.append(parsed)
+                if isinstance(parsed, dict):
+                    keys_seen.append(sorted(parsed.keys()))
+                idx = start + end
+            except json.JSONDecodeError:
+                idx = start + 1
+
+        if len(found) >= 2:
+            return found[0], found[1]
+
+        snippet = raw_text.strip().replace("\n", " ")
+        snippet = (snippet[:300] + "...") if len(snippet) > 300 else snippet
+        raise ValueError(
+            "Lead output must include REVIEW_JSON and REQUIREMENTS_JSON blocks. "
+            f"Detected JSON keys: {keys_seen}. Snippet: {snippet}"
+        )
+
+    def _find_next_json_start(self, text: str, start: int) -> int:
+        for idx in range(start, len(text)):
+            if text[idx] in "{[":
+                return idx
+        return -1
 
     def _write_usage(self, path: Path, response: LLMResponse) -> None:
         usage = getattr(response, "usage", None)
