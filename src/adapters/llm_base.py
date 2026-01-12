@@ -10,5 +10,8 @@ class LLMResponse:
 
 
 class LLMAdapter(Protocol):
-    def complete(self, prompt: str) -> LLMResponse:
+    def generate(self, prompt: str) -> str:
         raise NotImplementedError
+
+    def complete(self, prompt: str) -> LLMResponse:
+        return LLMResponse(raw_text=self.generate(prompt))

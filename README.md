@@ -22,6 +22,25 @@ scripts\setup.ps1
 This creates a new run directory under `runs/<run_id>/` with raw LLM outputs, parsed JSON,
 artifacts, and quality gate logs.
 
+## Live mode setup
+
+Create a `.env` file in the repository root (you can copy `.env.example`) and add:
+
+- `OPENAI_API_KEY`: Create one at https://platform.openai.com/account/api-keys
+- `GEMINI_API_KEY`: Create one at https://aistudio.google.com/app/apikey
+
+Then run:
+
+```bash
+python -m src.main --mode live --brief brief.md
+```
+
+You can also adjust generation controls:
+
+```bash
+python -m src.main --mode live --brief brief.md --max-output-tokens 800 --temperature 0.2
+```
+
 ## Real provider setup
 
 Set environment variables (see `.env.example`):
