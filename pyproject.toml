@@ -1,0 +1,15 @@
+[project]
+name = "orchestrator-b"
+version = "0.1.0"
+description = "Semi-automatic AI orchestration with fixed turns and quality gates"
+requires-python = ">=3.11"
+dependencies = [
+  "jsonschema>=4.22.0",
+  "pyyaml>=6.0.1",
+]
+
+[project.scripts]
+orchestrator-b = "src.main:main"
+
+[tool.ruff]
+line-length = 100
