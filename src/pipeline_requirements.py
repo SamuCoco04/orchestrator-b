@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict
 
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 
 from src.adapters.gemini_adapter import GeminiAdapter
 from src.adapters.llm_base import LLMAdapter, LLMResponse
@@ -36,42 +35,59 @@ class RequirementsPipeline:
         gemini = self._adapter("gemini")
         chatgpt = self._adapter("chatgpt")
 
-        lead_prompt = read_text(self.prompts_dir / "requirements_chatgpt_lead.md")
-        lead_full_prompt = f"{lead_prompt}\n\nINPUT:\n{brief}\n"
-        lead_prompt_path = raw_dir / "turnr1_chatgpt_lead_prompt.txt"
-        write_text(lead_prompt_path, lead_full_prompt)
-        lead_response = chatgpt.complete(lead_full_prompt)
-        lead_response_path = raw_dir / "turnr1_chatgpt_lead_response.txt"
-        write_text(lead_response_path, lead_response.raw_text)
-        self._write_usage(raw_dir / "turnr1_chatgpt_lead_usage.json", lead_response)
+        requirements_prompt = read_text(self.prompts_dir / "requirements_chatgpt_requirements.md")
+        requirements_full_prompt = f"{requirements_prompt}\n\nINPUT:\n{brief}\n"
+        requirements_prompt_path = raw_dir / "turnr1_chatgpt_requirements_prompt.txt"
+        write_text(requirements_prompt_path, requirements_full_prompt)
+        requirements_response = chatgpt.complete(requirements_full_prompt)
+        requirements_response_path = raw_dir / "turnr1_chatgpt_requirements_response.txt"
+        write_text(requirements_response_path, requirements_response.raw_text)
+        self._write_usage(raw_dir / "turnr1_chatgpt_requirements_usage.json", requirements_response)
 
-        review_json, requirements_json = self._parse_lead_output(lead_response.raw_text)
-        review_schema = self._load_schema("requirements_review.schema.json")
-        validate(instance=review_json, schema=review_schema)
+        requirements_json = extract_json(requirements_response.raw_text)
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=requirements_json, schema=requirements_schema)
-
-        write_json(artifacts_dir / "requirements_review.json", review_json)
         write_json(artifacts_dir / "requirements.json", requirements_json)
+
+        review_prompt = read_text(self.prompts_dir / "requirements_chatgpt_review.md")
+        review_payload = {"brief": brief, "requirements": requirements_json}
+        review_full_prompt = f"{review_prompt}\n\nINPUT:\n{json.dumps(review_payload)}\n"
+        review_prompt_path = raw_dir / "turnr2_chatgpt_review_prompt.txt"
+        write_text(review_prompt_path, review_full_prompt)
+        review_response = chatgpt.complete(review_full_prompt)
+        review_response_path = raw_dir / "turnr2_chatgpt_review_response.txt"
+        write_text(review_response_path, review_response.raw_text)
+        self._write_usage(raw_dir / "turnr2_chatgpt_review_usage.json", review_response)
+
+        review_json = extract_json(review_response.raw_text)
+        review_schema = self._load_schema("requirements_review.schema.json")
+        try:
+            validate(instance=review_json, schema=review_schema)
+        except ValidationError:
+            if self.mode != "mock":
+                raise
+            review_json = self._mock_review()
+            validate(instance=review_json, schema=review_schema)
+        write_json(artifacts_dir / "requirements_review.json", review_json)
 
         cross_prompt = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
         cross_payload = {
             "brief": brief,
-            "review": review_json,
             "requirements": requirements_json,
+            "review": review_json,
         }
         cross_full_prompt = f"{cross_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
-        cross_prompt_path = raw_dir / "turnr2_gemini_cross_review_prompt.txt"
+        cross_prompt_path = raw_dir / "turnr3_gemini_cross_review_prompt.txt"
         write_text(cross_prompt_path, cross_full_prompt)
         cross_response = gemini.complete(cross_full_prompt)
-        cross_response_path = raw_dir / "turnr2_gemini_cross_review_response.txt"
+        cross_response_path = raw_dir / "turnr3_gemini_cross_review_response.txt"
         write_text(cross_response_path, cross_response.raw_text)
-        self._write_usage(raw_dir / "turnr2_gemini_cross_review_usage.json", cross_response)
+        self._write_usage(raw_dir / "turnr3_gemini_cross_review_usage.json", cross_response)
 
         cross_review = extract_json(cross_response.raw_text)
         if not isinstance(cross_review, dict):
-            raise ValueError("Turn R2 cross-review output must be a JSON object.")
-        write_json(artifacts_dir / "turnr2_gemini_cross_review.json", cross_review)
+            raise ValueError("Turn R3 cross-review output must be a JSON object.")
+        write_json(artifacts_dir / "turnr3_gemini_cross_review.json", cross_review)
 
         adr_prompt = read_text(self.prompts_dir / "requirements_chatgpt_adr.md")
         adr_payload = {
@@ -80,24 +96,24 @@ class RequirementsPipeline:
             "cross_review": cross_review,
         }
         adr_full_prompt = f"{adr_prompt}\n\nINPUT:\n{json.dumps(adr_payload)}\n"
-        adr_prompt_path = raw_dir / "turnr3_chatgpt_adr_prompt.txt"
+        adr_prompt_path = raw_dir / "turnr4_chatgpt_adr_prompt.txt"
         write_text(adr_prompt_path, adr_full_prompt)
         adr_response = chatgpt.complete(adr_full_prompt)
-        adr_response_path = raw_dir / "turnr3_chatgpt_adr_response.txt"
+        adr_response_path = raw_dir / "turnr4_chatgpt_adr_response.txt"
         write_text(adr_response_path, adr_response.raw_text)
-        self._write_usage(raw_dir / "turnr3_chatgpt_adr_usage.json", adr_response)
+        self._write_usage(raw_dir / "turnr4_chatgpt_adr_usage.json", adr_response)
 
         adr = extract_json(adr_response.raw_text)
         adr_schema = self._load_schema("adr.schema.json")
         validate(instance=adr, schema=adr_schema)
-        write_json(artifacts_dir / "turnr3_chatgpt_adr.json", adr)
+        write_json(artifacts_dir / "turnr4_chatgpt_adr.json", adr)
 
         write_requirements(artifacts_dir / "requirements.md", requirements_json)
         write_adr(adrs_dir / f"{adr['adr_id']}.md", adr)
 
         return {
-            "review": review_json,
             "requirements": requirements_json,
+            "review": review_json,
             "cross_review": cross_review,
             "adr": adr,
         }
@@ -109,50 +125,14 @@ class RequirementsPipeline:
             return GeminiAdapter()
         return OpenAIAdapter()
 
-    def _parse_lead_output(self, raw_text: str) -> Tuple[Dict, Dict]:
-        label_pattern = (
-            r"REVIEW_JSON\s*:?[\r\n]+(.*?)"
-            r"REQUIREMENTS_JSON\s*:?[\r\n]+(.*)"
-        )
-        match = re.search(label_pattern, raw_text, flags=re.DOTALL | re.IGNORECASE)
-        if match:
-            review_text, requirements_text = match.groups()
-            review_json = extract_json(review_text)
-            requirements_json = extract_json(requirements_text)
-            return review_json, requirements_json
-
-        decoder = json.JSONDecoder()
-        found: list[dict] = []
-        keys_seen: list[list[str]] = []
-        idx = 0
-        while idx < len(raw_text) and len(found) < 2:
-            start = self._find_next_json_start(raw_text, idx)
-            if start == -1:
-                break
-            try:
-                parsed, end = decoder.raw_decode(raw_text[start:])
-                found.append(parsed)
-                if isinstance(parsed, dict):
-                    keys_seen.append(sorted(parsed.keys()))
-                idx = start + end
-            except json.JSONDecodeError:
-                idx = start + 1
-
-        if len(found) >= 2:
-            return found[0], found[1]
-
-        snippet = raw_text.strip().replace("\n", " ")
-        snippet = (snippet[:300] + "...") if len(snippet) > 300 else snippet
-        raise ValueError(
-            "Lead output must include REVIEW_JSON and REQUIREMENTS_JSON blocks. "
-            f"Detected JSON keys: {keys_seen}. Snippet: {snippet}"
-        )
-
-    def _find_next_json_start(self, text: str, start: int) -> int:
-        for idx in range(start, len(text)):
-            if text[idx] in "{[":
-                return idx
-        return -1
+    def _mock_review(self) -> Dict:
+        return {
+            "accepted": ["Add Erasmus Coordinator role"],
+            "rejected": [],
+            "issues": ["Clarify ownership of deadline tracking"],
+            "missing": ["Define compliance checkpoints"],
+            "rationale": ["Role clarity reduces process risk"],
+        }
 
     def _write_usage(self, path: Path, response: LLMResponse) -> None:
         usage = getattr(response, "usage", None)
