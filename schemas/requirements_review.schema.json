@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["accepted", "rejected", "issues", "missing", "rationale"],
+  "properties": {
+    "accepted": {"type": "array", "items": {"type": "string"}},
+    "rejected": {"type": "array", "items": {"type": "string"}},
+    "issues": {"type": "array", "items": {"type": "string"}},
+    "missing": {"type": "array", "items": {"type": "string"}},
+    "rationale": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}
