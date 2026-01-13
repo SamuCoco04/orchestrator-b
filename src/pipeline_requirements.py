@@ -242,6 +242,18 @@ class RequirementsPipeline:
         raise RuntimeError(f"Requirements apply step failed gates: {', '.join(failures)}")
 
     def _extract_marked_json(self, raw_text: str, marker: str, expected_keys: set[str]) -> Dict:
+        wrapper_key = marker.rstrip(":")
+        wrapper_keys: List[str] | None = None
+        try:
+            parsed_wrapper = extract_json(raw_text)
+        except Exception:
+            parsed_wrapper = None
+        if isinstance(parsed_wrapper, dict):
+            wrapper_keys = sorted(parsed_wrapper.keys())
+            candidate = parsed_wrapper.get(wrapper_key)
+            if isinstance(candidate, dict) and expected_keys.issubset(candidate.keys()):
+                return candidate
+
         match = re.search(re.escape(marker), raw_text)
         if match:
             snippet = raw_text[match.end():]
@@ -259,7 +271,12 @@ class RequirementsPipeline:
 
         snippet = raw_text.strip().replace("\n", " ")
         snippet = (snippet[:300] + "...") if len(snippet) > 300 else snippet
-        raise ValueError(f"Unable to extract JSON for marker {marker}. Snippet: {snippet}")
+        wrapper_note = ""
+        if wrapper_keys is not None:
+            wrapper_note = f" Detected wrapper JSON with keys: {wrapper_keys}."
+        raise ValueError(
+            f"Unable to extract JSON for marker {marker}.{wrapper_note} Snippet: {snippet}"
+        )
 
     def _try_parse_wrapper(self, raw_text: str) -> Dict | None:
         try:
