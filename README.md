@@ -36,10 +36,14 @@ python -m src.main --pipeline requirements --mode live --brief brief.md
 ```
 
 Evidence locations for requirements runs:
-- Raw prompts: `runs/<run_id>/raw/*_prompt.txt`
-- Raw responses: `runs/<run_id>/raw/*_response.txt`
+- Raw prompts/responses: `runs/<run_id>/raw/*.txt`
 - Parsed artifacts: `runs/<run_id>/artifacts/*.json`
 - ADRs: `runs/<run_id>/artifacts/adrs/ADR-XX.md`
+
+Requirements pipeline behavior:
+- ChatGPT produces draft requirements + review
+- Gemini cross-reviews
+- ChatGPT applies fixes with changelog and gates
 
 You can also adjust generation controls:
 
@@ -59,7 +63,7 @@ Outputs:
 - `runs/<run_id>/artifacts/requirements.md`
 - `runs/<run_id>/artifacts/requirements.json`
 - `runs/<run_id>/artifacts/requirements_review.json`
-- `runs/<run_id>/artifacts/turnr2_gemini_cross_review.json`
+- `runs/<run_id>/artifacts/turnr3_gemini_cross_review.json`
 - `runs/<run_id>/artifacts/adrs/ADR-XX.md`
 
 ### Architecture pipeline
