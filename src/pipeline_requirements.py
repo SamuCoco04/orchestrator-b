@@ -52,17 +52,33 @@ class RequirementsPipeline:
         write_text(lead_response_path, lead_response.raw_text)
         self._write_usage(raw_dir / "turnr1_chatgpt_lead_usage.json", lead_response)
 
-        review_json = self._extract_marked_json(
-            lead_response.raw_text,
-            "REVIEW_JSON:",
-            {"accepted", "rejected", "issues", "missing", "rationale"},
-        )
-        try:
-            draft_requirements = self._extract_marked_json(
+        wrapper = self._try_parse_wrapper(lead_response.raw_text)
+        wrapper_keys: List[str] | None = None
+        if wrapper is not None:
+            wrapper_keys = sorted(wrapper.keys())
+            review_json = wrapper.get("REVIEW_JSON")
+            draft_requirements = wrapper.get("REQUIREMENTS_JSON")
+        else:
+            review_json = self._extract_marked_json(
                 lead_response.raw_text,
-                "REQUIREMENTS_JSON:",
-                {"requirements", "assumptions", "constraints"},
+                "REVIEW_JSON:",
+                {"accepted", "rejected", "issues", "missing", "rationale"},
             )
+            draft_requirements = None
+
+        try:
+            if draft_requirements is None:
+                draft_requirements = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "REQUIREMENTS_JSON:",
+                    {"requirements", "assumptions", "constraints"},
+                )
+            if review_json is None:
+                review_json = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "REVIEW_JSON:",
+                    {"accepted", "rejected", "issues", "missing", "rationale"},
+                )
         except ValueError:
             retry_prompt = read_text(
                 self.prompts_dir / "requirements_lead_retry_requirements_only.md"
@@ -81,8 +97,12 @@ class RequirementsPipeline:
                     {"requirements", "assumptions", "constraints"},
                 )
             except ValueError as exc:
+                wrapper_note = ""
+                if wrapper_keys is not None:
+                    wrapper_note = f" Detected wrapper JSON with keys: {wrapper_keys}."
                 raise RuntimeError(
                     "Lead returned only REVIEW_JSON; enforce prompt format."
+                    + wrapper_note
                 ) from exc
 
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
@@ -240,6 +260,17 @@ class RequirementsPipeline:
         snippet = raw_text.strip().replace("\n", " ")
         snippet = (snippet[:300] + "...") if len(snippet) > 300 else snippet
         raise ValueError(f"Unable to extract JSON for marker {marker}. Snippet: {snippet}")
+
+    def _try_parse_wrapper(self, raw_text: str) -> Dict | None:
+        try:
+            parsed = extract_json(raw_text)
+        except Exception:
+            return None
+        if isinstance(parsed, dict) and (
+            "REVIEW_JSON" in parsed or "REQUIREMENTS_JSON" in parsed
+        ):
+            return parsed
+        return None
 
     def _match_expected_json(self, text: str, expected_keys: set[str]) -> Dict | None:
         try:
