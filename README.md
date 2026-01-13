@@ -42,6 +42,7 @@ Evidence locations for requirements runs:
 
 Requirements pipeline behavior:
 - ChatGPT produces draft requirements + review
+- If REQUIREMENTS_JSON is missing, the pipeline auto-retries once for the missing block
 - Gemini cross-reviews
 - ChatGPT applies fixes with changelog and gates
 

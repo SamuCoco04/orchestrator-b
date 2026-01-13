@@ -52,16 +52,38 @@ class RequirementsPipeline:
         write_text(lead_response_path, lead_response.raw_text)
         self._write_usage(raw_dir / "turnr1_chatgpt_lead_usage.json", lead_response)
 
-        draft_requirements = self._extract_marked_json(
-            lead_response.raw_text,
-            "REQUIREMENTS_JSON:",
-            {"requirements", "assumptions", "constraints"},
-        )
         review_json = self._extract_marked_json(
             lead_response.raw_text,
             "REVIEW_JSON:",
             {"accepted", "rejected", "issues", "missing", "rationale"},
         )
+        try:
+            draft_requirements = self._extract_marked_json(
+                lead_response.raw_text,
+                "REQUIREMENTS_JSON:",
+                {"requirements", "assumptions", "constraints"},
+            )
+        except ValueError:
+            retry_prompt = read_text(
+                self.prompts_dir / "requirements_lead_retry_requirements_only.md"
+            )
+            retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
+            retry_prompt_path = raw_dir / "turnr1_lead_retry_prompt.txt"
+            write_text(retry_prompt_path, retry_full_prompt)
+            retry_response = chatgpt.complete(retry_full_prompt)
+            retry_raw_path = raw_dir / "turnr1_lead_retry_raw.txt"
+            write_text(retry_raw_path, retry_response.raw_text)
+            self._write_usage(raw_dir / "turnr1_lead_retry_usage.json", retry_response)
+            try:
+                draft_requirements = self._extract_marked_json(
+                    retry_response.raw_text,
+                    "REQUIREMENTS_JSON:",
+                    {"requirements", "assumptions", "constraints"},
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    "Lead returned only REVIEW_JSON; enforce prompt format."
+                ) from exc
 
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
