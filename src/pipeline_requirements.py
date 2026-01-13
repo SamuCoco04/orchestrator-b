@@ -225,11 +225,36 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
-            changelog = self._extract_marked_json(
-                response.raw_text,
-                "CHANGELOG_JSON:",
-                {"splits", "replacements", "added", "removed"},
-            )
+            try:
+                changelog = self._extract_marked_json(
+                    response.raw_text,
+                    "CHANGELOG_JSON:",
+                    {"splits", "replacements", "added", "removed"},
+                )
+            except ValueError:
+                retry_prompt = read_text(
+                    self.prompts_dir / "requirements_apply_retry_changelog_only.md"
+                )
+                retry_payload = {"final_requirements": final_requirements}
+                retry_full_prompt = (
+                    f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+                )
+                retry_prompt_path = raw_dir / "turnr4_apply_changelog_retry_prompt.txt"
+                write_text(retry_prompt_path, retry_full_prompt)
+                retry_response = adapter.complete(retry_full_prompt)
+                retry_raw_path = raw_dir / "turnr4_apply_changelog_retry_raw.txt"
+                write_text(retry_raw_path, retry_response.raw_text)
+                self._write_usage(
+                    raw_dir / "turnr4_apply_changelog_retry_usage.json", retry_response
+                )
+                try:
+                    changelog = self._extract_marked_json(
+                        retry_response.raw_text,
+                        "CHANGELOG_JSON:",
+                        {"splits", "replacements", "added", "removed"},
+                    )
+                except ValueError as exc:
+                    raise RuntimeError("Missing CHANGELOG_JSON in apply output.") from exc
 
             requirements_schema = self._load_schema("normalized_requirements.schema.json")
             validate(instance=final_requirements, schema=requirements_schema)
