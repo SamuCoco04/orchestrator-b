@@ -53,9 +53,15 @@ class RequirementsPipeline:
         self._write_usage(raw_dir / "turnr1_chatgpt_lead_usage.json", lead_response)
 
         draft_requirements = self._extract_marked_json(
-            lead_response.raw_text, "REQUIREMENTS_JSON:"
+            lead_response.raw_text,
+            "REQUIREMENTS_JSON:",
+            {"requirements", "assumptions", "constraints"},
         )
-        review_json = self._extract_marked_json(lead_response.raw_text, "REVIEW_JSON:")
+        review_json = self._extract_marked_json(
+            lead_response.raw_text,
+            "REVIEW_JSON:",
+            {"accepted", "rejected", "issues", "missing", "rationale"},
+        )
 
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
@@ -173,9 +179,15 @@ class RequirementsPipeline:
             self._write_usage(raw_dir / "turnr4_apply_usage.json", response)
 
             final_requirements = self._extract_marked_json(
-                response.raw_text, "FINAL_REQUIREMENTS_JSON:"
+                response.raw_text,
+                "FINAL_REQUIREMENTS_JSON:",
+                {"requirements", "assumptions", "constraints"},
             )
-            changelog = self._extract_marked_json(response.raw_text, "CHANGELOG_JSON:")
+            changelog = self._extract_marked_json(
+                response.raw_text,
+                "CHANGELOG_JSON:",
+                {"splits", "replacements", "added", "removed"},
+            )
 
             requirements_schema = self._load_schema("normalized_requirements.schema.json")
             validate(instance=final_requirements, schema=requirements_schema)
@@ -187,12 +199,60 @@ class RequirementsPipeline:
 
         raise RuntimeError(f"Requirements apply step failed gates: {', '.join(failures)}")
 
-    def _extract_marked_json(self, raw_text: str, marker: str) -> Dict:
+    def _extract_marked_json(self, raw_text: str, marker: str, expected_keys: set[str]) -> Dict:
         match = re.search(re.escape(marker), raw_text)
-        if not match:
-            raise ValueError(f"Missing marker {marker} in lead output.")
-        snippet = raw_text[match.end():]
-        return extract_json(snippet)
+        if match:
+            snippet = raw_text[match.end():]
+            parsed = self._match_expected_json(snippet, expected_keys)
+            if parsed is not None:
+                return parsed
+
+        parsed = self._match_expected_json(raw_text, expected_keys)
+        if parsed is not None:
+            return parsed
+
+        for obj in self._scan_json_objects(raw_text):
+            if self._matches_keys(obj, expected_keys):
+                return obj
+
+        snippet = raw_text.strip().replace("\n", " ")
+        snippet = (snippet[:300] + "...") if len(snippet) > 300 else snippet
+        raise ValueError(f"Unable to extract JSON for marker {marker}. Snippet: {snippet}")
+
+    def _match_expected_json(self, text: str, expected_keys: set[str]) -> Dict | None:
+        try:
+            parsed = extract_json(text)
+        except Exception:
+            return None
+        if self._matches_keys(parsed, expected_keys):
+            return parsed
+        return None
+
+    def _scan_json_objects(self, raw_text: str) -> List[Dict]:
+        decoder = json.JSONDecoder()
+        results: List[Dict] = []
+        idx = 0
+        while idx < len(raw_text) and len(results) < 2:
+            start = self._find_next_json_start(raw_text, idx)
+            if start == -1:
+                break
+            try:
+                parsed, end = decoder.raw_decode(raw_text[start:])
+                if isinstance(parsed, dict):
+                    results.append(parsed)
+                idx = start + end
+            except json.JSONDecodeError:
+                idx = start + 1
+        return results
+
+    def _matches_keys(self, obj: object, expected_keys: set[str]) -> bool:
+        return isinstance(obj, dict) and expected_keys.issubset(set(obj.keys()))
+
+    def _find_next_json_start(self, text: str, start: int) -> int:
+        for idx in range(start, len(text)):
+            if text[idx] in "{[":
+                return idx
+        return -1
 
     def _run_gates(self, requirements: Dict, review: Dict, changelog: Dict) -> List[str]:
         failures: List[str] = []
