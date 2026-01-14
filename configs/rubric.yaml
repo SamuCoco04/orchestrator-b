@@ -1,0 +1,11 @@
+criteria:
+  - name: feasibility
+    weight: 0.3
+  - name: cost
+    weight: 0.2
+  - name: maintainability
+    weight: 0.2
+  - name: scalability
+    weight: 0.2
+  - name: security
+    weight: 0.1
