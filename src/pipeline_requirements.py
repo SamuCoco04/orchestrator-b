@@ -30,6 +30,7 @@ class RequirementsLimits:
     coverage_areas: List[str]
     min_per_area: int | None
     seed_requirements: List[str]
+    requested_artifacts: List[str]
 
 
 class RequirementsPipeline:
@@ -41,11 +42,13 @@ class RequirementsPipeline:
         self._review_normalization_warnings: List[str] = []
         self._extraction_traces: List[str] = []
         self._repair_warnings: List[Dict] = []
+        self._acceptance_warnings: List[str] = []
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
         self._extraction_traces = []
         self._repair_warnings = []
+        self._acceptance_warnings = []
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -76,6 +79,10 @@ class RequirementsPipeline:
             wrapper_keys = sorted(wrapper.keys())
             review_json = wrapper.get("REVIEW_JSON")
             draft_requirements = wrapper.get("REQUIREMENTS_JSON")
+            business_rules = wrapper.get("BUSINESS_RULES_JSON")
+            workflows = wrapper.get("WORKFLOWS_JSON")
+            domain_model = wrapper.get("DOMAIN_MODEL_JSON")
+            mvp_scope = wrapper.get("MVP_SCOPE_JSON")
         else:
             review_json = self._extract_marked_json(
                 lead_response.raw_text,
@@ -83,6 +90,10 @@ class RequirementsPipeline:
                 {"accepted", "rejected", "issues", "missing", "rationale"},
             )
             draft_requirements = None
+            business_rules = None
+            workflows = None
+            domain_model = None
+            mvp_scope = None
 
         try:
             if draft_requirements is None:
@@ -96,6 +107,30 @@ class RequirementsPipeline:
                     lead_response.raw_text,
                     "REVIEW_JSON:",
                     {"accepted", "rejected", "issues", "missing", "rationale"},
+                )
+            if self._is_requested("business_rules", limits) and business_rules is None:
+                business_rules = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "BUSINESS_RULES_JSON:",
+                    {"rules"},
+                )
+            if self._is_requested("workflows", limits) and workflows is None:
+                workflows = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "WORKFLOWS_JSON:",
+                    {"workflows"},
+                )
+            if self._is_requested("domain_model", limits) and domain_model is None:
+                domain_model = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "DOMAIN_MODEL_JSON:",
+                    {"entities", "relationships"},
+                )
+            if self._is_requested("mvp_scope", limits) and mvp_scope is None:
+                mvp_scope = self._extract_marked_json(
+                    lead_response.raw_text,
+                    "MVP_SCOPE_JSON:",
+                    {"in_scope", "out_of_scope"},
                 )
         except ValueError:
             retry_template = read_text(
@@ -128,10 +163,27 @@ class RequirementsPipeline:
                     + wrapper_note
                 ) from exc
 
+        if self._is_requested("business_rules", limits) and business_rules is None:
+            raise RuntimeError("Missing BUSINESS_RULES_JSON in lead output.")
+        if self._is_requested("workflows", limits) and workflows is None:
+            raise RuntimeError("Missing WORKFLOWS_JSON in lead output.")
+        if self._is_requested("domain_model", limits) and domain_model is None:
+            raise RuntimeError("Missing DOMAIN_MODEL_JSON in lead output.")
+        if self._is_requested("mvp_scope", limits) and mvp_scope is None:
+            raise RuntimeError("Missing MVP_SCOPE_JSON in lead output.")
+
         review_extracted = review_json
         draft_extracted = draft_requirements
         write_json(raw_dir / "turnr1_review_extracted.json", review_extracted)
         write_json(raw_dir / "turnr1_requirements_extracted.json", draft_extracted)
+        if business_rules is not None:
+            write_json(raw_dir / "turnr1_business_rules_extracted.json", business_rules)
+        if workflows is not None:
+            write_json(raw_dir / "turnr1_workflows_extracted.json", workflows)
+        if domain_model is not None:
+            write_json(raw_dir / "turnr1_domain_model_extracted.json", domain_model)
+        if mvp_scope is not None:
+            write_json(raw_dir / "turnr1_mvp_scope_extracted.json", mvp_scope)
 
         review_json = self.normalize_review_json(review_json)
         if self._review_normalization_warnings:
@@ -159,6 +211,37 @@ class RequirementsPipeline:
         write_json(raw_dir / "turnr1_draft.json", draft_requirements)
         write_json(raw_dir / "turnr1_review.json", review_json)
         write_json(artifacts_dir / "requirements_review.json", review_json)
+
+        if business_rules is not None:
+            self._validate_artifact(
+                business_rules, "business_rules.schema.json", "BUSINESS_RULES_JSON"
+            )
+            write_json(artifacts_dir / "business_rules.json", business_rules)
+            self._write_business_rules_markdown(
+                artifacts_dir / "business_rules.md", business_rules
+            )
+        if workflows is not None:
+            self._validate_artifact(
+                workflows, "workflows.schema.json", "WORKFLOWS_JSON"
+            )
+            write_json(artifacts_dir / "workflows.json", workflows)
+            self._write_workflows_markdown(artifacts_dir / "workflows.md", workflows)
+        if domain_model is not None:
+            self._validate_artifact(
+                domain_model, "domain_model.schema.json", "DOMAIN_MODEL_JSON"
+            )
+            write_json(artifacts_dir / "domain_model.json", domain_model)
+            self._write_domain_model_markdown(
+                artifacts_dir / "domain_model.md", domain_model
+            )
+        if mvp_scope is not None:
+            self._validate_artifact(
+                mvp_scope, "mvp_scope.schema.json", "MVP_SCOPE_JSON"
+            )
+            write_json(artifacts_dir / "mvp_scope.json", mvp_scope)
+            self._write_mvp_scope_markdown(
+                artifacts_dir / "mvp_scope.md", mvp_scope
+            )
 
         coverage = self._check_coverage(draft_requirements, limits)
         repairs_applied = False
@@ -201,7 +284,7 @@ class RequirementsPipeline:
 
         apply_template = read_text(self.prompts_dir / "requirements_apply_chatgpt.md")
         apply_prompt = self._render_prompt(apply_template, limits)
-        final_requirements, changelog, apply_repairs = self._run_apply(
+        final_requirements, changelog, final_artifacts, apply_repairs = self._run_apply(
             chatgpt,
             apply_prompt,
             brief,
@@ -244,9 +327,21 @@ class RequirementsPipeline:
         write_json(artifacts_dir / "turnr5_chatgpt_adr.json", adr)
         write_adr(adrs_dir / f"{adr['adr_id']}.md", adr)
 
+        acceptance_criteria = None
+        if self._is_requested("acceptance_criteria", limits):
+            acceptance_criteria = self._run_acceptance_criteria(
+                chatgpt,
+                gemini,
+                final_requirements,
+                raw_dir,
+                artifacts_dir,
+            )
+
         self._write_run_summary(
             artifacts_dir,
             final_requirements,
+            final_artifacts,
+            acceptance_criteria,
             final_coverage,
             repairs_applied,
             [
@@ -262,6 +357,8 @@ class RequirementsPipeline:
             "cross_review": cross_review,
             "final": final_requirements,
             "changelog": changelog,
+            "final_artifacts": final_artifacts,
+            "acceptance_criteria": acceptance_criteria,
             "adr": adr,
         }
 
@@ -283,9 +380,10 @@ class RequirementsPipeline:
         limits: RequirementsLimits,
         raw_dir: Path,
         artifacts_dir: Path,
-    ) -> tuple[Dict, Dict, bool]:
+    ) -> tuple[Dict, Dict, Dict[str, Dict], bool]:
         failures: List[str] = []
         repairs_applied = False
+        final_artifacts: Dict[str, Dict] = {}
 
         def write_normalized_if_repaired(
             final_payload: Dict, changelog_payload: Dict
@@ -337,6 +435,9 @@ class RequirementsPipeline:
             write_json(
                 raw_dir / "turnr4_final_requirements_extracted.json", final_requirements
             )
+            final_artifacts = self._extract_final_artifacts(
+                response.raw_text, limits, raw_dir
+            )
             changelog_raw_context: Dict | None = None
             try:
                 changelog = self._extract_marked_json(
@@ -385,6 +486,8 @@ class RequirementsPipeline:
                     f"Snippet: {snippet}"
                 ) from exc
 
+            self._validate_and_write_final_artifacts(final_artifacts, artifacts_dir)
+
             final_requirements, id_map = self._normalize_requirements(final_requirements)
             review = self._normalize_review(review, id_map)
             raw_changelog = changelog_raw_context if changelog_raw_context is not None else changelog
@@ -401,13 +504,13 @@ class RequirementsPipeline:
                     "added": [],
                     "removed": [],
                     "warnings": warnings,
-                }, repairs_applied
+                }, final_artifacts, repairs_applied
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
                 write_normalized_if_repaired(final_requirements, changelog)
-                return final_requirements, changelog, repairs_applied
+                return final_requirements, changelog, final_artifacts, repairs_applied
 
             fix_prompt = read_text(
                 self.prompts_dir / "requirements_apply_retry_fix_gates.md"
@@ -460,6 +563,10 @@ class RequirementsPipeline:
                 repair_changelog = {
                     "warnings": ["Missing CHANGELOG_JSON in apply fix output."],
                 }
+            repair_artifacts = self._extract_final_artifacts(
+                fix_response.raw_text, limits, raw_dir, suffix="_retry"
+            )
+            final_artifacts = self._merge_final_artifacts(final_artifacts, repair_artifacts)
             try:
                 validate(instance=repair_requirements, schema=requirements_schema)
             except Exception as exc:
@@ -473,6 +580,8 @@ class RequirementsPipeline:
                 raw_dir / "turnr4_apply_retry_fix_final_requirements_extracted.json",
                 repair_requirements,
             )
+
+            self._validate_and_write_final_artifacts(final_artifacts, artifacts_dir)
 
             merged = self._merge_requirements(final_requirements, repair_requirements)
             changelog = self._merge_changelog(changelog, repair_changelog)
@@ -492,13 +601,13 @@ class RequirementsPipeline:
                     "added": [],
                     "removed": [],
                     "warnings": warnings,
-                }, repairs_applied
+                }, final_artifacts, repairs_applied
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
                 write_normalized_if_repaired(final_requirements, changelog)
-                return final_requirements, changelog, repairs_applied
+                return final_requirements, changelog, final_artifacts, repairs_applied
 
             raise RuntimeError(
                 f"Requirements apply step failed gates: {', '.join(failures)}"
@@ -556,7 +665,13 @@ class RequirementsPipeline:
         except Exception:
             return None
         if isinstance(parsed, dict) and (
-            "REVIEW_JSON" in parsed or "REQUIREMENTS_JSON" in parsed
+            "REVIEW_JSON" in parsed
+            or "REQUIREMENTS_JSON" in parsed
+            or "BUSINESS_RULES_JSON" in parsed
+            or "WORKFLOWS_JSON" in parsed
+            or "DOMAIN_MODEL_JSON" in parsed
+            or "MVP_SCOPE_JSON" in parsed
+            or "FINAL_REQUIREMENTS_JSON" in parsed
         ):
             return parsed
         return None
@@ -653,6 +768,279 @@ class RequirementsPipeline:
 
         return failures
 
+    def _is_requested(self, artifact: str, limits: RequirementsLimits) -> bool:
+        requested = [item.lower() for item in limits.requested_artifacts]
+        if not requested:
+            return True
+        return artifact.lower() in requested
+
+    def _extract_final_artifacts(
+        self,
+        raw_text: str,
+        limits: RequirementsLimits,
+        raw_dir: Path,
+        suffix: str = "",
+    ) -> Dict[str, Dict]:
+        artifacts: Dict[str, Dict] = {}
+        requested = [
+            ("business_rules", "FINAL_BUSINESS_RULES_JSON:", {"rules"}),
+            ("workflows", "FINAL_WORKFLOWS_JSON:", {"workflows"}),
+            ("domain_model", "FINAL_DOMAIN_MODEL_JSON:", {"entities", "relationships"}),
+            ("mvp_scope", "FINAL_MVP_SCOPE_JSON:", {"in_scope", "out_of_scope"}),
+        ]
+        for key, marker, expected in requested:
+            if not self._is_requested(key, limits):
+                continue
+            try:
+                payload = self._extract_marked_json(raw_text, marker, expected)
+            except ValueError as exc:
+                artifacts[key] = {}
+                write_json(
+                    raw_dir / f"turnr4_{key}{suffix}_extraction_warning.json",
+                    {"warning": str(exc)},
+                )
+                continue
+            artifacts[key] = payload
+            write_json(raw_dir / f"turnr4_{key}{suffix}_extracted.json", payload)
+        return artifacts
+
+    def _merge_final_artifacts(
+        self, base: Dict[str, Dict], repair: Dict[str, Dict]
+    ) -> Dict[str, Dict]:
+        merged = dict(base)
+        merged.update({key: value for key, value in repair.items() if value})
+        return merged
+
+    def _validate_and_write_final_artifacts(
+        self, artifacts: Dict[str, Dict], artifacts_dir: Path
+    ) -> None:
+        schema_map = {
+            "business_rules": ("business_rules.schema.json", self._write_business_rules_markdown),
+            "workflows": ("workflows.schema.json", self._write_workflows_markdown),
+            "domain_model": ("domain_model.schema.json", self._write_domain_model_markdown),
+            "mvp_scope": ("mvp_scope.schema.json", self._write_mvp_scope_markdown),
+        }
+        for key, payload in artifacts.items():
+            if not payload:
+                raise RuntimeError(f"Missing FINAL_{key.upper()}_JSON in apply output.")
+            schema_name, writer = schema_map[key]
+            self._validate_artifact(payload, schema_name, key)
+            write_json(artifacts_dir / f"{key}.json", payload)
+            writer(artifacts_dir / f"{key}.md", payload)
+
+    def _validate_artifact(self, payload: Dict, schema_name: str, label: str) -> None:
+        schema = self._load_schema(schema_name)
+        try:
+            validate(instance=payload, schema=schema)
+        except Exception as exc:
+            snippet = json.dumps(payload)[:300]
+            raise RuntimeError(
+                f"{label} failed validation. Snippet: {snippet}"
+            ) from exc
+
+    def _write_business_rules_markdown(self, path: Path, payload: Dict) -> None:
+        lines = ["# Business Rules", ""]
+        for rule in payload.get("rules", []):
+            lines.append(f"- {rule.get('id')}: {rule.get('text')}")
+        write_text(path, "\n".join(lines) + "\n")
+
+    def _write_workflows_markdown(self, path: Path, payload: Dict) -> None:
+        lines = ["# Workflows", ""]
+        for workflow in payload.get("workflows", []):
+            lines.append(f"## {workflow.get('name')} ({workflow.get('id')})")
+            states = workflow.get("states", [])
+            if states:
+                lines.append(f"- States: {', '.join(states)}")
+            transitions = workflow.get("transitions", [])
+            if transitions:
+                lines.append("- Transitions:")
+                for transition in transitions:
+                    lines.append(
+                        f"  - {transition.get('from')} -> {transition.get('to')}: "
+                        f"{transition.get('trigger')}"
+                    )
+            lines.append("")
+        write_text(path, "\n".join(lines).rstrip() + "\n")
+
+    def _write_domain_model_markdown(self, path: Path, payload: Dict) -> None:
+        lines = ["# Domain Model", ""]
+        for entity in payload.get("entities", []):
+            lines.append(f"## {entity.get('name')}")
+            lines.append(entity.get("description", ""))
+            attributes = entity.get("attributes", [])
+            if attributes:
+                lines.append("- Attributes:")
+                for attr in attributes:
+                    lines.append(
+                        f"  - {attr.get('name')} ({attr.get('type')}): "
+                        f"{attr.get('description')}"
+                    )
+            lines.append("")
+        relationships = payload.get("relationships", [])
+        if relationships:
+            lines.append("## Relationships")
+            for relation in relationships:
+                lines.append(
+                    f"- {relation.get('from')} -> {relation.get('to')}: "
+                    f"{relation.get('type')} ({relation.get('description')})"
+                )
+        write_text(path, "\n".join(lines).rstrip() + "\n")
+
+    def _write_mvp_scope_markdown(self, path: Path, payload: Dict) -> None:
+        lines = ["# MVP Scope", "", "## In Scope"]
+        for item in payload.get("in_scope", []):
+            lines.append(f"- {item}")
+        lines.append("")
+        lines.append("## Out of Scope")
+        for item in payload.get("out_of_scope", []):
+            lines.append(f"- {item}")
+        milestones = payload.get("milestones", [])
+        if milestones:
+            lines.append("")
+            lines.append("## Milestones")
+            for milestone in milestones:
+                lines.append(f"- {milestone.get('name')}: {milestone.get('description')}")
+        write_text(path, "\n".join(lines).rstrip() + "\n")
+
+    def _must_requirements(self, requirements: Dict) -> List[Dict]:
+        return [
+            item
+            for item in requirements.get("requirements", [])
+            if str(item.get("priority", "")).lower() == "must"
+        ]
+
+    def _run_acceptance_criteria(
+        self,
+        chatgpt: LLMAdapter,
+        gemini: LLMAdapter,
+        final_requirements: Dict,
+        raw_dir: Path,
+        artifacts_dir: Path,
+    ) -> Dict | None:
+        must_requirements = self._must_requirements(final_requirements)
+        if not must_requirements:
+            self._acceptance_warnings.append("No MUST requirements for acceptance criteria.")
+            return None
+
+        acceptance_prompt = read_text(self.prompts_dir / "acceptance_chatgpt.md")
+        acceptance_payload = {"must_requirements": must_requirements}
+        acceptance_full_prompt = (
+            f"{acceptance_prompt}\n\nINPUT:\n{json.dumps(acceptance_payload)}\n"
+        )
+        acceptance_prompt_path = raw_dir / "turnr6_acceptance_prompt.txt"
+        write_text(acceptance_prompt_path, acceptance_full_prompt)
+        acceptance_response = chatgpt.complete(acceptance_full_prompt)
+        write_text(raw_dir / "turnr6_acceptance_raw.txt", acceptance_response.raw_text)
+        self._write_usage(raw_dir / "turnr6_acceptance_usage.json", acceptance_response)
+
+        try:
+            acceptance_json = self._extract_marked_json(
+                acceptance_response.raw_text,
+                "ACCEPTANCE_CRITERIA_JSON:",
+                {"criteria"},
+            )
+        except ValueError as exc:
+            self._acceptance_warnings.append(str(exc))
+            write_json(
+                artifacts_dir / "acceptance_warnings.json",
+                {"warnings": self._acceptance_warnings},
+            )
+            return None
+
+        write_json(raw_dir / "turnr6_acceptance_extracted.json", acceptance_json)
+
+        cross_prompt = read_text(self.prompts_dir / "acceptance_gemini_cross_review.md")
+        cross_payload = {
+            "must_requirements": must_requirements,
+            "acceptance_criteria": acceptance_json,
+        }
+        cross_full_prompt = f"{cross_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
+        cross_prompt_path = raw_dir / "turnr7_acceptance_cross_prompt.txt"
+        write_text(cross_prompt_path, cross_full_prompt)
+        cross_response = gemini.complete(cross_full_prompt)
+        write_text(raw_dir / "turnr7_acceptance_cross_raw.txt", cross_response.raw_text)
+        self._write_usage(raw_dir / "turnr7_acceptance_cross_usage.json", cross_response)
+
+        cross_review = extract_json(cross_response.raw_text)
+        if not isinstance(cross_review, dict):
+            cross_review = {"issues": ["Cross review output was not JSON."]}
+        write_json(raw_dir / "turnr7_acceptance_cross_review.json", cross_review)
+        write_json(artifacts_dir / "acceptance_cross_review.json", cross_review)
+
+        finalize_prompt = read_text(self.prompts_dir / "acceptance_chatgpt_finalize.md")
+        finalize_payload = {
+            "must_requirements": must_requirements,
+            "draft_acceptance": acceptance_json,
+            "cross_review": cross_review,
+        }
+        finalize_full_prompt = f"{finalize_prompt}\n\nINPUT:\n{json.dumps(finalize_payload)}\n"
+        finalize_prompt_path = raw_dir / "turnr8_acceptance_finalize_prompt.txt"
+        write_text(finalize_prompt_path, finalize_full_prompt)
+        finalize_response = chatgpt.complete(finalize_full_prompt)
+        write_text(raw_dir / "turnr8_acceptance_finalize_raw.txt", finalize_response.raw_text)
+        self._write_usage(raw_dir / "turnr8_acceptance_finalize_usage.json", finalize_response)
+
+        try:
+            final_acceptance = self._extract_marked_json(
+                finalize_response.raw_text,
+                "ACCEPTANCE_CRITERIA_JSON:",
+                {"criteria"},
+            )
+        except ValueError as exc:
+            self._acceptance_warnings.append(str(exc))
+            write_json(
+                artifacts_dir / "acceptance_warnings.json",
+                {"warnings": self._acceptance_warnings},
+            )
+            return None
+
+        schema = self._load_schema("acceptance_criteria.schema.json")
+        try:
+            validate(instance=final_acceptance, schema=schema)
+        except Exception as exc:
+            self._acceptance_warnings.append(f"Validation failed: {exc}")
+            write_json(
+                artifacts_dir / "acceptance_warnings.json",
+                {"warnings": self._acceptance_warnings},
+            )
+            return None
+
+        invalid_ids = self._validate_acceptance_ids(final_acceptance, must_requirements)
+        if invalid_ids:
+            self._acceptance_warnings.append(
+                f"Acceptance criteria contains non-MUST IDs: {', '.join(invalid_ids)}"
+            )
+            write_json(
+                artifacts_dir / "acceptance_warnings.json",
+                {"warnings": self._acceptance_warnings},
+            )
+            return None
+
+        write_json(artifacts_dir / "acceptance_criteria.json", final_acceptance)
+        self._write_acceptance_markdown(
+            artifacts_dir / "acceptance_criteria.md", final_acceptance
+        )
+        return final_acceptance
+
+    def _validate_acceptance_ids(
+        self, acceptance: Dict, must_requirements: List[Dict]
+    ) -> List[str]:
+        must_ids = {item.get("id") for item in must_requirements if item.get("id")}
+        invalid = []
+        for entry in acceptance.get("criteria", []):
+            req_id = entry.get("requirement_id")
+            if req_id not in must_ids:
+                invalid.append(str(req_id))
+        return invalid
+
+    def _write_acceptance_markdown(self, path: Path, payload: Dict) -> None:
+        lines = ["# Acceptance Criteria", ""]
+        for entry in payload.get("criteria", []):
+            lines.append(f"## {entry.get('requirement_id')}")
+            for item in entry.get("criteria", []):
+                lines.append(f"- {item}")
+            lines.append("")
+        write_text(path, "\n".join(lines).rstrip() + "\n")
     def _check_coverage(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
         req_items = requirements.get("requirements", [])
         req_texts = [str(item.get("text", "")).lower() for item in req_items]
@@ -1108,6 +1496,20 @@ class RequirementsPipeline:
         if isinstance(seed_requirements, str):
             seed_requirements = [seed_requirements]
         seed_requirements = list(seed_requirements)
+        requested_artifacts = frontmatter.get("requested_artifacts", [])
+        if isinstance(requested_artifacts, str):
+            requested_artifacts = [requested_artifacts]
+        if requested_artifacts:
+            requested_list = [str(item).lower() for item in requested_artifacts]
+        else:
+            requested_list = [
+                "requirements",
+                "business_rules",
+                "workflows",
+                "domain_model",
+                "mvp_scope",
+                "acceptance_criteria",
+            ]
         return RequirementsLimits(
             req_min=req_min,
             req_max=req_max_int,
@@ -1117,6 +1519,7 @@ class RequirementsPipeline:
             coverage_areas=coverage_areas,
             min_per_area=min_per_area_int,
             seed_requirements=seed_requirements,
+            requested_artifacts=requested_list,
         )
 
     def _limits_payload(self, limits: RequirementsLimits) -> Dict:
@@ -1194,6 +1597,8 @@ class RequirementsPipeline:
         self,
         artifacts_dir: Path,
         requirements: Dict,
+        final_artifacts: Dict[str, Dict],
+        acceptance_criteria: Dict | None,
         coverage: Dict,
         repairs_applied: bool,
         responses: List[LLMResponse],
@@ -1210,6 +1615,16 @@ class RequirementsPipeline:
             f"- missing_seeds: {', '.join(missing_seeds) if missing_seeds else 'none'}",
             f"- repairs_applied: {'yes' if repairs_applied else 'no'}",
         ]
+        if final_artifacts.get("business_rules"):
+            lines.append(f"- business_rules_count: {len(final_artifacts['business_rules'].get('rules', []))}")
+        if final_artifacts.get("workflows"):
+            lines.append(f"- workflows_count: {len(final_artifacts['workflows'].get('workflows', []))}")
+        if final_artifacts.get("domain_model"):
+            lines.append(f"- domain_entities_count: {len(final_artifacts['domain_model'].get('entities', []))}")
+        if final_artifacts.get("mvp_scope"):
+            lines.append(f"- mvp_in_scope_count: {len(final_artifacts['mvp_scope'].get('in_scope', []))}")
+        if acceptance_criteria:
+            lines.append(f"- acceptance_criteria_count: {len(acceptance_criteria.get('criteria', []))}")
         if usage_totals:
             lines.append(
                 "- token_usage: "
@@ -1219,6 +1634,11 @@ class RequirementsPipeline:
             lines.append(
                 f"- repairs_warnings: {len(self._repair_warnings)} "
                 "(see artifacts/repairs_warnings.json)"
+            )
+        if self._acceptance_warnings:
+            lines.append(
+                f"- acceptance_warnings: {len(self._acceptance_warnings)} "
+                "(see artifacts/acceptance_warnings.json)"
             )
         write_text(artifacts_dir / "run_summary.md", "\n".join(lines) + "\n")
 

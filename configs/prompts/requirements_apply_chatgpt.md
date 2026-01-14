@@ -11,6 +11,10 @@ Input includes: brief, draft requirements, review, and Gemini cross-review.
 Return a SINGLE JSON wrapper (no markdown, no commentary):
 {
   "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]},
+  "FINAL_BUSINESS_RULES_JSON": {"rules":[]},
+  "FINAL_WORKFLOWS_JSON": {"workflows":[]},
+  "FINAL_DOMAIN_MODEL_JSON": {"entities":[],"relationships":[]},
+  "FINAL_MVP_SCOPE_JSON": {"in_scope":[],"out_of_scope":[],"milestones":[]},
   "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]}
 }
 
@@ -20,6 +24,10 @@ Format contract:
 - CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
 - CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
 - FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects only (no strings, no mixed items).
+- FINAL_BUSINESS_RULES_JSON.rules must be objects with {id, text, category?}.
+- FINAL_WORKFLOWS_JSON.workflows must include states and transitions.
+- FINAL_DOMAIN_MODEL_JSON must include entities and relationships.
+- FINAL_MVP_SCOPE_JSON must include in_scope and out_of_scope.
 
 Example requirements array:
 [
