@@ -19,6 +19,13 @@ Format contract:
 - FINAL_REQUIREMENTS_JSON items must have ONLY id, text, priority (must|should|could).
 - CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
 - CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
+- FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects only (no strings, no mixed items).
+
+Example requirements array:
+[
+  {"id":"REQ-1","text":"The system must log all access attempts.","priority":"must"},
+  {"id":"REQ-2","text":"The system should export reports in CSV format.","priority":"should"}
+]
 
 Rules:
 - FINAL_REQUIREMENTS_JSON must include ONLY accepted requirements plus NEW requirements added to meet goals.

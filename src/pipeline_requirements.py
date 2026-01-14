@@ -40,10 +40,12 @@ class RequirementsPipeline:
         self.prompts_dir = base_dir / "configs" / "prompts"
         self._review_normalization_warnings: List[str] = []
         self._extraction_traces: List[str] = []
+        self._repair_warnings: List[Dict] = []
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
         self._extraction_traces = []
+        self._repair_warnings = []
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -323,6 +325,15 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
+            final_requirements, repair_warnings = self._repair_requirements_payload(
+                final_requirements
+            )
+            if repair_warnings:
+                self._repair_warnings.extend(repair_warnings)
+                write_json(
+                    artifacts_dir / "repairs_warnings.json",
+                    {"warnings": self._repair_warnings},
+                )
             write_json(
                 raw_dir / "turnr4_final_requirements_extracted.json", final_requirements
             )
@@ -364,7 +375,15 @@ class RequirementsPipeline:
                     changelog_raw_context = {"raw_response": retry_response.raw_text}
 
             requirements_schema = self._load_schema("normalized_requirements.schema.json")
-            validate(instance=final_requirements, schema=requirements_schema)
+            try:
+                validate(instance=final_requirements, schema=requirements_schema)
+            except Exception as exc:
+                snippet = json.dumps(final_requirements)[:300]
+                raise RuntimeError(
+                    "FINAL_REQUIREMENTS_JSON failed validation after repairs. "
+                    "See artifacts/repairs_warnings.json and raw turnr4 files. "
+                    f"Snippet: {snippet}"
+                ) from exc
 
             final_requirements, id_map = self._normalize_requirements(final_requirements)
             review = self._normalize_review(review, id_map)
@@ -417,6 +436,15 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
+            repair_requirements, repair_warnings = self._repair_requirements_payload(
+                repair_requirements
+            )
+            if repair_warnings:
+                self._repair_warnings.extend(repair_warnings)
+                write_json(
+                    artifacts_dir / "repairs_warnings.json",
+                    {"warnings": self._repair_warnings},
+                )
             repairs_applied = True
             try:
                 repair_changelog = self._extract_marked_json(
@@ -432,7 +460,15 @@ class RequirementsPipeline:
                 repair_changelog = {
                     "warnings": ["Missing CHANGELOG_JSON in apply fix output."],
                 }
-            validate(instance=repair_requirements, schema=requirements_schema)
+            try:
+                validate(instance=repair_requirements, schema=requirements_schema)
+            except Exception as exc:
+                snippet = json.dumps(repair_requirements)[:300]
+                raise RuntimeError(
+                    "FINAL_REQUIREMENTS_JSON (repair) failed validation after repairs. "
+                    "See artifacts/repairs_warnings.json and raw turnr4 files. "
+                    f"Snippet: {snippet}"
+                ) from exc
             write_json(
                 raw_dir / "turnr4_apply_retry_fix_final_requirements_extracted.json",
                 repair_requirements,
@@ -713,6 +749,129 @@ class RequirementsPipeline:
             "assumptions": payload.get("assumptions", []),
             "constraints": payload.get("constraints", []),
         }, mapping
+
+    def _repair_requirements_payload(self, payload: Dict) -> tuple[Dict, List[Dict]]:
+        warnings: List[Dict] = []
+        if not isinstance(payload, dict):
+            warnings.append(
+                {
+                    "warning": "Requirements payload is not a JSON object.",
+                    "original": payload,
+                }
+            )
+            return payload, warnings
+
+        items = payload.get("requirements", [])
+        if not isinstance(items, list):
+            warnings.append(
+                {
+                    "warning": "Requirements list is not an array.",
+                    "original": items,
+                }
+            )
+            items = []
+
+        existing_ids: set[str] = set()
+        next_id = 1
+
+        def allocate_id() -> str:
+            nonlocal next_id
+            while True:
+                candidate = f"REQ-TEMP-{next_id}"
+                next_id += 1
+                if candidate not in existing_ids:
+                    existing_ids.add(candidate)
+                    return candidate
+
+        def infer_priority(text: str) -> str:
+            match = re.match(r"\s*(must|should|could|shall)\b", text, re.IGNORECASE)
+            if match:
+                value = match.group(1).lower()
+                return "must" if value == "shall" else value
+            return "should"
+
+        def strip_priority_prefix(text: str) -> str:
+            return re.sub(r"^\s*(must|should|could|shall)\b[:\-\s]*", "", text, flags=re.IGNORECASE)
+
+        normalized_items: List[Dict] = []
+        for index, item in enumerate(items):
+            if isinstance(item, str):
+                text = strip_priority_prefix(item.strip())
+                req_id = allocate_id()
+                priority = infer_priority(item)
+                warnings.append(
+                    {
+                        "index": index,
+                        "original": item,
+                        "repaired_id": req_id,
+                        "note": "Converted string requirement to object.",
+                    }
+                )
+                normalized_items.append(
+                    {"id": req_id, "text": text, "priority": priority}
+                )
+                continue
+
+            if isinstance(item, dict):
+                repair_notes: List[str] = []
+                text = item.get("text") or item.get("normalized_text") or item.get("requirement")
+                if text is None:
+                    warnings.append(
+                        {
+                            "index": index,
+                            "original": item,
+                            "repaired_id": None,
+                            "note": "Dropped requirement with no text field.",
+                        }
+                    )
+                    continue
+                text_str = str(text).strip()
+                if "text" not in item and ("normalized_text" in item or "requirement" in item):
+                    repair_notes.append("Normalized text field from alternate key.")
+                raw_priority = item.get("priority")
+                if isinstance(raw_priority, str):
+                    priority = raw_priority.lower()
+                else:
+                    priority = infer_priority(text_str)
+                    repair_notes.append("Inferred priority for requirement.")
+                if priority not in {"must", "should", "could"}:
+                    priority = infer_priority(text_str)
+                    repair_notes.append("Repaired invalid priority value.")
+
+                req_id = item.get("id") if isinstance(item.get("id"), str) else None
+                if not req_id:
+                    req_id = allocate_id()
+                    repair_notes.append("Assigned new id for missing requirement id.")
+                elif req_id in existing_ids:
+                    new_id = allocate_id()
+                    repair_notes.append("Assigned new id for duplicate requirement id.")
+                    req_id = new_id
+                existing_ids.add(req_id)
+                if repair_notes:
+                    warnings.append(
+                        {
+                            "index": index,
+                            "original": item,
+                            "repaired_id": req_id,
+                            "note": "; ".join(repair_notes),
+                        }
+                    )
+                normalized_items.append(
+                    {"id": req_id, "text": text_str, "priority": priority}
+                )
+                continue
+
+            warnings.append(
+                {
+                    "index": index,
+                    "original": item,
+                    "repaired_id": None,
+                    "note": "Dropped requirement with unsupported type.",
+                }
+            )
+
+        payload["requirements"] = normalized_items
+        return payload, warnings
 
     def _normalize_review(self, review: Dict, mapping: Dict[str, str]) -> Dict:
         def map_ids(ids: List[str]) -> List[str]:
@@ -1055,6 +1214,11 @@ class RequirementsPipeline:
             lines.append(
                 "- token_usage: "
                 + ", ".join(f"{key}={value}" for key, value in usage_totals.items())
+            )
+        if self._repair_warnings:
+            lines.append(
+                f"- repairs_warnings: {len(self._repair_warnings)} "
+                "(see artifacts/repairs_warnings.json)"
             )
         write_text(artifacts_dir / "run_summary.md", "\n".join(lines) + "\n")
 
