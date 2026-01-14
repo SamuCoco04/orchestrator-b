@@ -105,7 +105,7 @@ class RequirementsPipeline:
                     + wrapper_note
                 ) from exc
 
-        requirements_schema = self._load_schema("normalized_requirements.schema.json")
+        requirements_schema = self._load_schema("requirements_strict.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
         review_schema = self._load_schema("requirements_review.schema.json")
         validate(instance=review_json, schema=review_schema)
@@ -126,6 +126,7 @@ class RequirementsPipeline:
         cross_response = gemini.complete(cross_full_prompt)
         cross_response_path = raw_dir / "turnr3_gemini_cross_review_response.txt"
         write_text(cross_response_path, cross_response.raw_text)
+        write_text(raw_dir / "turnr3_gemini_cross_review_raw.txt", cross_response.raw_text)
         self._write_usage(raw_dir / "turnr3_gemini_cross_review_usage.json", cross_response)
 
         cross_review = extract_json(cross_response.raw_text)
@@ -148,6 +149,7 @@ class RequirementsPipeline:
         write_json(raw_dir / "turnr4_final_requirements.json", final_requirements)
         write_json(raw_dir / "turnr4_changelog.json", changelog)
         write_json(artifacts_dir / "requirements.json", final_requirements)
+        write_json(artifacts_dir / "changelog.json", changelog)
 
         write_requirements(artifacts_dir / "requirements.md", final_requirements)
 
@@ -157,6 +159,13 @@ class RequirementsPipeline:
             "review": review_json,
             "cross_review": cross_review,
             "changelog": changelog,
+            "metrics": {
+                "requirements_count": len(final_requirements.get("requirements", [])),
+                "assumptions_count": len(final_requirements.get("assumptions", [])),
+                "constraints_count": len(final_requirements.get("constraints", [])),
+                "target_min": int(self._env("ORCH_REQ_MIN_COUNT", "30")),
+                "target_max": int(self._env("ORCH_REQ_MAX_COUNT", "45")),
+            },
         }
         adr_full_prompt = f"{adr_prompt}\n\nINPUT:\n{json.dumps(adr_payload)}\n"
         adr_prompt_path = raw_dir / "turnr5_chatgpt_adr_prompt.txt"
@@ -256,13 +265,55 @@ class RequirementsPipeline:
                 except ValueError as exc:
                     raise RuntimeError("Missing CHANGELOG_JSON in apply output.") from exc
 
-            requirements_schema = self._load_schema("normalized_requirements.schema.json")
+            requirements_schema = self._load_schema("requirements_strict.schema.json")
             validate(instance=final_requirements, schema=requirements_schema)
             self._validate_changelog(changelog)
 
             failures = self._run_gates(final_requirements, review, changelog)
             if not failures:
                 return final_requirements, changelog
+
+            fix_prompt = read_text(
+                self.prompts_dir / "requirements_apply_retry_fix_gates.md"
+            )
+            fix_payload = {
+                "brief": brief,
+                "previous": {
+                    "final_requirements": final_requirements,
+                    "changelog": changelog,
+                },
+                "review": review,
+                "cross_review": cross_review,
+                "failures": failures,
+            }
+            fix_full_prompt = f"{fix_prompt}\n\nINPUT:\n{json.dumps(fix_payload)}\n"
+            fix_prompt_path = raw_dir / "turnr4_apply_retry_fix_prompt.txt"
+            write_text(fix_prompt_path, fix_full_prompt)
+            fix_response = adapter.complete(fix_full_prompt)
+            write_text(raw_dir / "turnr4_apply_retry_fix_raw.txt", fix_response.raw_text)
+            self._write_usage(raw_dir / "turnr4_apply_retry_fix_usage.json", fix_response)
+
+            final_requirements = self._extract_marked_json(
+                fix_response.raw_text,
+                "FINAL_REQUIREMENTS_JSON:",
+                {"requirements", "assumptions", "constraints"},
+            )
+            changelog = self._extract_marked_json(
+                fix_response.raw_text,
+                "CHANGELOG_JSON:",
+                {"splits", "replacements", "added", "removed"},
+            )
+            requirements_schema = self._load_schema("requirements_strict.schema.json")
+            validate(instance=final_requirements, schema=requirements_schema)
+            self._validate_changelog(changelog)
+
+            failures = self._run_gates(final_requirements, review, changelog)
+            if not failures:
+                return final_requirements, changelog
+
+            raise RuntimeError(
+                f"Requirements apply step failed gates: {', '.join(failures)}"
+            )
 
         raise RuntimeError(f"Requirements apply step failed gates: {', '.join(failures)}")
 
@@ -352,25 +403,55 @@ class RequirementsPipeline:
     def _run_gates(self, requirements: Dict, review: Dict, changelog: Dict) -> List[str]:
         failures: List[str] = []
         min_count = int(self._env("ORCH_REQ_MIN_COUNT", "30"))
+        max_count = int(self._env("ORCH_REQ_MAX_COUNT", "45"))
         enforce_splits = self._env("ORCH_ENFORCE_SPLITS", "false").lower() == "true"
 
-        req_count = len(requirements.get("requirements", []))
-        if req_count < min_count:
-            failures.append(f"Gate A: requirements count {req_count} < {min_count}")
+        req_items = requirements.get("requirements", [])
+        req_count = len(req_items)
+        if req_count < min_count or req_count > max_count:
+            failures.append(
+                f"Gate A: requirements count {req_count} not in {min_count}..{max_count}"
+            )
+
+        if len(requirements.get("assumptions", [])) < 3:
+            failures.append("Gate B: assumptions must have at least 3 items")
+        if len(requirements.get("constraints", [])) < 3:
+            failures.append("Gate B: constraints must have at least 3 items")
+
+        rejected_ids = set(review.get("rejected", []))
+        accepted_ids = set(review.get("accepted", []))
+        added_ids = set(changelog.get("added", []))
+        split_targets = {
+            item_id
+            for split in changelog.get("splits", [])
+            for item_id in split.get("to", [])
+        }
+        added_ids |= split_targets
+        final_ids = {item.get("id") for item in req_items}
+
+        if rejected_ids.intersection(final_ids):
+            failures.append("Gate C: rejected requirement IDs present in final")
+
+        missing_from_acceptance = {
+            req_id
+            for req_id in final_ids
+            if req_id not in accepted_ids and req_id not in added_ids
+        }
+        if missing_from_acceptance:
+            failures.append("Gate C: final requirements include IDs not accepted or added")
 
         forbidden_ids = {"REQ-1", "REQ-7", "REQ-12", "REQ-14"}
         if enforce_splits:
-            ids = {item.get("id") for item in requirements.get("requirements", [])}
-            invalid = sorted(forbidden_ids.intersection(ids))
+            invalid = sorted(forbidden_ids.intersection(final_ids))
             if invalid:
-                failures.append(f"Gate B: forbidden IDs present {invalid}")
+                failures.append(f"Gate D: forbidden IDs present {invalid}")
 
         issues = " ".join(review.get("issues", [])).lower()
         needs_split = any(word in issues for word in ["split", "epic"])
         if needs_split:
             splits = changelog.get("splits", []) if isinstance(changelog, dict) else []
             if not splits:
-                failures.append("Gate C: review mentions split/epic but changelog has no splits")
+                failures.append("Gate E: review mentions split/epic but changelog has no splits")
 
         return failures
 

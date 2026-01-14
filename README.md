@@ -45,6 +45,7 @@ Requirements pipeline behavior:
 - If REQUIREMENTS_JSON is missing, the pipeline auto-retries once for the missing block
 - Gemini cross-reviews
 - ChatGPT applies fixes with changelog and gates
+- If gates fail, a single auto-repair retry is attempted for the apply output
 
 You can also adjust generation controls:
 
@@ -64,6 +65,7 @@ Outputs:
 - `runs/<run_id>/artifacts/requirements.md`
 - `runs/<run_id>/artifacts/requirements.json`
 - `runs/<run_id>/artifacts/requirements_review.json`
+- `runs/<run_id>/artifacts/changelog.json`
 - `runs/<run_id>/artifacts/turnr3_gemini_cross_review.json`
 - `runs/<run_id>/artifacts/adrs/ADR-XX.md`
 

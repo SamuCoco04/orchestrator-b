@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["requirements", "assumptions", "constraints"],
+  "properties": {
+    "requirements": {
+      "type": "array",
+      "minItems": 30,
+      "maxItems": 45,
+      "items": {
+        "type": "object",
+        "required": ["id", "text", "priority"],
+        "properties": {
+          "id": {"type": "string"},
+          "text": {"type": "string"},
+          "priority": {"type": "string", "enum": ["must", "should", "could"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "assumptions": {
+      "type": "array",
+      "minItems": 3,
+      "items": {"type": "string"}
+    },
+    "constraints": {
+      "type": "array",
+      "minItems": 3,
+      "items": {"type": "string"}
+    }
+  },
+  "additionalProperties": false
+}
