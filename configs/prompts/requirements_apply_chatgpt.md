@@ -14,11 +14,23 @@ Return a SINGLE JSON wrapper (no markdown, no commentary):
   "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]}
 }
 
+Format contract:
+- Prefer wrapper JSON keys exactly as shown above.
+- FINAL_REQUIREMENTS_JSON items must have ONLY id, text, priority (must|should|could).
+- CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
+- CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
+- FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects only (no strings, no mixed items).
+
+Example requirements array:
+[
+  {"id":"REQ-1","text":"The system must log all access attempts.","priority":"must"},
+  {"id":"REQ-2","text":"The system should export reports in CSV format.","priority":"should"}
+]
+
 Rules:
 - FINAL_REQUIREMENTS_JSON must include ONLY accepted requirements plus NEW requirements added to meet goals.
 - If any draft requirement is rejected, it must NOT appear in final.
 - If under minimum, generate NEW requirements aligned to the brief (do not resurrect rejected).
 - assumptions and constraints must meet their minimums.
 - CHANGELOG_JSON must list added/removed/replacements/splits (arrays may be minimal but must exist).
-- CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
 - No markdown, no extra keys.

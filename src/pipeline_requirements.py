@@ -27,6 +27,9 @@ class RequirementsLimits:
     assumptions_min: int
     constraints_min: int
     roles_expected: List[str]
+    coverage_areas: List[str]
+    min_per_area: int | None
+    seed_requirements: List[str]
 
 
 class RequirementsPipeline:
@@ -36,9 +39,13 @@ class RequirementsPipeline:
         self.schemas_dir = base_dir / "schemas"
         self.prompts_dir = base_dir / "configs" / "prompts"
         self._review_normalization_warnings: List[str] = []
+        self._extraction_traces: List[str] = []
+        self._repair_warnings: List[Dict] = []
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
+        self._extraction_traces = []
+        self._repair_warnings = []
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -108,6 +115,10 @@ class RequirementsPipeline:
                     "REQUIREMENTS_JSON:",
                     {"requirements", "assumptions", "constraints"},
                 )
+                write_json(
+                    raw_dir / "turnr1_lead_retry_requirements_extracted.json",
+                    draft_requirements,
+                )
             except ValueError as exc:
                 wrapper_note = ""
                 if wrapper_keys is not None:
@@ -116,6 +127,11 @@ class RequirementsPipeline:
                     "Lead returned only REVIEW_JSON; enforce prompt format."
                     + wrapper_note
                 ) from exc
+
+        review_extracted = review_json
+        draft_extracted = draft_requirements
+        write_json(raw_dir / "turnr1_review_extracted.json", review_extracted)
+        write_json(raw_dir / "turnr1_requirements_extracted.json", draft_extracted)
 
         review_json = self.normalize_review_json(review_json)
         if self._review_normalization_warnings:
@@ -127,7 +143,15 @@ class RequirementsPipeline:
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
         review_schema = self._load_schema("requirements_review.schema.json")
-        validate(instance=review_json, schema=review_schema)
+        try:
+            validate(instance=review_json, schema=review_schema)
+        except Exception as exc:
+            write_json(raw_dir / "turnr1_review_invalid_raw.json", review_extracted)
+            write_json(
+                artifacts_dir / "review_invalid_normalized.json",
+                review_json,
+            )
+            raise exc
 
         draft_requirements, id_map = self._normalize_requirements(draft_requirements)
         review_json = self._normalize_review(review_json, id_map)
@@ -135,6 +159,23 @@ class RequirementsPipeline:
         write_json(raw_dir / "turnr1_draft.json", draft_requirements)
         write_json(raw_dir / "turnr1_review.json", review_json)
         write_json(artifacts_dir / "requirements_review.json", review_json)
+
+        coverage = self._check_coverage(draft_requirements, limits)
+        repairs_applied = False
+        if coverage["needs_retry"]:
+            retries = self._run_coverage_retry(
+                chatgpt, brief, draft_requirements, coverage, limits, raw_dir
+            )
+            if retries is not None:
+                repairs_applied = True
+                draft_requirements = self._merge_requirements(draft_requirements, retries)
+                draft_requirements, id_map = self._normalize_requirements(draft_requirements)
+                review_json = self._normalize_review(review_json, id_map)
+                write_json(
+                    raw_dir / "turnr1_coverage_requirements_normalized.json",
+                    draft_requirements,
+                )
+                coverage = self._check_coverage(draft_requirements, limits)
 
         cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
         cross_prompt = self._render_prompt(cross_template, limits)
@@ -160,7 +201,7 @@ class RequirementsPipeline:
 
         apply_template = read_text(self.prompts_dir / "requirements_apply_chatgpt.md")
         apply_prompt = self._render_prompt(apply_template, limits)
-        final_requirements, changelog = self._run_apply(
+        final_requirements, changelog, apply_repairs = self._run_apply(
             chatgpt,
             apply_prompt,
             brief,
@@ -171,6 +212,8 @@ class RequirementsPipeline:
             raw_dir,
             artifacts_dir,
         )
+        repairs_applied = repairs_applied or apply_repairs
+        final_coverage = self._check_coverage(final_requirements, limits)
 
         write_json(raw_dir / "turnr4_final_requirements.json", final_requirements)
         write_json(raw_dir / "turnr4_changelog.json", changelog)
@@ -201,6 +244,18 @@ class RequirementsPipeline:
         write_json(artifacts_dir / "turnr5_chatgpt_adr.json", adr)
         write_adr(adrs_dir / f"{adr['adr_id']}.md", adr)
 
+        self._write_run_summary(
+            artifacts_dir,
+            final_requirements,
+            final_coverage,
+            repairs_applied,
+            [
+                lead_response,
+                cross_response,
+                adr_response,
+            ],
+        )
+
         return {
             "draft": draft_requirements,
             "review": review_json,
@@ -228,8 +283,22 @@ class RequirementsPipeline:
         limits: RequirementsLimits,
         raw_dir: Path,
         artifacts_dir: Path,
-    ) -> tuple[Dict, Dict]:
+    ) -> tuple[Dict, Dict, bool]:
         failures: List[str] = []
+        repairs_applied = False
+
+        def write_normalized_if_repaired(
+            final_payload: Dict, changelog_payload: Dict
+        ) -> None:
+            if repairs_applied:
+                write_json(
+                    raw_dir / "turnr4_final_requirements_normalized.json",
+                    final_payload,
+                )
+                write_json(
+                    raw_dir / "turnr4_changelog_normalized.json",
+                    changelog_payload,
+                )
         for attempt in range(2):
             instruction = ""
             if attempt == 1:
@@ -256,6 +325,18 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
+            final_requirements, repair_warnings = self._repair_requirements_payload(
+                final_requirements
+            )
+            if repair_warnings:
+                self._repair_warnings.extend(repair_warnings)
+                write_json(
+                    artifacts_dir / "repairs_warnings.json",
+                    {"warnings": self._repair_warnings},
+                )
+            write_json(
+                raw_dir / "turnr4_final_requirements_extracted.json", final_requirements
+            )
             changelog_raw_context: Dict | None = None
             try:
                 changelog = self._extract_marked_json(
@@ -264,6 +345,7 @@ class RequirementsPipeline:
                     {"splits", "replacements", "added", "removed"},
                 )
                 changelog_raw_context = changelog
+                write_json(raw_dir / "turnr4_changelog_extracted.json", changelog)
             except ValueError:
                 retry_prompt = read_text(
                     self.prompts_dir / "requirements_apply_retry_changelog_only.md"
@@ -287,12 +369,21 @@ class RequirementsPipeline:
                         {"splits", "replacements", "added", "removed"},
                     )
                     changelog_raw_context = changelog
+                    write_json(raw_dir / "turnr4_changelog_extracted.json", changelog)
                 except ValueError as exc:
                     changelog = None
                     changelog_raw_context = {"raw_response": retry_response.raw_text}
 
             requirements_schema = self._load_schema("normalized_requirements.schema.json")
-            validate(instance=final_requirements, schema=requirements_schema)
+            try:
+                validate(instance=final_requirements, schema=requirements_schema)
+            except Exception as exc:
+                snippet = json.dumps(final_requirements)[:300]
+                raise RuntimeError(
+                    "FINAL_REQUIREMENTS_JSON failed validation after repairs. "
+                    "See artifacts/repairs_warnings.json and raw turnr4 files. "
+                    f"Snippet: {snippet}"
+                ) from exc
 
             final_requirements, id_map = self._normalize_requirements(final_requirements)
             review = self._normalize_review(review, id_map)
@@ -310,12 +401,13 @@ class RequirementsPipeline:
                     "added": [],
                     "removed": [],
                     "warnings": warnings,
-                }
+                }, repairs_applied
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
-                return final_requirements, changelog
+                write_normalized_if_repaired(final_requirements, changelog)
+                return final_requirements, changelog, repairs_applied
 
             fix_prompt = read_text(
                 self.prompts_dir / "requirements_apply_retry_fix_gates.md"
@@ -344,17 +436,43 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
+            repair_requirements, repair_warnings = self._repair_requirements_payload(
+                repair_requirements
+            )
+            if repair_warnings:
+                self._repair_warnings.extend(repair_warnings)
+                write_json(
+                    artifacts_dir / "repairs_warnings.json",
+                    {"warnings": self._repair_warnings},
+                )
+            repairs_applied = True
             try:
                 repair_changelog = self._extract_marked_json(
                     fix_response.raw_text,
                     "CHANGELOG_JSON:",
                     {"splits", "replacements", "added", "removed"},
                 )
+                write_json(
+                    raw_dir / "turnr4_apply_retry_fix_changelog_extracted.json",
+                    repair_changelog,
+                )
             except ValueError:
                 repair_changelog = {
                     "warnings": ["Missing CHANGELOG_JSON in apply fix output."],
                 }
-            validate(instance=repair_requirements, schema=requirements_schema)
+            try:
+                validate(instance=repair_requirements, schema=requirements_schema)
+            except Exception as exc:
+                snippet = json.dumps(repair_requirements)[:300]
+                raise RuntimeError(
+                    "FINAL_REQUIREMENTS_JSON (repair) failed validation after repairs. "
+                    "See artifacts/repairs_warnings.json and raw turnr4 files. "
+                    f"Snippet: {snippet}"
+                ) from exc
+            write_json(
+                raw_dir / "turnr4_apply_retry_fix_final_requirements_extracted.json",
+                repair_requirements,
+            )
 
             merged = self._merge_requirements(final_requirements, repair_requirements)
             changelog = self._merge_changelog(changelog, repair_changelog)
@@ -374,12 +492,13 @@ class RequirementsPipeline:
                     "added": [],
                     "removed": [],
                     "warnings": warnings,
-                }
+                }, repairs_applied
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
-                return final_requirements, changelog
+                write_normalized_if_repaired(final_requirements, changelog)
+                return final_requirements, changelog, repairs_applied
 
             raise RuntimeError(
                 f"Requirements apply step failed gates: {', '.join(failures)}"
@@ -398,21 +517,28 @@ class RequirementsPipeline:
             wrapper_keys = sorted(parsed_wrapper.keys())
             candidate = parsed_wrapper.get(wrapper_key)
             if isinstance(candidate, dict) and expected_keys.issubset(candidate.keys()):
+                self._record_extraction(f"{wrapper_key}:wrapper")
                 return candidate
+            if expected_keys.issubset(parsed_wrapper.keys()):
+                self._record_extraction(f"{wrapper_key}:single-json")
+                return parsed_wrapper
 
         match = re.search(re.escape(marker), raw_text)
         if match:
             snippet = raw_text[match.end():]
             parsed = self._match_expected_json(snippet, expected_keys)
             if parsed is not None:
+                self._record_extraction(f"{wrapper_key}:marked-block")
                 return parsed
 
         parsed = self._match_expected_json(raw_text, expected_keys)
         if parsed is not None:
+            self._record_extraction(f"{wrapper_key}:raw-json")
             return parsed
 
         for obj in self._scan_json_objects(raw_text):
             if self._matches_keys(obj, expected_keys):
+                self._record_extraction(f"{wrapper_key}:scan")
                 return obj
 
         snippet = raw_text.strip().replace("\n", " ")
@@ -527,6 +653,79 @@ class RequirementsPipeline:
 
         return failures
 
+    def _check_coverage(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
+        req_items = requirements.get("requirements", [])
+        req_texts = [str(item.get("text", "")).lower() for item in req_items]
+        missing_areas: List[str] = []
+        min_per_area = limits.min_per_area or 1
+        if limits.coverage_areas:
+            for area in limits.coverage_areas:
+                area_lower = area.lower()
+                count = sum(1 for text in req_texts if area_lower in text)
+                if count < min_per_area:
+                    missing_areas.append(area)
+
+        missing_seeds: List[str] = []
+        for seed in limits.seed_requirements:
+            seed_lower = seed.lower()
+            if not any(seed_lower in text for text in req_texts):
+                missing_seeds.append(seed)
+
+        req_count = len(req_items)
+        missing_count = max(limits.req_min - req_count, 0)
+        needs_retry = bool(missing_areas or missing_seeds or missing_count)
+        return {
+            "missing_areas": missing_areas,
+            "missing_seeds": missing_seeds,
+            "missing_count": missing_count,
+            "needs_retry": needs_retry,
+            "req_count": req_count,
+        }
+
+    def _run_coverage_retry(
+        self,
+        adapter: LLMAdapter,
+        brief: str,
+        draft_requirements: Dict,
+        coverage: Dict,
+        limits: RequirementsLimits,
+        raw_dir: Path,
+    ) -> Dict | None:
+        if not coverage.get("needs_retry"):
+            return None
+        retry_template = read_text(
+            self.prompts_dir / "requirements_lead_retry_missing_coverage.md"
+        )
+        retry_prompt = self._render_prompt(retry_template, limits)
+        retry_payload = {
+            "brief": brief,
+            "existing_requirements": draft_requirements,
+            "missing_areas": coverage.get("missing_areas", []),
+            "missing_seeds": coverage.get("missing_seeds", []),
+            "missing_count": coverage.get("missing_count", 0),
+        }
+        retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        retry_prompt_path = raw_dir / "turnr1_coverage_retry_prompt.txt"
+        write_text(retry_prompt_path, retry_full_prompt)
+        retry_response = adapter.complete(retry_full_prompt)
+        retry_raw_path = raw_dir / "turnr1_coverage_retry_raw.txt"
+        write_text(retry_raw_path, retry_response.raw_text)
+        self._write_usage(raw_dir / "turnr1_coverage_retry_usage.json", retry_response)
+        try:
+            retries = self._extract_marked_json(
+                retry_response.raw_text,
+                "REQUIREMENTS_JSON:",
+                {"requirements", "assumptions", "constraints"},
+            )
+            write_json(raw_dir / "turnr1_coverage_retry_requirements.json", retries)
+            return retries
+        except ValueError as exc:
+            write_json(
+                raw_dir / "turnr1_coverage_retry_warning.json",
+                {"warning": str(exc)},
+            )
+            return None
+
     def _normalize_requirements(self, payload: Dict) -> Tuple[Dict, Dict[str, str]]:
         items = payload.get("requirements", [])
         mapping: Dict[str, str] = {}
@@ -550,6 +749,129 @@ class RequirementsPipeline:
             "assumptions": payload.get("assumptions", []),
             "constraints": payload.get("constraints", []),
         }, mapping
+
+    def _repair_requirements_payload(self, payload: Dict) -> tuple[Dict, List[Dict]]:
+        warnings: List[Dict] = []
+        if not isinstance(payload, dict):
+            warnings.append(
+                {
+                    "warning": "Requirements payload is not a JSON object.",
+                    "original": payload,
+                }
+            )
+            return payload, warnings
+
+        items = payload.get("requirements", [])
+        if not isinstance(items, list):
+            warnings.append(
+                {
+                    "warning": "Requirements list is not an array.",
+                    "original": items,
+                }
+            )
+            items = []
+
+        existing_ids: set[str] = set()
+        next_id = 1
+
+        def allocate_id() -> str:
+            nonlocal next_id
+            while True:
+                candidate = f"REQ-TEMP-{next_id}"
+                next_id += 1
+                if candidate not in existing_ids:
+                    existing_ids.add(candidate)
+                    return candidate
+
+        def infer_priority(text: str) -> str:
+            match = re.match(r"\s*(must|should|could|shall)\b", text, re.IGNORECASE)
+            if match:
+                value = match.group(1).lower()
+                return "must" if value == "shall" else value
+            return "should"
+
+        def strip_priority_prefix(text: str) -> str:
+            return re.sub(r"^\s*(must|should|could|shall)\b[:\-\s]*", "", text, flags=re.IGNORECASE)
+
+        normalized_items: List[Dict] = []
+        for index, item in enumerate(items):
+            if isinstance(item, str):
+                text = strip_priority_prefix(item.strip())
+                req_id = allocate_id()
+                priority = infer_priority(item)
+                warnings.append(
+                    {
+                        "index": index,
+                        "original": item,
+                        "repaired_id": req_id,
+                        "note": "Converted string requirement to object.",
+                    }
+                )
+                normalized_items.append(
+                    {"id": req_id, "text": text, "priority": priority}
+                )
+                continue
+
+            if isinstance(item, dict):
+                repair_notes: List[str] = []
+                text = item.get("text") or item.get("normalized_text") or item.get("requirement")
+                if text is None:
+                    warnings.append(
+                        {
+                            "index": index,
+                            "original": item,
+                            "repaired_id": None,
+                            "note": "Dropped requirement with no text field.",
+                        }
+                    )
+                    continue
+                text_str = str(text).strip()
+                if "text" not in item and ("normalized_text" in item or "requirement" in item):
+                    repair_notes.append("Normalized text field from alternate key.")
+                raw_priority = item.get("priority")
+                if isinstance(raw_priority, str):
+                    priority = raw_priority.lower()
+                else:
+                    priority = infer_priority(text_str)
+                    repair_notes.append("Inferred priority for requirement.")
+                if priority not in {"must", "should", "could"}:
+                    priority = infer_priority(text_str)
+                    repair_notes.append("Repaired invalid priority value.")
+
+                req_id = item.get("id") if isinstance(item.get("id"), str) else None
+                if not req_id:
+                    req_id = allocate_id()
+                    repair_notes.append("Assigned new id for missing requirement id.")
+                elif req_id in existing_ids:
+                    new_id = allocate_id()
+                    repair_notes.append("Assigned new id for duplicate requirement id.")
+                    req_id = new_id
+                existing_ids.add(req_id)
+                if repair_notes:
+                    warnings.append(
+                        {
+                            "index": index,
+                            "original": item,
+                            "repaired_id": req_id,
+                            "note": "; ".join(repair_notes),
+                        }
+                    )
+                normalized_items.append(
+                    {"id": req_id, "text": text_str, "priority": priority}
+                )
+                continue
+
+            warnings.append(
+                {
+                    "index": index,
+                    "original": item,
+                    "repaired_id": None,
+                    "note": "Dropped requirement with unsupported type.",
+                }
+            )
+
+        payload["requirements"] = normalized_items
+        return payload, warnings
 
     def _normalize_review(self, review: Dict, mapping: Dict[str, str]) -> Dict:
         def map_ids(ids: List[str]) -> List[str]:
@@ -682,8 +1004,23 @@ class RequirementsPipeline:
             if not isinstance(values, list):
                 warnings.append(f"{key} entry is not a list or string.")
                 return []
-            mapped = [map_id(item) for item in values if isinstance(item, str)]
-            return [item for item in mapped if item]
+            normalized: List[str] = []
+            for item in values:
+                if isinstance(item, str):
+                    mapped = map_id(item)
+                    if mapped:
+                        normalized.append(mapped)
+                elif isinstance(item, dict):
+                    target = item.get("to") or item.get("id")
+                    if isinstance(target, str):
+                        mapped = map_id(target)
+                        if mapped:
+                            normalized.append(mapped)
+                    else:
+                        warnings.append(f"{key} entry has invalid object: {item}")
+                else:
+                    warnings.append(f"{key} entry has unsupported type: {item}")
+            return normalized
 
         normalized = {
             "splits": splits,
@@ -743,6 +1080,11 @@ class RequirementsPipeline:
         changelog["added"] = added
         return changelog
 
+    def _record_extraction(self, note: str) -> None:
+        self._extraction_traces.append(note)
+        if self._env("ORCH_DEBUG_EXTRACT", "") == "1":
+            print(f"[extract] {note}")
+
     def _validate_changelog(self, changelog: Dict) -> None:
         required_keys = {"splits", "replacements", "added", "removed"}
         if not isinstance(changelog, dict) or not required_keys.issubset(changelog.keys()):
@@ -750,15 +1092,31 @@ class RequirementsPipeline:
 
     def _limits_from_frontmatter(self, frontmatter: Dict) -> RequirementsLimits:
         req_target = frontmatter.get("requirements_target", {}) if isinstance(frontmatter, dict) else {}
-        req_min = int(req_target.get("min", 30))
-        req_max = req_target.get("max")
-        req_max_int = int(req_max) if req_max is not None else None
+        req_min = int(frontmatter.get("target_min_reqs", req_target.get("min", 30)))
+        req_max = frontmatter.get("target_max_reqs", req_target.get("max"))
+        if req_max == "" or req_max is None:
+            req_max_int = None
+        else:
+            req_max_int = int(req_max)
+        coverage_areas = frontmatter.get("coverage_areas", [])
+        if isinstance(coverage_areas, str):
+            coverage_areas = [coverage_areas]
+        coverage_areas = list(coverage_areas)
+        min_per_area = frontmatter.get("min_per_area")
+        min_per_area_int = int(min_per_area) if min_per_area is not None else None
+        seed_requirements = frontmatter.get("seed_requirements", [])
+        if isinstance(seed_requirements, str):
+            seed_requirements = [seed_requirements]
+        seed_requirements = list(seed_requirements)
         return RequirementsLimits(
             req_min=req_min,
             req_max=req_max_int,
             assumptions_min=int(frontmatter.get("assumptions_min", 3)),
             constraints_min=int(frontmatter.get("constraints_min", 3)),
             roles_expected=list(frontmatter.get("roles_expected", [])),
+            coverage_areas=coverage_areas,
+            min_per_area=min_per_area_int,
+            seed_requirements=seed_requirements,
         )
 
     def _limits_payload(self, limits: RequirementsLimits) -> Dict:
@@ -768,6 +1126,9 @@ class RequirementsPipeline:
             "assumptions_min": limits.assumptions_min,
             "constraints_min": limits.constraints_min,
             "roles_expected": limits.roles_expected,
+            "coverage_areas": limits.coverage_areas,
+            "min_per_area": limits.min_per_area,
+            "seed_requirements": limits.seed_requirements,
         }
 
     def _metrics(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
@@ -781,16 +1142,34 @@ class RequirementsPipeline:
 
     def _render_prompt(self, template: str, limits: RequirementsLimits) -> str:
         roles = ", ".join(limits.roles_expected) if limits.roles_expected else "none"
+        coverage = ", ".join(limits.coverage_areas) if limits.coverage_areas else "none"
+        seeds = "\n".join(f"- {seed}" for seed in limits.seed_requirements) or "none"
+        min_per_area = (
+            str(limits.min_per_area) if limits.min_per_area is not None else "none"
+        )
         return (
             template.replace("{{REQ_MIN}}", str(limits.req_min))
             .replace("{{REQ_MAX}}", str(limits.req_max) if limits.req_max is not None else "none")
             .replace("{{ASSUMPTIONS_MIN}}", str(limits.assumptions_min))
             .replace("{{CONSTRAINTS_MIN}}", str(limits.constraints_min))
             .replace("{{ROLES_EXPECTED}}", roles)
+            .replace("{{COVERAGE_AREAS}}", coverage)
+            .replace("{{MIN_PER_AREA}}", min_per_area)
+            .replace("{{SEED_REQUIREMENTS}}", seeds)
         )
 
     def _parse_frontmatter(self, content: str) -> Tuple[Dict, str]:
         if not content.startswith("---"):
+            stripped = content.lstrip()
+            if stripped.startswith("{"):
+                try:
+                    decoder = json.JSONDecoder()
+                    parsed, end = decoder.raw_decode(stripped)
+                except json.JSONDecodeError:
+                    return {}, content
+                if isinstance(parsed, dict):
+                    body = stripped[end:].lstrip("\n")
+                    return parsed, body
             return {}, content
         parts = content.split("---", 2)
         if len(parts) < 3:
@@ -810,6 +1189,64 @@ class RequirementsPipeline:
             "assumptions_min": int(self._env("ORCH_ASSUMPTIONS_MIN", "3")),
             "constraints_min": int(self._env("ORCH_CONSTRAINTS_MIN", "3")),
         }
+
+    def _write_run_summary(
+        self,
+        artifacts_dir: Path,
+        requirements: Dict,
+        coverage: Dict,
+        repairs_applied: bool,
+        responses: List[LLMResponse],
+    ) -> None:
+        req_count = len(requirements.get("requirements", []))
+        missing_areas = coverage.get("missing_areas", [])
+        missing_seeds = coverage.get("missing_seeds", [])
+        usage_totals = self._collect_usage_totals(artifacts_dir.parent / "raw", responses)
+        lines = [
+            "# Run Summary",
+            "",
+            f"- req_count: {req_count}",
+            f"- missing_areas: {', '.join(missing_areas) if missing_areas else 'none'}",
+            f"- missing_seeds: {', '.join(missing_seeds) if missing_seeds else 'none'}",
+            f"- repairs_applied: {'yes' if repairs_applied else 'no'}",
+        ]
+        if usage_totals:
+            lines.append(
+                "- token_usage: "
+                + ", ".join(f"{key}={value}" for key, value in usage_totals.items())
+            )
+        if self._repair_warnings:
+            lines.append(
+                f"- repairs_warnings: {len(self._repair_warnings)} "
+                "(see artifacts/repairs_warnings.json)"
+            )
+        write_text(artifacts_dir / "run_summary.md", "\n".join(lines) + "\n")
+
+    def _collect_usage_totals(
+        self, raw_dir: Path, responses: List[LLMResponse]
+    ) -> Dict[str, int]:
+        totals: Dict[str, int] = {}
+        usage_files = list(raw_dir.glob("*_usage.json"))
+        for path in usage_files:
+            try:
+                usage = json.loads(read_text(path))
+            except Exception:
+                continue
+            if isinstance(usage, dict):
+                for key, value in usage.items():
+                    if isinstance(value, int):
+                        totals[key] = totals.get(key, 0) + value
+        if totals:
+            return totals
+
+        for response in responses:
+            usage = getattr(response, "usage", None)
+            if not usage:
+                continue
+            for key, value in usage.items():
+                if isinstance(value, int):
+                    totals[key] = totals.get(key, 0) + value
+        return totals
 
     def _write_usage(self, path: Path, response: LLMResponse) -> None:
         usage = getattr(response, "usage", None)
