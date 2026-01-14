@@ -2,9 +2,9 @@ Return ONLY the REQUIREMENTS_JSON block.
 
 Format:
 REQUIREMENTS_JSON:
-<json>
+{"requirements":[],"assumptions":[],"constraints":[]}
 
-The JSON must match normalized_requirements.schema.json:
-{"requirements":[{"id":"REQ-1","text":"...","priority":"must"}],"assumptions":["..."],"constraints":["..."]}
-
-No markdown, no extra text.
+Rules:
+- requirements must include 30–45 items with unique IDs and priorities.
+- assumptions and constraints must each include at least 3 items.
+- No markdown, no extra text.

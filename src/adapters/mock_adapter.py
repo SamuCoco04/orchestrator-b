@@ -22,77 +22,9 @@ class MockAdapter(LLMAdapter):
 
     def _build_payload(self, prompt: str) -> Dict:
         if "requirements_chatgpt_lead" in prompt:
-            review = {
-                "accepted": ["Add Erasmus Coordinator role"],
-                "rejected": [],
-                "issues": ["Epic requirements need splitting"],
-                "missing": ["Define compliance checkpoints"],
-                "rationale": ["Role clarity reduces process risk"],
-            }
-            requirements = {
-                "requirements": [
-                    {"id": "REQ-1", "text": "Add Erasmus Coordinator role.", "priority": "must"},
-                    {"id": "REQ-2", "text": "Track exchange deadlines.", "priority": "must"},
-                    {"id": "REQ-3", "text": "Provide student advising workflow.", "priority": "should"},
-                ],
-                "assumptions": [],
-                "constraints": [],
-            }
-            return (
-                "REVIEW_JSON:\n"
-                f"{json.dumps(review)}\n"
-                "REQUIREMENTS_JSON:\n"
-                f"{json.dumps(requirements)}"
-            )
+            return '{"REVIEW_JSON": {"accepted": ["REQ-2", "REQ-3", "REQ-4", "REQ-5", "REQ-6", "REQ-7", "REQ-8", "REQ-9", "REQ-10", "REQ-11", "REQ-12", "REQ-13", "REQ-14", "REQ-15", "REQ-16", "REQ-17", "REQ-18", "REQ-19", "REQ-20", "REQ-21", "REQ-22", "REQ-23", "REQ-24", "REQ-25", "REQ-26", "REQ-27", "REQ-28", "REQ-29", "REQ-30", "REQ-31", "REQ-32", "REQ-33"], "rejected": ["REQ-1"], "issues": ["Epic requirements need splitting"], "missing": ["Deadline publishing workflow"], "rationale": ["Ensure actionable requirements and compliance"]}, "REQUIREMENTS_JSON": {"requirements": [{"id": "REQ-2", "text": "Track exchange deadlines.", "priority": "must"}, {"id": "REQ-3", "text": "Provide student advising workflow.", "priority": "should"}, {"id": "REQ-4", "text": "Define compliance checkpoints.", "priority": "must"}, {"id": "REQ-5", "text": "Notify students of deadline changes.", "priority": "should"}, {"id": "REQ-6", "text": "Maintain audit trail for approvals.", "priority": "could"}, {"id": "REQ-7", "text": "Offer Erasmus Coordinator dashboard.", "priority": "should"}, {"id": "REQ-8", "text": "Assign coordinator backup role.", "priority": "could"}, {"id": "REQ-9", "text": "Integrate calendar sync for deadlines.", "priority": "could"}, {"id": "REQ-10", "text": "Capture eligibility status per student.", "priority": "must"}, {"id": "REQ-11", "text": "Support deadline escalation workflow.", "priority": "should"}, {"id": "REQ-12", "text": "Generate compliance reports.", "priority": "must"}, {"id": "REQ-13", "text": "Store partner university requirements.", "priority": "should"}, {"id": "REQ-14", "text": "Provide multilingual notices.", "priority": "could"}, {"id": "REQ-15", "text": "Track application milestones.", "priority": "must"}, {"id": "REQ-16", "text": "Notify stakeholders of status changes.", "priority": "should"}, {"id": "REQ-17", "text": "Support exception approvals.", "priority": "could"}, {"id": "REQ-18", "text": "Track outgoing and incoming exchanges.", "priority": "must"}, {"id": "REQ-19", "text": "Maintain contact history.", "priority": "could"}, {"id": "REQ-20", "text": "Provide SLA metrics.", "priority": "could"}, {"id": "REQ-21", "text": "Capture visa documentation status.", "priority": "must"}, {"id": "REQ-22", "text": "Validate partner agreements.", "priority": "should"}, {"id": "REQ-23", "text": "Allow deadline override approvals.", "priority": "must"}, {"id": "REQ-24", "text": "Support bulk deadline updates.", "priority": "should"}, {"id": "REQ-25", "text": "Archive completed exchange cases.", "priority": "could"}, {"id": "REQ-26", "text": "Generate onboarding checklists.", "priority": "should"}, {"id": "REQ-27", "text": "Provide coordinator task queue.", "priority": "must"}, {"id": "REQ-28", "text": "Sync with student records system.", "priority": "must"}, {"id": "REQ-29", "text": "Support compliance reminders.", "priority": "should"}, {"id": "REQ-30", "text": "Publish deadlines to portal.", "priority": "must"}, {"id": "REQ-31", "text": "Moderate coordinator edits.", "priority": "could"}, {"id": "REQ-32", "text": "Enable approval workflows.", "priority": "must"}, {"id": "REQ-33", "text": "Record GDPR consent.", "priority": "should"}], "assumptions": ["Students have university email accounts.", "Coordinator access is provisioned by IT.", "Partner data feeds are available quarterly."], "constraints": ["Must comply with GDPR.", "Must support audit retention for 7 years.", "Must run on existing university SSO."]}}'
         if "requirements_apply_chatgpt" in prompt:
-            final_requirements = {
-                "requirements": [
-                    {"id": "REQ-2", "text": "Track exchange deadlines.", "priority": "must"},
-                    {"id": "REQ-3", "text": "Provide student advising workflow.", "priority": "should"},
-                    {"id": "REQ-4", "text": "Define compliance checkpoints.", "priority": "must"},
-                    {"id": "REQ-5", "text": "Notify students of deadline changes.", "priority": "should"},
-                    {"id": "REQ-6", "text": "Maintain audit trail for approvals.", "priority": "could"},
-                    {"id": "REQ-8", "text": "Offer Erasmus Coordinator dashboard.", "priority": "should"},
-                    {"id": "REQ-9", "text": "Assign coordinator backup role.", "priority": "could"},
-                    {"id": "REQ-10", "text": "Integrate calendar sync for deadlines.", "priority": "could"},
-                    {"id": "REQ-11", "text": "Capture eligibility status per student.", "priority": "must"},
-                    {"id": "REQ-13", "text": "Support deadline escalation workflow.", "priority": "should"},
-                    {"id": "REQ-15", "text": "Generate compliance reports.", "priority": "must"},
-                    {"id": "REQ-16", "text": "Store partner university requirements.", "priority": "should"},
-                    {"id": "REQ-17", "text": "Provide multilingual notices.", "priority": "could"},
-                    {"id": "REQ-18", "text": "Track application milestones.", "priority": "must"},
-                    {"id": "REQ-19", "text": "Notify stakeholders of status changes.", "priority": "should"},
-                    {"id": "REQ-20", "text": "Support exception approvals.", "priority": "could"},
-                    {"id": "REQ-21", "text": "Track outgoing and incoming exchanges.", "priority": "must"},
-                    {"id": "REQ-22", "text": "Maintain contact history.", "priority": "could"},
-                    {"id": "REQ-23", "text": "Provide SLA metrics.", "priority": "could"},
-                    {"id": "REQ-24", "text": "Capture visa documentation status.", "priority": "must"},
-                    {"id": "REQ-25", "text": "Validate partner agreements.", "priority": "should"},
-                    {"id": "REQ-26", "text": "Allow deadline override approvals.", "priority": "must"},
-                    {"id": "REQ-27", "text": "Support bulk deadline updates.", "priority": "should"},
-                    {"id": "REQ-28", "text": "Archive completed exchange cases.", "priority": "could"},
-                    {"id": "REQ-29", "text": "Generate onboarding checklists.", "priority": "should"},
-                    {"id": "REQ-30", "text": "Provide coordinator task queue.", "priority": "must"},
-                    {"id": "REQ-31", "text": "Sync with student records system.", "priority": "must"},
-                    {"id": "REQ-32", "text": "Support compliance reminders.", "priority": "should"},
-                ],
-                "assumptions": [],
-                "constraints": [],
-            }
-            changelog = {
-                "splits": [
-                    {"from": "REQ-1", "to": ["REQ-2", "REQ-4"], "note": "Split epic into actionable items"}
-                ],
-                "replacements": [],
-                "added": ["REQ-4", "REQ-5", "REQ-6"],
-                "removed": ["REQ-1"],
-            }
-            return (
-                "FINAL_REQUIREMENTS_JSON:\n"
-                f"{json.dumps(final_requirements)}\n"
-                "CHANGELOG_JSON:\n"
-                f"{json.dumps(changelog)}"
-            )
+            return '{"FINAL_REQUIREMENTS_JSON": {"requirements": [{"id": "REQ-2", "text": "Track exchange deadlines.", "priority": "must"}, {"id": "REQ-3", "text": "Provide student advising workflow.", "priority": "should"}, {"id": "REQ-4", "text": "Define compliance checkpoints.", "priority": "must"}, {"id": "REQ-5", "text": "Notify students of deadline changes.", "priority": "should"}, {"id": "REQ-6", "text": "Maintain audit trail for approvals.", "priority": "could"}, {"id": "REQ-7", "text": "Offer Erasmus Coordinator dashboard.", "priority": "should"}, {"id": "REQ-8", "text": "Assign coordinator backup role.", "priority": "could"}, {"id": "REQ-9", "text": "Integrate calendar sync for deadlines.", "priority": "could"}, {"id": "REQ-10", "text": "Capture eligibility status per student.", "priority": "must"}, {"id": "REQ-11", "text": "Support deadline escalation workflow.", "priority": "should"}, {"id": "REQ-12", "text": "Generate compliance reports.", "priority": "must"}, {"id": "REQ-13", "text": "Store partner university requirements.", "priority": "should"}, {"id": "REQ-14", "text": "Provide multilingual notices.", "priority": "could"}, {"id": "REQ-15", "text": "Track application milestones.", "priority": "must"}, {"id": "REQ-16", "text": "Notify stakeholders of status changes.", "priority": "should"}, {"id": "REQ-17", "text": "Support exception approvals.", "priority": "could"}, {"id": "REQ-18", "text": "Track outgoing and incoming exchanges.", "priority": "must"}, {"id": "REQ-19", "text": "Maintain contact history.", "priority": "could"}, {"id": "REQ-20", "text": "Provide SLA metrics.", "priority": "could"}, {"id": "REQ-21", "text": "Capture visa documentation status.", "priority": "must"}, {"id": "REQ-22", "text": "Validate partner agreements.", "priority": "should"}, {"id": "REQ-23", "text": "Allow deadline override approvals.", "priority": "must"}, {"id": "REQ-24", "text": "Support bulk deadline updates.", "priority": "should"}, {"id": "REQ-25", "text": "Archive completed exchange cases.", "priority": "could"}, {"id": "REQ-26", "text": "Generate onboarding checklists.", "priority": "should"}, {"id": "REQ-27", "text": "Provide coordinator task queue.", "priority": "must"}, {"id": "REQ-28", "text": "Sync with student records system.", "priority": "must"}, {"id": "REQ-29", "text": "Support compliance reminders.", "priority": "should"}, {"id": "REQ-30", "text": "Publish deadlines to portal.", "priority": "must"}, {"id": "REQ-31", "text": "Moderate coordinator edits.", "priority": "could"}, {"id": "REQ-32", "text": "Enable approval workflows.", "priority": "must"}, {"id": "REQ-33", "text": "Record GDPR consent.", "priority": "should"}], "assumptions": ["Students have university email accounts.", "Coordinator access is provisioned by IT.", "Partner data feeds are available quarterly."], "constraints": ["Must comply with GDPR.", "Must support audit retention for 7 years.", "Must run on existing university SSO."]}, "CHANGELOG_JSON": {"splits": [{"from": "REQ-1", "to": ["REQ-2", "REQ-4"], "note": "Split epic"}], "replacements": [], "added": ["REQ-29", "REQ-30", "REQ-31", "REQ-32", "REQ-33"], "removed": ["REQ-1"]}}'
         if "requirements_gemini_cross_review" in prompt:
             return {
                 "agreements": ["Splitting epic requirements is necessary.", "Add compliance checkpoints."],
