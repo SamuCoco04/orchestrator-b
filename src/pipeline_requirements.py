@@ -169,6 +169,7 @@ class RequirementsPipeline:
             cross_review,
             limits,
             raw_dir,
+            artifacts_dir,
         )
 
         write_json(raw_dir / "turnr4_final_requirements.json", final_requirements)
@@ -226,6 +227,7 @@ class RequirementsPipeline:
         cross_review: Dict,
         limits: RequirementsLimits,
         raw_dir: Path,
+        artifacts_dir: Path,
     ) -> tuple[Dict, Dict]:
         failures: List[str] = []
         for attempt in range(2):
@@ -254,12 +256,14 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
+            changelog_raw_context: Dict | None = None
             try:
                 changelog = self._extract_marked_json(
                     response.raw_text,
                     "CHANGELOG_JSON:",
                     {"splits", "replacements", "added", "removed"},
                 )
+                changelog_raw_context = changelog
             except ValueError:
                 retry_prompt = read_text(
                     self.prompts_dir / "requirements_apply_retry_changelog_only.md"
@@ -282,16 +286,31 @@ class RequirementsPipeline:
                         "CHANGELOG_JSON:",
                         {"splits", "replacements", "added", "removed"},
                     )
+                    changelog_raw_context = changelog
                 except ValueError as exc:
-                    raise RuntimeError("Missing CHANGELOG_JSON in apply output.") from exc
+                    changelog = None
+                    changelog_raw_context = {"raw_response": retry_response.raw_text}
 
             requirements_schema = self._load_schema("normalized_requirements.schema.json")
             validate(instance=final_requirements, schema=requirements_schema)
-            self._validate_changelog(changelog)
 
             final_requirements, id_map = self._normalize_requirements(final_requirements)
             review = self._normalize_review(review, id_map)
-            changelog = self._normalize_changelog(changelog, id_map)
+            raw_changelog = changelog_raw_context if changelog_raw_context is not None else changelog
+            changelog, warnings = self._normalize_changelog(changelog, id_map)
+            if changelog is None:
+                write_json(artifacts_dir / "changelog_raw.json", raw_changelog)
+                write_json(
+                    artifacts_dir / "changelog_warnings.json",
+                    {"warnings": warnings},
+                )
+                return final_requirements, {
+                    "splits": [],
+                    "replacements": [],
+                    "added": [],
+                    "removed": [],
+                    "warnings": warnings,
+                }
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
@@ -325,19 +344,37 @@ class RequirementsPipeline:
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
-            repair_changelog = self._extract_marked_json(
-                fix_response.raw_text,
-                "CHANGELOG_JSON:",
-                {"splits", "replacements", "added", "removed"},
-            )
+            try:
+                repair_changelog = self._extract_marked_json(
+                    fix_response.raw_text,
+                    "CHANGELOG_JSON:",
+                    {"splits", "replacements", "added", "removed"},
+                )
+            except ValueError:
+                repair_changelog = {
+                    "warnings": ["Missing CHANGELOG_JSON in apply fix output."],
+                }
             validate(instance=repair_requirements, schema=requirements_schema)
-            self._validate_changelog(repair_changelog)
 
             merged = self._merge_requirements(final_requirements, repair_requirements)
             changelog = self._merge_changelog(changelog, repair_changelog)
             final_requirements, id_map = self._normalize_requirements(merged)
             review = self._normalize_review(review, id_map)
-            changelog = self._normalize_changelog(changelog, id_map)
+            raw_changelog = changelog
+            changelog, warnings = self._normalize_changelog(changelog, id_map)
+            if changelog is None:
+                write_json(artifacts_dir / "changelog_raw.json", raw_changelog)
+                write_json(
+                    artifacts_dir / "changelog_warnings.json",
+                    {"warnings": warnings},
+                )
+                return final_requirements, {
+                    "splits": [],
+                    "replacements": [],
+                    "added": [],
+                    "removed": [],
+                    "warnings": warnings,
+                }
             changelog = self._recompute_added(changelog, final_requirements, review)
 
             failures = self._run_gates(final_requirements, review, changelog, limits)
@@ -464,7 +501,7 @@ class RequirementsPipeline:
         split_targets = {
             item_id
             for split in changelog.get("splits", [])
-            for item_id in split.get("to", [])
+            for item_id in split.get("into", []) or split.get("to", [])
         }
         added_ids |= split_targets
         final_ids = {item.get("id") for item in req_items}
@@ -560,33 +597,103 @@ class RequirementsPipeline:
             "rationale": review.get("rationale", []),
         }
 
-    def _normalize_changelog(self, changelog: Dict, mapping: Dict[str, str]) -> Dict:
-        def map_id(value: str) -> str | None:
-            return mapping.get(value)
+    def _normalize_changelog(
+        self, changelog: Dict | None, mapping: Dict[str, str]
+    ) -> tuple[Dict | None, List[str]]:
+        warnings: List[str] = []
+        if not isinstance(changelog, dict):
+            warnings.append("Changelog is not a JSON object.")
+            return None, warnings
 
-        splits = []
-        for split in changelog.get("splits", []):
-            from_id = map_id(split.get("from", ""))
-            to_ids = [map_id(item) for item in split.get("to", [])]
-            to_ids = [item for item in to_ids if item]
-            if from_id or to_ids:
-                splits.append(
-                    {
-                        "from": from_id or split.get("from", ""),
-                        "to": to_ids,
-                        "note": split.get("note", ""),
-                    }
-                )
-        return {
+        required_keys = {"splits", "replacements", "added", "removed"}
+        missing_keys = required_keys - set(changelog.keys())
+        if missing_keys:
+            warnings.append(
+                f"Changelog missing required keys: {', '.join(sorted(missing_keys))}"
+            )
+
+        def map_id(value: str | None) -> str | None:
+            if not value:
+                return None
+            return mapping.get(value, value)
+
+        def parse_split_text(value: str) -> Dict | None:
+            match = re.match(r"\s*(REQ-\d+)\s*->\s*(.+)", value)
+            if not match:
+                warnings.append(f"Unparseable split entry: {value}")
+                return None
+            from_id = match.group(1).strip()
+            into_raw = match.group(2)
+            into_ids = [item.strip() for item in into_raw.split(",") if item.strip()]
+            if not into_ids:
+                warnings.append(f"Split entry missing targets: {value}")
+                return None
+            return {"from": from_id, "into": into_ids}
+
+        def normalize_split_entry(entry: object) -> Dict | None:
+            if isinstance(entry, dict):
+                from_id = entry.get("from")
+                if not isinstance(from_id, str):
+                    warnings.append(f"Split entry missing string from id: {entry}")
+                    return None
+                into_ids = entry.get("into", entry.get("to", []))
+                if isinstance(into_ids, str):
+                    into_ids = [into_ids]
+                if not isinstance(into_ids, list):
+                    warnings.append(f"Split entry has invalid targets: {entry}")
+                    return None
+                mapped_from = map_id(from_id)
+                mapped_into = [
+                    map_id(item) for item in into_ids if isinstance(item, str)
+                ]
+                mapped_into = [item for item in mapped_into if item]
+                if not mapped_into:
+                    warnings.append(f"Split entry missing targets: {entry}")
+                    return None
+                return {"from": mapped_from or from_id, "into": mapped_into}
+            if isinstance(entry, str):
+                parsed = parse_split_text(entry)
+                if not parsed:
+                    return None
+                return {
+                    "from": map_id(parsed["from"]) or parsed["from"],
+                    "into": [map_id(item) or item for item in parsed["into"]],
+                }
+            warnings.append(f"Split entry has unsupported type: {entry}")
+            return None
+
+        raw_splits = changelog.get("splits", [])
+        if isinstance(raw_splits, str):
+            raw_splits = [raw_splits]
+        if not isinstance(raw_splits, list):
+            warnings.append("Splits entry is not a list or string.")
+            raw_splits = []
+
+        splits: List[Dict] = []
+        for split in raw_splits:
+            normalized = normalize_split_entry(split)
+            if normalized:
+                splits.append(normalized)
+
+        def normalize_id_list(key: str) -> List[str]:
+            values = changelog.get(key, [])
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, list):
+                warnings.append(f"{key} entry is not a list or string.")
+                return []
+            mapped = [map_id(item) for item in values if isinstance(item, str)]
+            return [item for item in mapped if item]
+
+        normalized = {
             "splits": splits,
-            "replacements": [
-                item for item in (map_id(val) for val in changelog.get("replacements", [])) if item
-            ],
-            "added": [item for item in (map_id(val) for val in changelog.get("added", [])) if item],
-            "removed": [
-                item for item in (map_id(val) for val in changelog.get("removed", [])) if item
-            ],
+            "replacements": normalize_id_list("replacements"),
+            "added": normalize_id_list("added"),
+            "removed": normalize_id_list("removed"),
         }
+        if warnings:
+            normalized["warnings"] = warnings
+        return normalized, warnings
 
     def _merge_requirements(self, base: Dict, repair: Dict) -> Dict:
         base_items = list(base.get("requirements", []))
@@ -626,6 +733,7 @@ class RequirementsPipeline:
             "replacements": merge_list("replacements"),
             "added": merge_list("added"),
             "removed": merge_list("removed"),
+            "warnings": merge_list("warnings"),
         }
 
     def _recompute_added(self, changelog: Dict, requirements: Dict, review: Dict) -> Dict:

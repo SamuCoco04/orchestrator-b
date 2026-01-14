@@ -20,4 +20,5 @@ Rules:
 - If under minimum, generate NEW requirements aligned to the brief (do not resurrect rejected).
 - assumptions and constraints must meet their minimums.
 - CHANGELOG_JSON must list added/removed/replacements/splits (arrays may be minimal but must exist).
+- CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
 - No markdown, no extra keys.
