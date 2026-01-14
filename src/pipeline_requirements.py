@@ -35,8 +35,10 @@ class RequirementsPipeline:
         self.base_dir = base_dir
         self.schemas_dir = base_dir / "schemas"
         self.prompts_dir = base_dir / "configs" / "prompts"
+        self._review_normalization_warnings: List[str] = []
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
+        self._review_normalization_warnings = []
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -114,6 +116,13 @@ class RequirementsPipeline:
                     "Lead returned only REVIEW_JSON; enforce prompt format."
                     + wrapper_note
                 ) from exc
+
+        review_json = self.normalize_review_json(review_json)
+        if self._review_normalization_warnings:
+            write_json(
+                artifacts_dir / "review_normalization_warnings.json",
+                {"warnings": self._review_normalization_warnings},
+            )
 
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
@@ -512,6 +521,40 @@ class RequirementsPipeline:
         return {
             "accepted": map_ids(review.get("accepted", [])),
             "rejected": map_ids(review.get("rejected", [])),
+            "issues": review.get("issues", []),
+            "missing": review.get("missing", []),
+            "rationale": review.get("rationale", []),
+        }
+
+    def normalize_review_json(self, review: Dict) -> Dict:
+        def normalize_ids(key: str) -> List[str]:
+            normalized: List[str] = []
+            values = review.get(key, [])
+            if not isinstance(values, list):
+                return normalized
+            for item in values:
+                if isinstance(item, str):
+                    normalized.append(item)
+                elif isinstance(item, dict):
+                    candidate = item.get("id")
+                    if isinstance(candidate, str):
+                        normalized.append(candidate)
+                        self._review_normalization_warnings.append(
+                            f"Normalized {key} entry object to id: {candidate}"
+                        )
+                    else:
+                        self._review_normalization_warnings.append(
+                            f"Dropped {key} entry without string id: {item}"
+                        )
+                else:
+                    self._review_normalization_warnings.append(
+                        f"Dropped {key} entry with unsupported type: {item}"
+                    )
+            return normalized
+
+        return {
+            "accepted": normalize_ids("accepted"),
+            "rejected": normalize_ids("rejected"),
             "issues": review.get("issues", []),
             "missing": review.get("missing", []),
             "rationale": review.get("rationale", []),
