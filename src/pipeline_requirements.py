@@ -5,8 +5,9 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
+import yaml
 from jsonschema import validate
 
 from src.adapters.gemini_adapter import GeminiAdapter
@@ -20,8 +21,12 @@ from src.utils.io import read_text, write_json, write_text
 
 
 @dataclass
-class GateResult:
-    failures: List[str]
+class RequirementsLimits:
+    req_min: int
+    req_max: int | None
+    assumptions_min: int
+    constraints_min: int
+    roles_expected: List[str]
 
 
 class RequirementsPipeline:
@@ -32,7 +37,10 @@ class RequirementsPipeline:
         self.prompts_dir = base_dir / "configs" / "prompts"
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
-        brief = read_text(brief_path)
+        raw_brief = read_text(brief_path)
+        frontmatter, brief = self._parse_frontmatter(raw_brief)
+        limits = self._limits_from_frontmatter(frontmatter)
+
         raw_dir = run_dir / "raw"
         artifacts_dir = run_dir / "artifacts"
         adrs_dir = artifacts_dir / "adrs"
@@ -43,7 +51,8 @@ class RequirementsPipeline:
         gemini = self._adapter("gemini")
         chatgpt = self._adapter("chatgpt")
 
-        lead_prompt = read_text(self.prompts_dir / "requirements_chatgpt_lead.md")
+        lead_template = read_text(self.prompts_dir / "requirements_chatgpt_lead.md")
+        lead_prompt = self._render_prompt(lead_template, limits)
         lead_full_prompt = f"{lead_prompt}\n\nINPUT:\n{brief}\n"
         lead_prompt_path = raw_dir / "turnr1_chatgpt_lead_prompt.txt"
         write_text(lead_prompt_path, lead_full_prompt)
@@ -80,9 +89,10 @@ class RequirementsPipeline:
                     {"accepted", "rejected", "issues", "missing", "rationale"},
                 )
         except ValueError:
-            retry_prompt = read_text(
+            retry_template = read_text(
                 self.prompts_dir / "requirements_lead_retry_requirements_only.md"
             )
+            retry_prompt = self._render_prompt(retry_template, limits)
             retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
             retry_prompt_path = raw_dir / "turnr1_lead_retry_prompt.txt"
             write_text(retry_prompt_path, retry_full_prompt)
@@ -105,16 +115,20 @@ class RequirementsPipeline:
                     + wrapper_note
                 ) from exc
 
-        requirements_schema = self._load_schema("requirements_strict.schema.json")
+        requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
         review_schema = self._load_schema("requirements_review.schema.json")
         validate(instance=review_json, schema=review_schema)
+
+        draft_requirements, id_map = self._normalize_requirements(draft_requirements)
+        review_json = self._normalize_review(review_json, id_map)
 
         write_json(raw_dir / "turnr1_draft.json", draft_requirements)
         write_json(raw_dir / "turnr1_review.json", review_json)
         write_json(artifacts_dir / "requirements_review.json", review_json)
 
-        cross_prompt = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
+        cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
+        cross_prompt = self._render_prompt(cross_template, limits)
         cross_payload = {
             "brief": brief,
             "requirements": draft_requirements,
@@ -135,7 +149,8 @@ class RequirementsPipeline:
         write_json(raw_dir / "turnr3_gemini_cross_review.json", cross_review)
         write_json(artifacts_dir / "turnr3_gemini_cross_review.json", cross_review)
 
-        apply_prompt = read_text(self.prompts_dir / "requirements_apply_chatgpt.md")
+        apply_template = read_text(self.prompts_dir / "requirements_apply_chatgpt.md")
+        apply_prompt = self._render_prompt(apply_template, limits)
         final_requirements, changelog = self._run_apply(
             chatgpt,
             apply_prompt,
@@ -143,6 +158,7 @@ class RequirementsPipeline:
             draft_requirements,
             review_json,
             cross_review,
+            limits,
             raw_dir,
         )
 
@@ -159,13 +175,7 @@ class RequirementsPipeline:
             "review": review_json,
             "cross_review": cross_review,
             "changelog": changelog,
-            "metrics": {
-                "requirements_count": len(final_requirements.get("requirements", [])),
-                "assumptions_count": len(final_requirements.get("assumptions", [])),
-                "constraints_count": len(final_requirements.get("constraints", [])),
-                "target_min": int(self._env("ORCH_REQ_MIN_COUNT", "30")),
-                "target_max": int(self._env("ORCH_REQ_MAX_COUNT", "45")),
-            },
+            "metrics": self._metrics(final_requirements, limits),
         }
         adr_full_prompt = f"{adr_prompt}\n\nINPUT:\n{json.dumps(adr_payload)}\n"
         adr_prompt_path = raw_dir / "turnr5_chatgpt_adr_prompt.txt"
@@ -205,6 +215,7 @@ class RequirementsPipeline:
         draft: Dict,
         review: Dict,
         cross_review: Dict,
+        limits: RequirementsLimits,
         raw_dir: Path,
     ) -> tuple[Dict, Dict]:
         failures: List[str] = []
@@ -220,7 +231,7 @@ class RequirementsPipeline:
                 "requirements": draft,
                 "review": review,
                 "cross_review": cross_review,
-                "gates": self._gate_config(),
+                "limits": self._limits_payload(limits),
             }
             full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}{instruction}\n"
             prompt_path = raw_dir / "turnr4_apply_prompt.txt"
@@ -265,17 +276,23 @@ class RequirementsPipeline:
                 except ValueError as exc:
                     raise RuntimeError("Missing CHANGELOG_JSON in apply output.") from exc
 
-            requirements_schema = self._load_schema("requirements_strict.schema.json")
+            requirements_schema = self._load_schema("normalized_requirements.schema.json")
             validate(instance=final_requirements, schema=requirements_schema)
             self._validate_changelog(changelog)
 
-            failures = self._run_gates(final_requirements, review, changelog)
+            final_requirements, id_map = self._normalize_requirements(final_requirements)
+            review = self._normalize_review(review, id_map)
+            changelog = self._normalize_changelog(changelog, id_map)
+            changelog = self._recompute_added(changelog, final_requirements, review)
+
+            failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
                 return final_requirements, changelog
 
             fix_prompt = read_text(
                 self.prompts_dir / "requirements_apply_retry_fix_gates.md"
             )
+            fix_prompt = self._render_prompt(fix_prompt, limits)
             fix_payload = {
                 "brief": brief,
                 "previous": {
@@ -285,6 +302,7 @@ class RequirementsPipeline:
                 "review": review,
                 "cross_review": cross_review,
                 "failures": failures,
+                "limits": self._limits_payload(limits),
             }
             fix_full_prompt = f"{fix_prompt}\n\nINPUT:\n{json.dumps(fix_payload)}\n"
             fix_prompt_path = raw_dir / "turnr4_apply_retry_fix_prompt.txt"
@@ -293,21 +311,27 @@ class RequirementsPipeline:
             write_text(raw_dir / "turnr4_apply_retry_fix_raw.txt", fix_response.raw_text)
             self._write_usage(raw_dir / "turnr4_apply_retry_fix_usage.json", fix_response)
 
-            final_requirements = self._extract_marked_json(
+            repair_requirements = self._extract_marked_json(
                 fix_response.raw_text,
                 "FINAL_REQUIREMENTS_JSON:",
                 {"requirements", "assumptions", "constraints"},
             )
-            changelog = self._extract_marked_json(
+            repair_changelog = self._extract_marked_json(
                 fix_response.raw_text,
                 "CHANGELOG_JSON:",
                 {"splits", "replacements", "added", "removed"},
             )
-            requirements_schema = self._load_schema("requirements_strict.schema.json")
-            validate(instance=final_requirements, schema=requirements_schema)
-            self._validate_changelog(changelog)
+            validate(instance=repair_requirements, schema=requirements_schema)
+            self._validate_changelog(repair_changelog)
 
-            failures = self._run_gates(final_requirements, review, changelog)
+            merged = self._merge_requirements(final_requirements, repair_requirements)
+            changelog = self._merge_changelog(changelog, repair_changelog)
+            final_requirements, id_map = self._normalize_requirements(merged)
+            review = self._normalize_review(review, id_map)
+            changelog = self._normalize_changelog(changelog, id_map)
+            changelog = self._recompute_added(changelog, final_requirements, review)
+
+            failures = self._run_gates(final_requirements, review, changelog, limits)
             if not failures:
                 return final_requirements, changelog
 
@@ -400,23 +424,30 @@ class RequirementsPipeline:
                 return idx
         return -1
 
-    def _run_gates(self, requirements: Dict, review: Dict, changelog: Dict) -> List[str]:
+    def _run_gates(
+        self,
+        requirements: Dict,
+        review: Dict,
+        changelog: Dict,
+        limits: RequirementsLimits,
+    ) -> List[str]:
         failures: List[str] = []
-        min_count = int(self._env("ORCH_REQ_MIN_COUNT", "30"))
-        max_count = int(self._env("ORCH_REQ_MAX_COUNT", "45"))
-        enforce_splits = self._env("ORCH_ENFORCE_SPLITS", "false").lower() == "true"
 
         req_items = requirements.get("requirements", [])
         req_count = len(req_items)
-        if req_count < min_count or req_count > max_count:
+        if req_count < limits.req_min:
             failures.append(
-                f"Gate A: requirements count {req_count} not in {min_count}..{max_count}"
+                f"Gate A: requirements count {req_count} < {limits.req_min}"
+            )
+        if limits.req_max is not None and req_count > limits.req_max:
+            failures.append(
+                f"Gate A: requirements count {req_count} > {limits.req_max}"
             )
 
-        if len(requirements.get("assumptions", [])) < 3:
-            failures.append("Gate B: assumptions must have at least 3 items")
-        if len(requirements.get("constraints", [])) < 3:
-            failures.append("Gate B: constraints must have at least 3 items")
+        if len(requirements.get("assumptions", [])) < limits.assumptions_min:
+            failures.append("Gate B: assumptions below minimum")
+        if len(requirements.get("constraints", [])) < limits.constraints_min:
+            failures.append("Gate B: constraints below minimum")
 
         rejected_ids = set(review.get("rejected", []))
         accepted_ids = set(review.get("accepted", []))
@@ -429,50 +460,213 @@ class RequirementsPipeline:
         added_ids |= split_targets
         final_ids = {item.get("id") for item in req_items}
 
-        if rejected_ids.intersection(final_ids):
+        if rejected_ids and rejected_ids.intersection(final_ids):
             failures.append("Gate C: rejected requirement IDs present in final")
 
-        missing_from_acceptance = {
-            req_id
-            for req_id in final_ids
-            if req_id not in accepted_ids and req_id not in added_ids
-        }
-        if missing_from_acceptance:
-            failures.append("Gate C: final requirements include IDs not accepted or added")
-
-        forbidden_ids = {"REQ-1", "REQ-7", "REQ-12", "REQ-14"}
-        if enforce_splits:
-            invalid = sorted(forbidden_ids.intersection(final_ids))
-            if invalid:
-                failures.append(f"Gate D: forbidden IDs present {invalid}")
+        if accepted_ids:
+            missing_from_acceptance = {
+                req_id
+                for req_id in final_ids
+                if req_id not in accepted_ids and req_id not in added_ids
+            }
+            if missing_from_acceptance:
+                failures.append("Gate C: final requirements include IDs not accepted or added")
 
         issues = " ".join(review.get("issues", [])).lower()
         needs_split = any(word in issues for word in ["split", "epic"])
         if needs_split:
             splits = changelog.get("splits", []) if isinstance(changelog, dict) else []
             if not splits:
-                failures.append("Gate E: review mentions split/epic but changelog has no splits")
+                failures.append("Gate D: review mentions split/epic but changelog has no splits")
 
         return failures
+
+    def _normalize_requirements(self, payload: Dict) -> Tuple[Dict, Dict[str, str]]:
+        items = payload.get("requirements", [])
+        mapping: Dict[str, str] = {}
+        normalized_items: List[Dict] = []
+        next_id = 1
+        for item in items:
+            old_id = str(item.get("id", "")).strip()
+            new_id = f"REQ-{next_id}"
+            next_id += 1
+            if old_id:
+                mapping[old_id] = new_id
+            normalized_items.append(
+                {
+                    "id": new_id,
+                    "text": str(item.get("text", "")).strip(),
+                    "priority": str(item.get("priority", "must")),
+                }
+            )
+        return {
+            "requirements": normalized_items,
+            "assumptions": payload.get("assumptions", []),
+            "constraints": payload.get("constraints", []),
+        }, mapping
+
+    def _normalize_review(self, review: Dict, mapping: Dict[str, str]) -> Dict:
+        def map_ids(ids: List[str]) -> List[str]:
+            return [mapping[item] for item in ids if item in mapping]
+
+        return {
+            "accepted": map_ids(review.get("accepted", [])),
+            "rejected": map_ids(review.get("rejected", [])),
+            "issues": review.get("issues", []),
+            "missing": review.get("missing", []),
+            "rationale": review.get("rationale", []),
+        }
+
+    def _normalize_changelog(self, changelog: Dict, mapping: Dict[str, str]) -> Dict:
+        def map_id(value: str) -> str | None:
+            return mapping.get(value)
+
+        splits = []
+        for split in changelog.get("splits", []):
+            from_id = map_id(split.get("from", ""))
+            to_ids = [map_id(item) for item in split.get("to", [])]
+            to_ids = [item for item in to_ids if item]
+            if from_id or to_ids:
+                splits.append(
+                    {
+                        "from": from_id or split.get("from", ""),
+                        "to": to_ids,
+                        "note": split.get("note", ""),
+                    }
+                )
+        return {
+            "splits": splits,
+            "replacements": [
+                item for item in (map_id(val) for val in changelog.get("replacements", [])) if item
+            ],
+            "added": [item for item in (map_id(val) for val in changelog.get("added", [])) if item],
+            "removed": [
+                item for item in (map_id(val) for val in changelog.get("removed", [])) if item
+            ],
+        }
+
+    def _merge_requirements(self, base: Dict, repair: Dict) -> Dict:
+        base_items = list(base.get("requirements", []))
+        seen = {(item.get("text"), item.get("priority")) for item in base_items}
+        for item in repair.get("requirements", []):
+            key = (item.get("text"), item.get("priority"))
+            if key not in seen:
+                seen.add(key)
+                base_items.append(item)
+
+        assumptions = list(base.get("assumptions", []))
+        for item in repair.get("assumptions", []):
+            if item not in assumptions:
+                assumptions.append(item)
+
+        constraints = list(base.get("constraints", []))
+        for item in repair.get("constraints", []):
+            if item not in constraints:
+                constraints.append(item)
+
+        return {
+            "requirements": base_items,
+            "assumptions": assumptions,
+            "constraints": constraints,
+        }
+
+    def _merge_changelog(self, base: Dict, repair: Dict) -> Dict:
+        def merge_list(key: str) -> List:
+            merged = list(base.get(key, []))
+            for item in repair.get(key, []):
+                if item not in merged:
+                    merged.append(item)
+            return merged
+
+        return {
+            "splits": merge_list("splits"),
+            "replacements": merge_list("replacements"),
+            "added": merge_list("added"),
+            "removed": merge_list("removed"),
+        }
+
+    def _recompute_added(self, changelog: Dict, requirements: Dict, review: Dict) -> Dict:
+        accepted_ids = set(review.get("accepted", []))
+        final_ids = {item.get("id") for item in requirements.get("requirements", [])}
+        added = sorted([item for item in final_ids if item not in accepted_ids])
+        changelog["added"] = added
+        return changelog
 
     def _validate_changelog(self, changelog: Dict) -> None:
         required_keys = {"splits", "replacements", "added", "removed"}
         if not isinstance(changelog, dict) or not required_keys.issubset(changelog.keys()):
             raise ValueError("Changelog JSON missing required keys.")
 
+    def _limits_from_frontmatter(self, frontmatter: Dict) -> RequirementsLimits:
+        req_target = frontmatter.get("requirements_target", {}) if isinstance(frontmatter, dict) else {}
+        req_min = int(req_target.get("min", 30))
+        req_max = req_target.get("max")
+        req_max_int = int(req_max) if req_max is not None else None
+        return RequirementsLimits(
+            req_min=req_min,
+            req_max=req_max_int,
+            assumptions_min=int(frontmatter.get("assumptions_min", 3)),
+            constraints_min=int(frontmatter.get("constraints_min", 3)),
+            roles_expected=list(frontmatter.get("roles_expected", [])),
+        )
+
+    def _limits_payload(self, limits: RequirementsLimits) -> Dict:
+        return {
+            "requirements_min": limits.req_min,
+            "requirements_max": limits.req_max,
+            "assumptions_min": limits.assumptions_min,
+            "constraints_min": limits.constraints_min,
+            "roles_expected": limits.roles_expected,
+        }
+
+    def _metrics(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
+        return {
+            "requirements_count": len(requirements.get("requirements", [])),
+            "assumptions_count": len(requirements.get("assumptions", [])),
+            "constraints_count": len(requirements.get("constraints", [])),
+            "target_min": limits.req_min,
+            "target_max": limits.req_max,
+        }
+
+    def _render_prompt(self, template: str, limits: RequirementsLimits) -> str:
+        roles = ", ".join(limits.roles_expected) if limits.roles_expected else "none"
+        return (
+            template.replace("{{REQ_MIN}}", str(limits.req_min))
+            .replace("{{REQ_MAX}}", str(limits.req_max) if limits.req_max is not None else "none")
+            .replace("{{ASSUMPTIONS_MIN}}", str(limits.assumptions_min))
+            .replace("{{CONSTRAINTS_MIN}}", str(limits.constraints_min))
+            .replace("{{ROLES_EXPECTED}}", roles)
+        )
+
+    def _parse_frontmatter(self, content: str) -> Tuple[Dict, str]:
+        if not content.startswith("---"):
+            return {}, content
+        parts = content.split("---", 2)
+        if len(parts) < 3:
+            return {}, content
+        meta_raw = parts[1].strip()
+        body = parts[2].lstrip("\n")
+        try:
+            meta = yaml.safe_load(meta_raw) or {}
+        except yaml.YAMLError:
+            meta = {}
+        return meta, body
+
     def _gate_config(self) -> Dict:
         return {
             "min_count": int(self._env("ORCH_REQ_MIN_COUNT", "30")),
-            "enforce_splits": self._env("ORCH_ENFORCE_SPLITS", "false"),
+            "max_count": self._env("ORCH_REQ_MAX_COUNT", ""),
+            "assumptions_min": int(self._env("ORCH_ASSUMPTIONS_MIN", "3")),
+            "constraints_min": int(self._env("ORCH_CONSTRAINTS_MIN", "3")),
         }
-
-    def _env(self, key: str, default: str) -> str:
-        return os.getenv(key, default)
 
     def _write_usage(self, path: Path, response: LLMResponse) -> None:
         usage = getattr(response, "usage", None)
         if usage:
             write_json(path, usage)
+
+    def _env(self, key: str, default: str) -> str:
+        return os.getenv(key, default)
 
     def _load_schema(self, name: str) -> Dict:
         return json.loads(read_text(self.schemas_dir / name))

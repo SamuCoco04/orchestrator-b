@@ -1,10 +1,17 @@
 Return ONLY the REQUIREMENTS_JSON block.
 
+Targets from brief:
+- requirements_min={{REQ_MIN}}
+- requirements_max={{REQ_MAX}}
+- assumptions_min={{ASSUMPTIONS_MIN}}
+- constraints_min={{CONSTRAINTS_MIN}}
+- roles_expected={{ROLES_EXPECTED}}
+
 Format:
 REQUIREMENTS_JSON:
 {"requirements":[],"assumptions":[],"constraints":[]}
 
 Rules:
-- requirements must include 30–45 items with unique IDs and priorities.
-- assumptions and constraints must each include at least 3 items.
+- requirements must meet the target range.
+- assumptions and constraints must meet their minimums.
 - No markdown, no extra text.

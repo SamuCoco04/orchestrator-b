@@ -53,6 +53,24 @@ You can also adjust generation controls:
 python -m src.main --pipeline requirements --mode live --brief brief.md --max-output-tokens 800 --temperature 0.2
 ```
 
+
+## Brief frontmatter targets
+
+You can set per-project targets by adding YAML frontmatter to the brief:
+
+```yaml
+---
+requirements_target:
+  min: 30
+  max: 60
+assumptions_min: 3
+constraints_min: 3
+roles_expected: ["Student", "Administrator", "Coordinator"]
+---
+```
+
+When omitted, defaults are used. These targets drive quality gates and prompt rendering.
+
 ## Pipelines
 
 ### Requirements pipeline
