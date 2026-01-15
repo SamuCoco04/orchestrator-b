@@ -44,6 +44,7 @@ class RequirementsPipeline:
         self._repair_warnings: List[Dict] = []
         self._acceptance_warnings: List[str] = []
         self._section_warnings: Dict[str, List[str]] = {}
+        self._requirements_warnings: List[Dict] = []
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
@@ -51,6 +52,7 @@ class RequirementsPipeline:
         self._repair_warnings = []
         self._acceptance_warnings = []
         self._section_warnings = {}
+        self._requirements_warnings = []
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -241,6 +243,28 @@ class RequirementsPipeline:
                 artifacts_dir / "review_normalization_warnings.json",
                 {"warnings": self._review_normalization_warnings},
             )
+
+        draft_requirements, string_count = self._normalize_requirements_payload(
+            draft_requirements, stage="draft"
+        )
+        if string_count > 2:
+            retry_requirements = self._retry_requirements_only(
+                chatgpt,
+                brief,
+                limits,
+                raw_dir,
+                "requirements_lead_retry_requirements_only.md",
+                "turnr1_requirements_retry",
+                "REQUIREMENTS_JSON:",
+                {"requirements", "assumptions", "constraints"},
+            )
+            if retry_requirements is not None:
+                draft_requirements, _ = self._normalize_requirements_payload(
+                    retry_requirements, stage="draft_retry"
+                )
+
+        write_json(raw_dir / "turnr1_requirements_normalized.json", draft_requirements)
+        self._write_requirements_warnings(artifacts_dir / "warnings.json")
 
         requirements_schema = self._load_schema("normalized_requirements.schema.json")
         validate(instance=draft_requirements, schema=requirements_schema)
@@ -483,6 +507,28 @@ class RequirementsPipeline:
                     artifacts_dir / "repairs_warnings.json",
                     {"warnings": self._repair_warnings},
                 )
+            final_requirements, string_count = self._normalize_requirements_payload(
+                final_requirements, stage="final"
+            )
+            if string_count > 2:
+                retry_requirements = self._retry_requirements_only(
+                    adapter,
+                    brief,
+                    limits,
+                    raw_dir,
+                    "requirements_apply_retry_requirements_only.md",
+                    "turnr4_requirements_retry",
+                    "FINAL_REQUIREMENTS_JSON:",
+                    {"requirements", "assumptions", "constraints"},
+                )
+                if retry_requirements is not None:
+                    final_requirements, _ = self._normalize_requirements_payload(
+                        retry_requirements, stage="final_retry"
+                    )
+            write_json(
+                raw_dir / "turnr4_final_requirements_normalized.json", final_requirements
+            )
+            self._write_requirements_warnings(artifacts_dir / "warnings.json")
             write_json(
                 raw_dir / "turnr4_final_requirements_extracted.json", final_requirements
             )
@@ -599,6 +645,9 @@ class RequirementsPipeline:
                     artifacts_dir / "repairs_warnings.json",
                     {"warnings": self._repair_warnings},
                 )
+            repair_requirements, _ = self._normalize_requirements_payload(
+                repair_requirements, stage="final_retry"
+            )
             repairs_applied = True
             try:
                 repair_changelog = self._extract_marked_json(
@@ -916,6 +965,147 @@ class RequirementsPipeline:
                 continue
             normalized.append({"id": rule_id, "text": text, "rationale": rationale})
         return {"rules": normalized}
+
+    def _normalize_requirements_payload(
+        self, payload: Dict, stage: str
+    ) -> tuple[Dict, int]:
+        warnings: List[Dict] = []
+        string_count = 0
+        if not isinstance(payload, dict):
+            self._requirements_warnings.append(
+                {"stage": stage, "note": "Payload was not an object.", "original": payload}
+            )
+            return payload, string_count
+
+        items = payload.get("requirements", [])
+        if not isinstance(items, list):
+            self._requirements_warnings.append(
+                {"stage": stage, "note": "Requirements list was not an array.", "original": items}
+            )
+            payload["requirements"] = []
+            return payload, string_count
+
+        existing_ids = {
+            item.get("id")
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        auto_index = 1
+
+        def next_auto_id() -> str:
+            nonlocal auto_index
+            while True:
+                candidate = f"REQ-AUTO-{auto_index}"
+                auto_index += 1
+                if candidate not in existing_ids:
+                    existing_ids.add(candidate)
+                    return candidate
+
+        normalized_items: List[Dict] = []
+        for idx, item in enumerate(items):
+            if item is None or item == "":
+                warnings.append(
+                    {
+                        "stage": stage,
+                        "index": idx,
+                        "note": "Dropped empty requirement item.",
+                        "original": item,
+                    }
+                )
+                continue
+
+            if isinstance(item, str):
+                string_count += 1
+                req_id = next_auto_id()
+                normalized_items.append(
+                    {"id": req_id, "text": item, "priority": "should"}
+                )
+                warnings.append(
+                    {
+                        "stage": stage,
+                        "index": idx,
+                        "note": "Converted string requirement to object.",
+                        "original": item,
+                        "repaired_id": req_id,
+                    }
+                )
+                continue
+
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("normalized_text") or item.get("requirement")
+                if not isinstance(text, str) or not text.strip():
+                    warnings.append(
+                        {
+                            "stage": stage,
+                            "index": idx,
+                            "note": "Dropped requirement missing text.",
+                            "original": item,
+                        }
+                    )
+                    continue
+                priority = item.get("priority")
+                if not isinstance(priority, str) or priority.lower() not in {
+                    "must",
+                    "should",
+                    "could",
+                }:
+                    priority = "should"
+                req_id = item.get("id") if isinstance(item.get("id"), str) else next_auto_id()
+                if req_id in existing_ids:
+                    req_id = next_auto_id()
+                normalized_items.append(
+                    {"id": req_id, "text": text.strip(), "priority": priority.lower()}
+                )
+                continue
+
+            warnings.append(
+                {
+                    "stage": stage,
+                    "index": idx,
+                    "note": "Dropped unsupported requirement item.",
+                    "original": item,
+                }
+            )
+
+        payload["requirements"] = normalized_items
+        if warnings:
+            self._requirements_warnings.extend(warnings)
+        return payload, string_count
+
+    def _retry_requirements_only(
+        self,
+        adapter: LLMAdapter,
+        brief: str,
+        limits: RequirementsLimits,
+        raw_dir: Path,
+        prompt_name: str,
+        prefix: str,
+        marker: str,
+        expected_keys: set[str],
+    ) -> Dict | None:
+        retry_template = read_text(self.prompts_dir / prompt_name)
+        retry_prompt = self._render_prompt(retry_template, limits)
+        retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
+        retry_prompt_path = raw_dir / f"{prefix}_prompt.txt"
+        write_text(retry_prompt_path, retry_full_prompt)
+        retry_response = adapter.complete(retry_full_prompt)
+        write_text(raw_dir / f"{prefix}_raw.txt", retry_response.raw_text)
+        self._write_usage(raw_dir / f"{prefix}_usage.json", retry_response)
+        try:
+            extracted = self._extract_marked_json(
+                retry_response.raw_text, marker, expected_keys
+            )
+            write_json(raw_dir / f"{prefix}_extracted.json", extracted)
+            return extracted
+        except ValueError as exc:
+            self._requirements_warnings.append(
+                {"stage": prefix, "note": "Retry extraction failed.", "error": str(exc)}
+            )
+            return None
+
+    def _write_requirements_warnings(self, path: Path) -> None:
+        if self._requirements_warnings:
+            write_json(path, {"warnings": self._requirements_warnings})
 
     def _require_section(
         self,
@@ -1765,6 +1955,11 @@ class RequirementsPipeline:
             )
             if missing:
                 lines.append(f"- missing_sections: {missing}")
+        if self._requirements_warnings:
+            lines.append(
+                f"- requirements_repairs: {len(self._requirements_warnings)} "
+                "(see artifacts/warnings.json)"
+            )
         if usage_totals:
             lines.append(
                 "- token_usage: "
