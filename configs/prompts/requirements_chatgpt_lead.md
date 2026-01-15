@@ -34,6 +34,7 @@ Rules:
 - Do NOT reuse rejected requirements to reach minimum count.
 - If below minimum, generate NEW high-value requirements aligned to the brief.
 - assumptions and constraints must each meet their minimums.
+- assumptions and constraints must be arrays of strings only.
 - requirements must meet the target range if max is provided.
 - If coverage_areas provided, ensure each area appears in the requirement text (include the area name).
 - If seed_requirements provided, ensure each seed is captured or paraphrased in requirements.

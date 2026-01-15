@@ -53,6 +53,7 @@ class RequirementsPipeline:
         }
         self._artifact_repair_counts: Dict[str, int] = {}
         self._delta_retry_counts: Dict[str, int] = {}
+        self._artifact_validation: Dict[str, str] = {}
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
@@ -69,6 +70,7 @@ class RequirementsPipeline:
         }
         self._artifact_repair_counts = {}
         self._delta_retry_counts = {}
+        self._artifact_validation = {}
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -312,17 +314,47 @@ class RequirementsPipeline:
                 artifacts_dir / "business_rules.md", business_rules
             )
         if workflows is not None:
+            write_json(raw_dir / "workflows_raw.json", workflows)
+            workflows, warnings = self._repair_workflows(workflows)
+            write_json(artifacts_dir / "workflows_repaired.json", workflows)
+            if warnings:
+                self._artifact_repair_counts["workflows"] = (
+                    self._artifact_repair_counts.get("workflows", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_workflows.json",
+                    {"warnings": warnings, "repaired": workflows},
+                )
             workflows = self._normalize_workflows(workflows)
             write_json(artifacts_dir / "workflows_normalized.json", workflows)
             self._validate_artifact(
-                workflows, "workflows.schema.json", "WORKFLOWS_JSON"
+                workflows,
+                "workflows.schema.json",
+                "WORKFLOWS_JSON",
+                repair_note="Applied workflow repairs before validation.",
             )
+            self._artifact_validation["workflows"] = "valid"
             write_json(artifacts_dir / "workflows.json", workflows)
             self._write_workflows_markdown(artifacts_dir / "workflows.md", workflows)
         if domain_model is not None:
+            write_json(raw_dir / "domain_model_raw.json", domain_model)
+            domain_model, warnings = self._repair_domain_model(domain_model)
+            write_json(artifacts_dir / "domain_model_repaired.json", domain_model)
+            if warnings:
+                self._artifact_repair_counts["domain_model"] = (
+                    self._artifact_repair_counts.get("domain_model", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_domain_model.json",
+                    {"warnings": warnings, "repaired": domain_model},
+                )
             self._validate_artifact(
-                domain_model, "domain_model.schema.json", "DOMAIN_MODEL_JSON"
+                domain_model,
+                "domain_model.schema.json",
+                "DOMAIN_MODEL_JSON",
+                repair_note="Applied domain model repairs before validation.",
             )
+            self._artifact_validation["domain_model"] = "valid"
             write_json(artifacts_dir / "domain_model.json", domain_model)
             self._write_domain_model_markdown(
                 artifacts_dir / "domain_model.md", domain_model
@@ -953,14 +985,17 @@ class RequirementsPipeline:
             write_json(artifacts_dir / f"{key}.json", payload)
             writer(artifacts_dir / f"{key}.md", payload)
 
-    def _validate_artifact(self, payload: Dict, schema_name: str, label: str) -> None:
+    def _validate_artifact(
+        self, payload: Dict, schema_name: str, label: str, repair_note: str | None = None
+    ) -> None:
         schema = self._load_schema(schema_name)
         try:
             validate(instance=payload, schema=schema)
         except Exception as exc:
             snippet = json.dumps(payload)[:300]
+            note = f" Repair note: {repair_note}" if repair_note else ""
             raise RuntimeError(
-                f"{label} failed validation. Snippet: {snippet}"
+                f"{label} failed validation.{note} Snippet: {snippet}"
             ) from exc
 
     def _write_business_rules_markdown(self, path: Path, payload: Dict) -> None:
@@ -1011,7 +1046,11 @@ class RequirementsPipeline:
             if isinstance(item, dict):
                 text = item.get("text") or item.get("normalized_text")
                 if isinstance(text, str):
-                    normalized.append(text)
+                    item_id = item.get("id")
+                    if isinstance(item_id, str):
+                        normalized.append(f"{item_id}: {text}")
+                    else:
+                        normalized.append(text)
                     self._requirements_warnings.append(
                         {
                             "stage": stage,
@@ -1492,10 +1531,31 @@ class RequirementsPipeline:
                         "description": description,
                     }
                 )
-        repaired = {
-            "entities": [entity for entity in entities if isinstance(entity, dict)],
-            "relationships": repaired_relationships,
-        }
+        repaired_entities: List[Dict] = []
+        for entity in entities:
+            if not isinstance(entity, dict):
+                continue
+            name = entity.get("name")
+            description = entity.get("description")
+            attributes = entity.get("attributes", [])
+            if not isinstance(attributes, list):
+                attributes = []
+            repaired_attributes: List[Dict] = []
+            for attr in attributes:
+                if not isinstance(attr, dict):
+                    continue
+                attr_name = attr.get("name")
+                attr_type = attr.get("type")
+                attr_desc = attr.get("description")
+                if all(isinstance(value, str) for value in [attr_name, attr_type, attr_desc]):
+                    repaired_attributes.append(
+                        {"name": attr_name, "type": attr_type, "description": attr_desc}
+                    )
+            if all(isinstance(value, str) for value in [name, description]):
+                repaired_entities.append(
+                    {"name": name, "description": description, "attributes": repaired_attributes}
+                )
+        repaired = {"entities": repaired_entities, "relationships": repaired_relationships}
         return repaired, warnings
 
     def _write_domain_model_markdown(self, path: Path, payload: Dict) -> None:
@@ -1733,6 +1793,7 @@ class RequirementsPipeline:
                 {"workflows"},
             )
             write_json(raw_dir / "turn_apply_stage_b_workflows_extracted.json", workflows)
+            write_json(raw_dir / "workflows_raw.json", workflows)
             repaired, warnings = self._repair_workflows(workflows)
             if warnings:
                 self._artifact_repair_counts["workflows"] = (
@@ -1746,8 +1807,12 @@ class RequirementsPipeline:
             write_json(artifacts_dir / "workflows_normalized.json", workflows)
             try:
                 self._validate_artifact(
-                    workflows, "workflows.schema.json", "FINAL_WORKFLOWS_JSON"
+                    workflows,
+                    "workflows.schema.json",
+                    "FINAL_WORKFLOWS_JSON",
+                    repair_note="Applied workflow repairs before validation.",
                 )
+                self._artifact_validation["workflows"] = "valid"
             except Exception as exc:
                 workflows = self._delta_retry_artifact(
                     adapter=adapter,
@@ -1816,6 +1881,7 @@ class RequirementsPipeline:
                 {"entities", "relationships"},
             )
             write_json(raw_dir / "turn_apply_stage_c_domain_model_extracted.json", domain_model)
+            write_json(raw_dir / "domain_model_raw.json", domain_model)
             repaired, warnings = self._repair_domain_model(domain_model)
             if warnings:
                 self._artifact_repair_counts["domain_model"] = (
@@ -1827,8 +1893,12 @@ class RequirementsPipeline:
                 )
             try:
                 self._validate_artifact(
-                    repaired, "domain_model.schema.json", "FINAL_DOMAIN_MODEL_JSON"
+                    repaired,
+                    "domain_model.schema.json",
+                    "FINAL_DOMAIN_MODEL_JSON",
+                    repair_note="Applied domain model repairs before validation.",
                 )
+                self._artifact_validation["domain_model"] = "valid"
             except Exception as exc:
                 repaired = self._delta_retry_artifact(
                     adapter=adapter,
@@ -2534,6 +2604,13 @@ class RequirementsPipeline:
                 "- artifact_repairs: "
                 + ", ".join(
                     f"{key}={value}" for key, value in self._artifact_repair_counts.items()
+                )
+            )
+        if self._artifact_validation:
+            lines.append(
+                "- artifact_validation: "
+                + ", ".join(
+                    f"{key}={value}" for key, value in self._artifact_validation.items()
                 )
             )
         if self._delta_retry_counts:
