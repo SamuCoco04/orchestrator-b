@@ -51,6 +51,8 @@ class RequirementsPipeline:
             "constraints": 0,
             "moved": 0,
         }
+        self._artifact_repair_counts: Dict[str, int] = {}
+        self._delta_retry_counts: Dict[str, int] = {}
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
@@ -65,6 +67,8 @@ class RequirementsPipeline:
             "constraints": 0,
             "moved": 0,
         }
+        self._artifact_repair_counts = {}
+        self._delta_retry_counts = {}
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -1225,6 +1229,51 @@ class RequirementsPipeline:
         if self._requirements_warnings:
             write_json(path, {"warnings": self._requirements_warnings})
 
+    def _delta_retry_artifact(
+        self,
+        adapter: LLMAdapter,
+        prompt_name: str,
+        label: str,
+        expected_keys: set[str],
+        schema_name: str,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        payload: Dict,
+        retry_key: str,
+    ) -> Dict:
+        self._delta_retry_counts[retry_key] = self._delta_retry_counts.get(retry_key, 0) + 1
+        prompt = read_text(self.prompts_dir / prompt_name)
+        full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}\n"
+        retry_prefix = f"turn_apply_delta_{retry_key}"
+        write_text(raw_dir / f"{retry_prefix}_prompt.txt", full_prompt)
+        response = adapter.complete(full_prompt)
+        write_text(raw_dir / f"{retry_prefix}_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / f"{retry_prefix}_usage.json", response)
+        try:
+            corrected = self._extract_marked_json(
+                response.raw_text, f"{label}:", expected_keys
+            )
+            write_json(raw_dir / f"{retry_prefix}_extracted.json", corrected)
+            self._validate_artifact(corrected, schema_name, label)
+            return corrected
+        except Exception as exc:
+            self._section_warnings.setdefault(retry_key, []).append(str(exc))
+            write_json(
+                artifacts_dir / f"{retry_key}_warnings.json",
+                {"warnings": self._section_warnings[retry_key]},
+            )
+            return payload
+
+    def _load_cached_artifact(self, path: Path, fallback: Dict) -> Dict:
+        if path.exists():
+            try:
+                cached = json.loads(read_text(path))
+                if isinstance(cached, dict):
+                    return cached
+            except Exception:
+                return fallback
+        return fallback
+
     def _require_section(
         self,
         section_name: str,
@@ -1355,6 +1404,99 @@ class RequirementsPipeline:
                 }
             )
         return {"workflows": normalized}
+
+    def _repair_workflows(self, payload: Dict) -> tuple[Dict, List[str]]:
+        warnings: List[str] = []
+        if not isinstance(payload, dict):
+            return {"workflows": []}, ["Payload was not an object."]
+        workflows = payload.get("workflows", [])
+        if not isinstance(workflows, list):
+            return {"workflows": []}, ["Workflows was not a list."]
+        repaired: List[Dict] = []
+        for workflow in workflows:
+            if not isinstance(workflow, dict):
+                continue
+            workflow_id = workflow.get("id")
+            if not isinstance(workflow_id, str):
+                continue
+            name = workflow.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = f"Workflow {workflow_id}"
+                warnings.append(f"Filled missing name for workflow {workflow_id}.")
+            states = workflow.get("states", [])
+            if not isinstance(states, list):
+                states = []
+            states = [state for state in states if isinstance(state, str)]
+            transitions = workflow.get("transitions", [])
+            if not isinstance(transitions, list):
+                transitions = []
+            repaired_transitions: List[Dict[str, str]] = []
+            for transition in transitions:
+                if not isinstance(transition, dict):
+                    continue
+                from_state = transition.get("from")
+                to_state = transition.get("to")
+                trigger = transition.get("trigger")
+                if not isinstance(trigger, str):
+                    guard = transition.get("guard")
+                    if isinstance(guard, str):
+                        trigger = guard
+                        warnings.append("Renamed guard to trigger in transition.")
+                if (
+                    isinstance(from_state, str)
+                    and isinstance(to_state, str)
+                    and isinstance(trigger, str)
+                ):
+                    repaired_transitions.append(
+                        {"from": from_state, "to": to_state, "trigger": trigger}
+                    )
+            repaired.append(
+                {
+                    "id": workflow_id,
+                    "name": name,
+                    "states": states,
+                    "transitions": repaired_transitions,
+                }
+            )
+        return {"workflows": repaired}, warnings
+
+    def _repair_domain_model(self, payload: Dict) -> tuple[Dict, List[str]]:
+        warnings: List[str] = []
+        if not isinstance(payload, dict):
+            return {"entities": [], "relationships": []}, ["Payload was not an object."]
+        entities = payload.get("entities", [])
+        relationships = payload.get("relationships", [])
+        entities = entities if isinstance(entities, list) else []
+        relationships = relationships if isinstance(relationships, list) else []
+        repaired_relationships: List[Dict] = []
+        for relation in relationships:
+            if not isinstance(relation, dict):
+                continue
+            from_entity = relation.get("from")
+            to_entity = relation.get("to")
+            rel_type = relation.get("type")
+            description = relation.get("description")
+            if not isinstance(description, str) and all(
+                isinstance(value, str) for value in [from_entity, rel_type, to_entity]
+            ):
+                description = f"{from_entity} {rel_type} {to_entity} relationship."
+                warnings.append(
+                    f"Filled missing description for relationship {from_entity}->{to_entity}."
+                )
+            if all(isinstance(value, str) for value in [from_entity, to_entity, rel_type, description]):
+                repaired_relationships.append(
+                    {
+                        "from": from_entity,
+                        "to": to_entity,
+                        "type": rel_type,
+                        "description": description,
+                    }
+                )
+        repaired = {
+            "entities": [entity for entity in entities if isinstance(entity, dict)],
+            "relationships": repaired_relationships,
+        }
+        return repaired, warnings
 
     def _write_domain_model_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Domain Model", ""]
@@ -1591,11 +1733,34 @@ class RequirementsPipeline:
                 {"workflows"},
             )
             write_json(raw_dir / "turn_apply_stage_b_workflows_extracted.json", workflows)
-            workflows = self._normalize_workflows(workflows)
+            repaired, warnings = self._repair_workflows(workflows)
+            if warnings:
+                self._artifact_repair_counts["workflows"] = (
+                    self._artifact_repair_counts.get("workflows", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_workflows.json",
+                    {"warnings": warnings, "repaired": repaired},
+                )
+            workflows = self._normalize_workflows(repaired)
             write_json(artifacts_dir / "workflows_normalized.json", workflows)
-            self._validate_artifact(
-                workflows, "workflows.schema.json", "FINAL_WORKFLOWS_JSON"
-            )
+            try:
+                self._validate_artifact(
+                    workflows, "workflows.schema.json", "FINAL_WORKFLOWS_JSON"
+                )
+            except Exception as exc:
+                workflows = self._delta_retry_artifact(
+                    adapter=adapter,
+                    prompt_name="requirements_apply_retry_workflows_only.md",
+                    label="FINAL_WORKFLOWS_JSON",
+                    expected_keys={"workflows"},
+                    schema_name="workflows.schema.json",
+                    raw_dir=raw_dir,
+                    artifacts_dir=artifacts_dir,
+                    payload=workflows,
+                    retry_key="workflows",
+                )
+                self._section_warnings.setdefault("workflows", []).append(str(exc))
             results["workflows"] = workflows
             write_json(artifacts_dir / "workflows.json", workflows)
             self._write_workflows_markdown(artifacts_dir / "workflows.md", workflows)
@@ -1605,7 +1770,18 @@ class RequirementsPipeline:
                 artifacts_dir / "workflows_warnings.json",
                 {"warnings": self._section_warnings["workflows"]},
             )
-            results["workflows"] = {"workflows": []}
+            cached = self._load_cached_artifact(artifacts_dir / "workflows.json", {"workflows": []})
+            if cached.get("workflows"):
+                self._section_warnings["workflows"].append(
+                    "Reused cached workflows.json due to missing FINAL_WORKFLOWS_JSON."
+                )
+                write_json(
+                    artifacts_dir / "workflows_warnings.json",
+                    {"warnings": self._section_warnings["workflows"]},
+                )
+                results["workflows"] = cached
+            else:
+                results["workflows"] = {"workflows": []}
 
         return results
 
@@ -1640,13 +1816,36 @@ class RequirementsPipeline:
                 {"entities", "relationships"},
             )
             write_json(raw_dir / "turn_apply_stage_c_domain_model_extracted.json", domain_model)
-            self._validate_artifact(
-                domain_model, "domain_model.schema.json", "FINAL_DOMAIN_MODEL_JSON"
-            )
-            results["domain_model"] = domain_model
-            write_json(artifacts_dir / "domain_model.json", domain_model)
+            repaired, warnings = self._repair_domain_model(domain_model)
+            if warnings:
+                self._artifact_repair_counts["domain_model"] = (
+                    self._artifact_repair_counts.get("domain_model", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_domain_model.json",
+                    {"warnings": warnings, "repaired": repaired},
+                )
+            try:
+                self._validate_artifact(
+                    repaired, "domain_model.schema.json", "FINAL_DOMAIN_MODEL_JSON"
+                )
+            except Exception as exc:
+                repaired = self._delta_retry_artifact(
+                    adapter=adapter,
+                    prompt_name="requirements_apply_retry_domain_model_only.md",
+                    label="FINAL_DOMAIN_MODEL_JSON",
+                    expected_keys={"entities", "relationships"},
+                    schema_name="domain_model.schema.json",
+                    raw_dir=raw_dir,
+                    artifacts_dir=artifacts_dir,
+                    payload=repaired,
+                    retry_key="domain_model",
+                )
+                self._section_warnings.setdefault("domain_model", []).append(str(exc))
+            results["domain_model"] = repaired
+            write_json(artifacts_dir / "domain_model.json", repaired)
             self._write_domain_model_markdown(
-                artifacts_dir / "domain_model.md", domain_model
+                artifacts_dir / "domain_model.md", repaired
             )
         except Exception as exc:
             self._section_warnings.setdefault("domain_model", []).append(str(exc))
@@ -1654,7 +1853,20 @@ class RequirementsPipeline:
                 artifacts_dir / "domain_model_warnings.json",
                 {"warnings": self._section_warnings["domain_model"]},
             )
-            results["domain_model"] = {"entities": [], "relationships": []}
+            cached = self._load_cached_artifact(
+                artifacts_dir / "domain_model.json", {"entities": [], "relationships": []}
+            )
+            if cached.get("entities") or cached.get("relationships"):
+                self._section_warnings["domain_model"].append(
+                    "Reused cached domain_model.json due to missing FINAL_DOMAIN_MODEL_JSON."
+                )
+                write_json(
+                    artifacts_dir / "domain_model_warnings.json",
+                    {"warnings": self._section_warnings["domain_model"]},
+                )
+                results["domain_model"] = cached
+            else:
+                results["domain_model"] = {"entities": [], "relationships": []}
 
         try:
             mvp_scope = self._extract_marked_json(
@@ -1675,7 +1887,21 @@ class RequirementsPipeline:
                 artifacts_dir / "mvp_scope_warnings.json",
                 {"warnings": self._section_warnings["mvp_scope"]},
             )
-            results["mvp_scope"] = {"in_scope": [], "out_of_scope": [], "milestones": []}
+            cached = self._load_cached_artifact(
+                artifacts_dir / "mvp_scope.json",
+                {"in_scope": [], "out_of_scope": [], "milestones": []},
+            )
+            if cached.get("in_scope") or cached.get("out_of_scope"):
+                self._section_warnings["mvp_scope"].append(
+                    "Reused cached mvp_scope.json due to missing FINAL_MVP_SCOPE_JSON."
+                )
+                write_json(
+                    artifacts_dir / "mvp_scope_warnings.json",
+                    {"warnings": self._section_warnings["mvp_scope"]},
+                )
+                results["mvp_scope"] = cached
+            else:
+                results["mvp_scope"] = {"in_scope": [], "out_of_scope": [], "milestones": []}
 
         return results
     def _check_coverage(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
@@ -2140,7 +2366,18 @@ class RequirementsPipeline:
         seed_requirements = frontmatter.get("seed_requirements", [])
         if isinstance(seed_requirements, str):
             seed_requirements = [seed_requirements]
-        seed_requirements = list(seed_requirements)
+        normalized_seeds: List[str] = []
+        for seed in seed_requirements if isinstance(seed_requirements, list) else []:
+            if isinstance(seed, str):
+                normalized_seeds.append(seed)
+            elif isinstance(seed, dict):
+                text = seed.get("text")
+                seed_id = seed.get("id")
+                if isinstance(seed_id, str) and isinstance(text, str):
+                    normalized_seeds.append(f"{seed_id}: {text}")
+                elif isinstance(text, str):
+                    normalized_seeds.append(text)
+        seed_requirements = normalized_seeds
         requested_artifacts = frontmatter.get("requested_artifacts", [])
         if isinstance(requested_artifacts, str):
             requested_artifacts = [requested_artifacts]
@@ -2290,6 +2527,20 @@ class RequirementsPipeline:
                 "- list_repairs: "
                 + ", ".join(
                     f"{key}={value}" for key, value in self._list_repair_counts.items()
+                )
+            )
+        if self._artifact_repair_counts:
+            lines.append(
+                "- artifact_repairs: "
+                + ", ".join(
+                    f"{key}={value}" for key, value in self._artifact_repair_counts.items()
+                )
+            )
+        if self._delta_retry_counts:
+            lines.append(
+                "- delta_retries: "
+                + ", ".join(
+                    f"{key}={value}" for key, value in self._delta_retry_counts.items()
                 )
             )
         if usage_totals:
