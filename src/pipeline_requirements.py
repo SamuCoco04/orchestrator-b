@@ -43,12 +43,14 @@ class RequirementsPipeline:
         self._extraction_traces: List[str] = []
         self._repair_warnings: List[Dict] = []
         self._acceptance_warnings: List[str] = []
+        self._section_warnings: Dict[str, List[str]] = {}
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
         self._extraction_traces = []
         self._repair_warnings = []
         self._acceptance_warnings = []
+        self._section_warnings = {}
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -164,15 +166,61 @@ class RequirementsPipeline:
                 ) from exc
 
         if self._is_requested("business_rules", limits) and business_rules is None:
-            business_rules = self._retry_business_rules(
-                chatgpt, brief, limits, raw_dir, artifacts_dir
+            business_rules = self._require_section(
+                section_name="business_rules",
+                label="BUSINESS_RULES_JSON",
+                schema_name="business_rules.schema.json",
+                retry_prompt_path="requirements_lead_retry_business_rules.md",
+                default_value={"rules": []},
+                expected_keys={"rules"},
+                brief=brief,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
             )
         if self._is_requested("workflows", limits) and workflows is None:
-            raise RuntimeError("Missing WORKFLOWS_JSON in lead output.")
+            workflows = self._require_section(
+                section_name="workflows",
+                label="WORKFLOWS_JSON",
+                schema_name="workflows.schema.json",
+                retry_prompt_path="requirements_lead_retry_workflows.md",
+                default_value={"workflows": []},
+                expected_keys={"workflows"},
+                brief=brief,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+            )
         if self._is_requested("domain_model", limits) and domain_model is None:
-            raise RuntimeError("Missing DOMAIN_MODEL_JSON in lead output.")
+            domain_model = self._require_section(
+                section_name="domain_model",
+                label="DOMAIN_MODEL_JSON",
+                schema_name="domain_model.schema.json",
+                retry_prompt_path="requirements_lead_retry_domain_model.md",
+                default_value={"entities": [], "relationships": []},
+                expected_keys={"entities", "relationships"},
+                brief=brief,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+            )
         if self._is_requested("mvp_scope", limits) and mvp_scope is None:
-            raise RuntimeError("Missing MVP_SCOPE_JSON in lead output.")
+            mvp_scope = self._require_section(
+                section_name="mvp_scope",
+                label="MVP_SCOPE_JSON",
+                schema_name="mvp_scope.schema.json",
+                retry_prompt_path="requirements_lead_retry_mvp_scope.md",
+                default_value={"in_scope": [], "out_of_scope": [], "milestones": []},
+                expected_keys={"in_scope", "out_of_scope"},
+                brief=brief,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+            )
 
         review_extracted = review_json
         draft_extracted = draft_requirements
@@ -869,41 +917,66 @@ class RequirementsPipeline:
             normalized.append({"id": rule_id, "text": text, "rationale": rationale})
         return {"rules": normalized}
 
-    def _retry_business_rules(
+    def _require_section(
         self,
-        adapter: LLMAdapter,
+        section_name: str,
+        label: str,
+        schema_name: str,
+        retry_prompt_path: str,
+        default_value: Dict,
+        expected_keys: set[str],
         brief: str,
         limits: RequirementsLimits,
+        adapter: LLMAdapter,
         raw_dir: Path,
         artifacts_dir: Path,
     ) -> Dict:
-        warning_path = artifacts_dir / "business_rules_warnings.json"
-        warnings = ["Missing BUSINESS_RULES_JSON in lead output."]
-        write_json(warning_path, {"warnings": warnings})
-
-        retry_template = read_text(
-            self.prompts_dir / "requirements_lead_retry_business_rules.md"
+        warnings = self._section_warnings.setdefault(section_name, [])
+        warnings.append(f"Missing {label} in lead output.")
+        write_json(
+            artifacts_dir / f"{section_name}_warnings.json",
+            {"warnings": warnings},
         )
+
+        retry_template = read_text(self.prompts_dir / retry_prompt_path)
         retry_prompt = self._render_prompt(retry_template, limits)
         retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
-        retry_prompt_path = raw_dir / "turnr1_business_rules_retry_prompt.txt"
+        retry_prompt_path = raw_dir / f"turnr1_{section_name}_retry_prompt.txt"
         write_text(retry_prompt_path, retry_full_prompt)
         retry_response = adapter.complete(retry_full_prompt)
-        write_text(raw_dir / "turnr1_business_rules_retry_raw.txt", retry_response.raw_text)
-        self._write_usage(raw_dir / "turnr1_business_rules_retry_usage.json", retry_response)
+        write_text(
+            raw_dir / f"turnr1_{section_name}_retry_raw.txt", retry_response.raw_text
+        )
+        self._write_usage(
+            raw_dir / f"turnr1_{section_name}_retry_usage.json", retry_response
+        )
 
         try:
-            business_rules = self._extract_marked_json(
+            extracted = self._extract_marked_json(
                 retry_response.raw_text,
-                "BUSINESS_RULES_JSON:",
-                {"rules"},
+                f"{label}:",
+                expected_keys,
             )
-            write_json(raw_dir / "turnr1_business_rules_retry_extracted.json", business_rules)
-            return self._normalize_business_rules(business_rules)
+            write_json(
+                raw_dir / f"turnr1_{section_name}_retry_extracted.json", extracted
+            )
+            normalized = (
+                self._normalize_business_rules(extracted)
+                if section_name == "business_rules"
+                else extracted
+            )
+            self._validate_artifact(normalized, schema_name, label)
+            return normalized
         except ValueError as exc:
             warnings.append(str(exc))
-            write_json(warning_path, {"warnings": warnings})
-            return {"rules": []}
+        except Exception as exc:
+            warnings.append(f"Validation failed: {exc}")
+
+        write_json(
+            artifacts_dir / f"{section_name}_warnings.json",
+            {"warnings": warnings},
+        )
+        return default_value
 
     def _write_workflows_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Workflows", ""]
@@ -1686,6 +1759,12 @@ class RequirementsPipeline:
             lines.append(f"- mvp_in_scope_count: {len(final_artifacts['mvp_scope'].get('in_scope', []))}")
         if acceptance_criteria:
             lines.append(f"- acceptance_criteria_count: {len(acceptance_criteria.get('criteria', []))}")
+        if self._section_warnings:
+            missing = ", ".join(
+                key for key, items in self._section_warnings.items() if items
+            )
+            if missing:
+                lines.append(f"- missing_sections: {missing}")
         if usage_totals:
             lines.append(
                 "- token_usage: "
