@@ -308,6 +308,8 @@ class RequirementsPipeline:
                 artifacts_dir / "business_rules.md", business_rules
             )
         if workflows is not None:
+            workflows = self._normalize_workflows(workflows)
+            write_json(artifacts_dir / "workflows_normalized.json", workflows)
             self._validate_artifact(
                 workflows, "workflows.schema.json", "WORKFLOWS_JSON"
             )
@@ -1302,6 +1304,58 @@ class RequirementsPipeline:
             lines.append("")
         write_text(path, "\n".join(lines).rstrip() + "\n")
 
+    def _normalize_workflows(self, payload: Dict) -> Dict:
+        if not isinstance(payload, dict):
+            return {"workflows": []}
+        workflows = payload.get("workflows", [])
+        if not isinstance(workflows, list):
+            return {"workflows": []}
+        normalized: List[Dict] = []
+        for workflow in workflows:
+            if not isinstance(workflow, dict):
+                continue
+            workflow_id = workflow.get("id")
+            if not isinstance(workflow_id, str):
+                continue
+            name = workflow.get("name")
+            if not isinstance(name, str) or not name.strip():
+                name = f"Workflow {workflow_id}"
+            states = workflow.get("states", [])
+            if not isinstance(states, list):
+                states = []
+            states = [state for state in states if isinstance(state, str)]
+            transitions = workflow.get("transitions", [])
+            if not isinstance(transitions, list):
+                transitions = []
+            normalized_transitions: List[Dict[str, str]] = []
+            for transition in transitions:
+                if not isinstance(transition, dict):
+                    continue
+                from_state = transition.get("from")
+                to_state = transition.get("to")
+                trigger = transition.get("trigger")
+                if not isinstance(trigger, str):
+                    guard = transition.get("guard")
+                    if isinstance(guard, str):
+                        trigger = guard
+                if (
+                    isinstance(from_state, str)
+                    and isinstance(to_state, str)
+                    and isinstance(trigger, str)
+                ):
+                    normalized_transitions.append(
+                        {"from": from_state, "to": to_state, "trigger": trigger}
+                    )
+            normalized.append(
+                {
+                    "id": workflow_id,
+                    "name": name,
+                    "states": states,
+                    "transitions": normalized_transitions,
+                }
+            )
+        return {"workflows": normalized}
+
     def _write_domain_model_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Domain Model", ""]
         for entity in payload.get("entities", []):
@@ -1537,6 +1591,8 @@ class RequirementsPipeline:
                 {"workflows"},
             )
             write_json(raw_dir / "turn_apply_stage_b_workflows_extracted.json", workflows)
+            workflows = self._normalize_workflows(workflows)
+            write_json(artifacts_dir / "workflows_normalized.json", workflows)
             self._validate_artifact(
                 workflows, "workflows.schema.json", "FINAL_WORKFLOWS_JSON"
             )

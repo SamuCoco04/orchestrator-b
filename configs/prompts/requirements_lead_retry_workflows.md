@@ -9,4 +9,5 @@ Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape
 Rules:
 - Each workflow must include {id, name, states, transitions}.
 - Each transition must include {from, to, trigger}.
+- Use "trigger" (not "guard") and do not include extra keys.
 - No markdown, no extra keys.
