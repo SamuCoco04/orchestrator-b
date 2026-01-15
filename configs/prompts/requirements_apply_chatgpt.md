@@ -24,7 +24,7 @@ Format contract:
 - CHANGELOG_JSON.splits must be an array of objects with keys {from, into}.
 - CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
 - FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects only (no strings, no mixed items).
-- FINAL_BUSINESS_RULES_JSON.rules must be objects with {id, text, category?}.
+- FINAL_BUSINESS_RULES_JSON.rules must be objects with {id, text, rationale}.
 - FINAL_WORKFLOWS_JSON.workflows must include states and transitions.
 - FINAL_DOMAIN_MODEL_JSON must include entities and relationships.
 - FINAL_MVP_SCOPE_JSON must include in_scope and out_of_scope.

@@ -25,7 +25,7 @@ Format contract:
 - Prefer wrapper JSON keys exactly as shown above.
 - accepted/rejected MUST be arrays of requirement ID strings only (e.g., "REQ-1"), never objects.
 - Each requirement item must have ONLY id, text, priority (must|should|could).
-- BUSINESS_RULES_JSON.rules must be objects with {id, text, category?}.
+- BUSINESS_RULES_JSON.rules must be objects with {id, text, rationale}.
 - WORKFLOWS_JSON.workflows must include states and transitions.
 - DOMAIN_MODEL_JSON must include entities and relationships.
 - MVP_SCOPE_JSON must include in_scope and out_of_scope.

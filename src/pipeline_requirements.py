@@ -164,7 +164,9 @@ class RequirementsPipeline:
                 ) from exc
 
         if self._is_requested("business_rules", limits) and business_rules is None:
-            raise RuntimeError("Missing BUSINESS_RULES_JSON in lead output.")
+            business_rules = self._retry_business_rules(
+                chatgpt, brief, limits, raw_dir, artifacts_dir
+            )
         if self._is_requested("workflows", limits) and workflows is None:
             raise RuntimeError("Missing WORKFLOWS_JSON in lead output.")
         if self._is_requested("domain_model", limits) and domain_model is None:
@@ -213,6 +215,7 @@ class RequirementsPipeline:
         write_json(artifacts_dir / "requirements_review.json", review_json)
 
         if business_rules is not None:
+            business_rules = self._normalize_business_rules(business_rules)
             self._validate_artifact(
                 business_rules, "business_rules.schema.json", "BUSINESS_RULES_JSON"
             )
@@ -841,8 +844,66 @@ class RequirementsPipeline:
     def _write_business_rules_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Business Rules", ""]
         for rule in payload.get("rules", []):
-            lines.append(f"- {rule.get('id')}: {rule.get('text')}")
+            rationale = rule.get("rationale", "")
+            if rationale:
+                lines.append(f"- {rule.get('id')}: {rule.get('text')} (Rationale: {rationale})")
+            else:
+                lines.append(f"- {rule.get('id')}: {rule.get('text')}")
         write_text(path, "\n".join(lines) + "\n")
+
+    def _normalize_business_rules(self, payload: Dict) -> Dict:
+        if not isinstance(payload, dict):
+            return {"rules": []}
+        rules = payload.get("rules", [])
+        if not isinstance(rules, list):
+            return {"rules": []}
+        normalized: List[Dict[str, str]] = []
+        for item in rules:
+            if not isinstance(item, dict):
+                continue
+            rule_id = item.get("id")
+            text = item.get("text")
+            rationale = item.get("rationale")
+            if not all(isinstance(value, str) for value in [rule_id, text, rationale]):
+                continue
+            normalized.append({"id": rule_id, "text": text, "rationale": rationale})
+        return {"rules": normalized}
+
+    def _retry_business_rules(
+        self,
+        adapter: LLMAdapter,
+        brief: str,
+        limits: RequirementsLimits,
+        raw_dir: Path,
+        artifacts_dir: Path,
+    ) -> Dict:
+        warning_path = artifacts_dir / "business_rules_warnings.json"
+        warnings = ["Missing BUSINESS_RULES_JSON in lead output."]
+        write_json(warning_path, {"warnings": warnings})
+
+        retry_template = read_text(
+            self.prompts_dir / "requirements_lead_retry_business_rules.md"
+        )
+        retry_prompt = self._render_prompt(retry_template, limits)
+        retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
+        retry_prompt_path = raw_dir / "turnr1_business_rules_retry_prompt.txt"
+        write_text(retry_prompt_path, retry_full_prompt)
+        retry_response = adapter.complete(retry_full_prompt)
+        write_text(raw_dir / "turnr1_business_rules_retry_raw.txt", retry_response.raw_text)
+        self._write_usage(raw_dir / "turnr1_business_rules_retry_usage.json", retry_response)
+
+        try:
+            business_rules = self._extract_marked_json(
+                retry_response.raw_text,
+                "BUSINESS_RULES_JSON:",
+                {"rules"},
+            )
+            write_json(raw_dir / "turnr1_business_rules_retry_extracted.json", business_rules)
+            return self._normalize_business_rules(business_rules)
+        except ValueError as exc:
+            warnings.append(str(exc))
+            write_json(warning_path, {"warnings": warnings})
+            return {"rules": []}
 
     def _write_workflows_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Workflows", ""]

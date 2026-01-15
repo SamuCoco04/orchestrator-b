@@ -7,11 +7,11 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "text"],
+        "required": ["id", "text", "rationale"],
         "properties": {
           "id": {"type": "string"},
           "text": {"type": "string"},
-          "category": {"type": "string"}
+          "rationale": {"type": "string"}
         },
         "additionalProperties": false
       }
