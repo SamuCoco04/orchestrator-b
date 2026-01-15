@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["adr_id", "title", "status", "context", "decision", "consequences"],
+  "properties": {
+    "adr_id": {"type": "string"},
+    "title": {"type": "string"},
+    "status": {"type": "string"},
+    "context": {"type": "string"},
+    "decision": {"type": "string"},
+    "consequences": {"type": "array", "items": {"type": "string"}}
+  },
+  "additionalProperties": false
+}
