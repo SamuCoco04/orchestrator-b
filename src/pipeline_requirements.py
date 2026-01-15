@@ -360,13 +360,26 @@ class RequirementsPipeline:
                 artifacts_dir / "domain_model.md", domain_model
             )
         if mvp_scope is not None:
+            write_json(raw_dir / "mvp_scope_raw.json", mvp_scope)
+            mvp_scope, warnings = self._repair_mvp_scope(mvp_scope)
+            write_json(artifacts_dir / "mvp_scope_repaired.json", mvp_scope)
+            if warnings:
+                self._artifact_repair_counts["mvp_scope"] = (
+                    self._artifact_repair_counts.get("mvp_scope", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_mvp_scope.json",
+                    {"warnings": warnings, "repaired": mvp_scope},
+                )
             self._validate_artifact(
-                mvp_scope, "mvp_scope.schema.json", "MVP_SCOPE_JSON"
+                mvp_scope,
+                "mvp_scope.schema.json",
+                "MVP_SCOPE_JSON",
+                repair_note="Applied MVP scope repairs before validation.",
             )
+            self._artifact_validation["mvp_scope"] = "valid"
             write_json(artifacts_dir / "mvp_scope.json", mvp_scope)
-            self._write_mvp_scope_markdown(
-                artifacts_dir / "mvp_scope.md", mvp_scope
-            )
+            self._write_mvp_scope_markdown(artifacts_dir / "mvp_scope.md", mvp_scope)
 
         coverage = self._check_coverage(draft_requirements, limits)
         repairs_applied = False
@@ -1558,6 +1571,53 @@ class RequirementsPipeline:
         repaired = {"entities": repaired_entities, "relationships": repaired_relationships}
         return repaired, warnings
 
+    def _repair_mvp_scope(self, payload: Dict) -> tuple[Dict, List[str]]:
+        warnings: List[str] = []
+        if not isinstance(payload, dict):
+            return {"in_scope": [], "out_of_scope": [], "milestones": []}, [
+                "Payload was not an object."
+            ]
+        in_scope = payload.get("in_scope", [])
+        out_of_scope = payload.get("out_of_scope", [])
+        milestones = payload.get("milestones", [])
+        if isinstance(in_scope, str):
+            in_scope = [in_scope]
+        if isinstance(out_of_scope, str):
+            out_of_scope = [out_of_scope]
+        if isinstance(milestones, str):
+            milestones = [milestones]
+        in_scope = [item for item in in_scope if isinstance(item, str)] if isinstance(in_scope, list) else []
+        out_of_scope = (
+            [item for item in out_of_scope if isinstance(item, str)]
+            if isinstance(out_of_scope, list)
+            else []
+        )
+        repaired_milestones: List[Dict[str, str]] = []
+        if isinstance(milestones, list):
+            for item in milestones:
+                if isinstance(item, str):
+                    repaired_milestones.append(
+                        {"name": item, "description": f"Milestone: {item}"}
+                    )
+                    warnings.append("Converted milestone string to object.")
+                    continue
+                if isinstance(item, dict):
+                    name = item.get("name")
+                    description = item.get("description")
+                    if isinstance(name, str):
+                        if not isinstance(description, str):
+                            description = f"Milestone: {name}"
+                            warnings.append(f"Filled missing milestone description for {name}.")
+                        repaired_milestones.append(
+                            {"name": name, "description": description}
+                        )
+        repaired = {
+            "in_scope": in_scope,
+            "out_of_scope": out_of_scope,
+            "milestones": repaired_milestones,
+        }
+        return repaired, warnings
+
     def _write_domain_model_markdown(self, path: Path, payload: Dict) -> None:
         lines = ["# Domain Model", ""]
         for entity in payload.get("entities", []):
@@ -1945,12 +2005,27 @@ class RequirementsPipeline:
                 {"in_scope", "out_of_scope"},
             )
             write_json(raw_dir / "turn_apply_stage_c_mvp_scope_extracted.json", mvp_scope)
+            write_json(raw_dir / "mvp_scope_raw.json", mvp_scope)
+            repaired, warnings = self._repair_mvp_scope(mvp_scope)
+            write_json(artifacts_dir / "mvp_scope_repaired.json", repaired)
+            if warnings:
+                self._artifact_repair_counts["mvp_scope"] = (
+                    self._artifact_repair_counts.get("mvp_scope", 0) + len(warnings)
+                )
+                write_json(
+                    artifacts_dir / "repairs_mvp_scope.json",
+                    {"warnings": warnings, "repaired": repaired},
+                )
             self._validate_artifact(
-                mvp_scope, "mvp_scope.schema.json", "FINAL_MVP_SCOPE_JSON"
+                repaired,
+                "mvp_scope.schema.json",
+                "FINAL_MVP_SCOPE_JSON",
+                repair_note="Applied MVP scope repairs before validation.",
             )
-            results["mvp_scope"] = mvp_scope
-            write_json(artifacts_dir / "mvp_scope.json", mvp_scope)
-            self._write_mvp_scope_markdown(artifacts_dir / "mvp_scope.md", mvp_scope)
+            self._artifact_validation["mvp_scope"] = "valid"
+            results["mvp_scope"] = repaired
+            write_json(artifacts_dir / "mvp_scope.json", repaired)
+            self._write_mvp_scope_markdown(artifacts_dir / "mvp_scope.md", repaired)
         except Exception as exc:
             self._section_warnings.setdefault("mvp_scope", []).append(str(exc))
             write_json(

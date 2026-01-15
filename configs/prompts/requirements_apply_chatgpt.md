@@ -28,6 +28,7 @@ Format contract:
 - FINAL_WORKFLOWS_JSON.workflows must include states and transitions.
 - FINAL_DOMAIN_MODEL_JSON must include entities and relationships.
 - FINAL_MVP_SCOPE_JSON must include in_scope and out_of_scope.
+- FINAL_MVP_SCOPE_JSON.milestones must be an array of objects with {name, description}.
 
 Example requirements array:
 [

@@ -29,6 +29,7 @@ Format contract:
 - WORKFLOWS_JSON.workflows must include states and transitions.
 - DOMAIN_MODEL_JSON must include entities and relationships.
 - MVP_SCOPE_JSON must include in_scope and out_of_scope.
+- MVP_SCOPE_JSON.milestones must be an array of objects with {name, description}.
 
 Rules:
 - Do NOT reuse rejected requirements to reach minimum count.

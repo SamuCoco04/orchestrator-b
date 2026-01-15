@@ -8,5 +8,5 @@ Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape
 
 Rules:
 - in_scope and out_of_scope must be arrays of strings.
-- milestones, if provided, must include {name, description}.
+- milestones must be an array of objects with {name, description}.
 - No markdown, no extra keys.
