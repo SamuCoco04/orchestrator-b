@@ -45,6 +45,12 @@ class RequirementsPipeline:
         self._acceptance_warnings: List[str] = []
         self._section_warnings: Dict[str, List[str]] = {}
         self._requirements_warnings: List[Dict] = []
+        self._list_repair_counts: Dict[str, int] = {
+            "requirements": 0,
+            "assumptions": 0,
+            "constraints": 0,
+            "moved": 0,
+        }
 
     def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
@@ -53,6 +59,12 @@ class RequirementsPipeline:
         self._acceptance_warnings = []
         self._section_warnings = {}
         self._requirements_warnings = []
+        self._list_repair_counts = {
+            "requirements": 0,
+            "assumptions": 0,
+            "constraints": 0,
+            "moved": 0,
+        }
         raw_brief = read_text(brief_path)
         frontmatter, brief = self._parse_frontmatter(raw_brief)
         limits = self._limits_from_frontmatter(frontmatter)
@@ -966,6 +978,91 @@ class RequirementsPipeline:
             normalized.append({"id": rule_id, "text": text, "rationale": rationale})
         return {"rules": normalized}
 
+    def _normalize_str_list(self, items: object, field_name: str, stage: str) -> List[str]:
+        normalized: List[str] = []
+        if not isinstance(items, list):
+            self._requirements_warnings.append(
+                {
+                    "stage": stage,
+                    "field": field_name,
+                    "note": "Expected list; replaced with empty list.",
+                    "original": items,
+                }
+            )
+            return normalized
+
+        for idx, item in enumerate(items):
+            if isinstance(item, str):
+                normalized.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("normalized_text")
+                if isinstance(text, str):
+                    normalized.append(text)
+                    self._requirements_warnings.append(
+                        {
+                            "stage": stage,
+                            "field": field_name,
+                            "index": idx,
+                            "note": "Converted object to text.",
+                            "original": item,
+                        }
+                    )
+                    self._list_repair_counts[field_name] += 1
+                    continue
+                if all(
+                    key in item for key in ["id", "text", "category", "priority"]
+                ) and isinstance(item.get("text"), str):
+                    normalized.append(item.get("text"))
+                    self._requirements_warnings.append(
+                        {
+                            "stage": stage,
+                            "field": field_name,
+                            "index": idx,
+                            "note": "Converted NFR-style object to text.",
+                            "original": item,
+                        }
+                    )
+                    self._list_repair_counts[field_name] += 1
+                    continue
+                serialized = json.dumps(item, ensure_ascii=False)
+                normalized.append(serialized)
+                self._requirements_warnings.append(
+                    {
+                        "stage": stage,
+                        "field": field_name,
+                        "index": idx,
+                        "note": "Serialized object to text.",
+                        "original": item,
+                    }
+                )
+                self._list_repair_counts[field_name] += 1
+                continue
+            if item is None or item == "":
+                self._requirements_warnings.append(
+                    {
+                        "stage": stage,
+                        "field": field_name,
+                        "index": idx,
+                        "note": "Dropped empty item.",
+                        "original": item,
+                    }
+                )
+                self._list_repair_counts[field_name] += 1
+                continue
+            normalized.append(str(item))
+            self._requirements_warnings.append(
+                {
+                    "stage": stage,
+                    "field": field_name,
+                    "index": idx,
+                    "note": "Coerced non-string item to text.",
+                    "original": item,
+                }
+            )
+            self._list_repair_counts[field_name] += 1
+        return normalized
+
     def _normalize_requirements_payload(
         self, payload: Dict, stage: str
     ) -> tuple[Dict, int]:
@@ -984,6 +1081,15 @@ class RequirementsPipeline:
             )
             payload["requirements"] = []
             return payload, string_count
+
+        assumptions = self._normalize_str_list(
+            payload.get("assumptions", []), "assumptions", stage
+        )
+        constraints = self._normalize_str_list(
+            payload.get("constraints", []), "constraints", stage
+        )
+        payload["assumptions"] = assumptions
+        payload["constraints"] = constraints
 
         existing_ids = {
             item.get("id")
@@ -1029,6 +1135,7 @@ class RequirementsPipeline:
                         "repaired_id": req_id,
                     }
                 )
+                self._list_repair_counts["requirements"] += 1
                 continue
 
             if isinstance(item, dict):
@@ -1042,6 +1149,7 @@ class RequirementsPipeline:
                             "original": item,
                         }
                     )
+                    self._list_repair_counts["requirements"] += 1
                     continue
                 priority = item.get("priority")
                 if not isinstance(priority, str) or priority.lower() not in {
@@ -1066,6 +1174,7 @@ class RequirementsPipeline:
                     "original": item,
                 }
             )
+            self._list_repair_counts["requirements"] += 1
 
         payload["requirements"] = normalized_items
         if warnings:
@@ -1959,6 +2068,13 @@ class RequirementsPipeline:
             lines.append(
                 f"- requirements_repairs: {len(self._requirements_warnings)} "
                 "(see artifacts/warnings.json)"
+            )
+        if any(value > 0 for value in self._list_repair_counts.values()):
+            lines.append(
+                "- list_repairs: "
+                + ", ".join(
+                    f"{key}={value}" for key, value in self._list_repair_counts.items()
+                )
             )
         if usage_totals:
             lines.append(
