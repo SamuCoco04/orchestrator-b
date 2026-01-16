@@ -45,6 +45,7 @@ Requirements pipeline behavior (single artifact mode):
 - Gemini cross-reviews that artifact for gaps/ambiguity
 - ChatGPT applies fixes and outputs a FINAL_* JSON wrapper
 - If validation fails, a targeted retry fixes missing/invalid fields only
+- Requirements runs also enforce brief targets (minimum count, coverage areas, and minimum assumptions/constraints) and will trigger add-only retries to close gaps.
 
 You can also adjust generation controls:
 

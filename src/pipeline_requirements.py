@@ -29,6 +29,7 @@ class RequirementsLimits:
     constraints_min: int
     roles_expected: List[str]
     coverage_areas: List[str]
+    coverage_keywords: Dict[str, List[str]]
     min_per_area: int | None
     seed_requirements: List[str]
     requested_artifacts: List[str]
@@ -91,7 +92,14 @@ class RequirementsPipeline:
         gemini = self._adapter("gemini")
         chatgpt = self._adapter("chatgpt")
 
-        payload, warnings, retry_count, missing_fields, responses = self._run_single_artifact(
+        (
+            payload,
+            warnings,
+            retry_count,
+            missing_fields,
+            responses,
+            summary,
+        ) = self._run_single_artifact(
             artifact_key,
             brief,
             limits,
@@ -108,6 +116,7 @@ class RequirementsPipeline:
             retry_count,
             missing_fields,
             responses,
+            summary,
         )
         return {artifact_key: payload}
 
@@ -198,10 +207,11 @@ class RequirementsPipeline:
         gemini: LLMAdapter,
         raw_dir: Path,
         artifacts_dir: Path,
-    ) -> tuple[Dict, List[Dict], int, List[str], List[LLMResponse]]:
+    ) -> tuple[Dict, List[Dict], int, List[str], List[LLMResponse], Dict]:
         config = self._artifact_configs()[artifact]
         max_tokens = self._artifact_token_budget(artifact, limits)
         responses: List[LLMResponse] = []
+        summary: Dict[str, object] = {}
 
         lead_template = read_text(self.prompts_dir / config["lead_prompt"])
         lead_prompt = self._render_prompt(lead_template, limits)
@@ -240,7 +250,16 @@ class RequirementsPipeline:
             "draft": draft_payload,
             "cross_review": cross_review,
         }
-        apply_full_prompt = f"{apply_prompt}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
+        if artifact == "requirements":
+            apply_payload["targets"] = self._requirements_targets_payload(limits)
+            apply_payload["gemini_review"] = cross_review
+            apply_payload["gemini_review_text"] = cross_response.raw_text
+        apply_instruction = ""
+        if artifact == "requirements":
+            apply_instruction = (
+                "\n\nYou may add NEW requirements to meet targets and missing coverage."
+            )
+        apply_full_prompt = f"{apply_prompt}{apply_instruction}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
         write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
         with self._with_max_output_tokens(max_tokens):
             apply_response = chatgpt.complete(apply_full_prompt)
@@ -266,8 +285,32 @@ class RequirementsPipeline:
             )
 
         retry_count = 0
+        add_only_used = False
+        id_normalized = False
+        missing_coverage_areas: List[str] = []
         missing_fields: List[str] = []
         schema = self._load_schema(config["schema"])
+        if artifact == "requirements":
+            final_payload, id_normalized = self._normalize_requirement_ids(
+                final_payload
+            )
+            final_payload, missing_coverage_areas, add_only_used = self._ensure_requirements_targets(
+                brief=brief,
+                limits=limits,
+                payload=final_payload,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                max_tokens=max_tokens,
+            )
+            summary.update(
+                {
+                    "target_min_items": limits.req_min,
+                    "actual_count": len(final_payload.get("requirements", [])),
+                    "missing_coverage_areas": missing_coverage_areas,
+                    "add_only_retry_used": add_only_used,
+                    "id_normalized": id_normalized,
+                }
+            )
         try:
             validate(instance=final_payload, schema=schema)
             self._artifact_validation[artifact] = "valid"
@@ -318,7 +361,7 @@ class RequirementsPipeline:
             self._artifact_validation[artifact] = "invalid"
 
         self._write_artifact_outputs(artifact, final_payload, artifacts_dir)
-        return final_payload, warnings, retry_count, missing_fields, responses
+        return final_payload, warnings, retry_count, missing_fields, responses, summary
 
     def _safe_extract_json(self, raw_text: str) -> Dict:
         try:
@@ -418,6 +461,146 @@ class RequirementsPipeline:
             return len(payload.get("criteria", []))
         return 0
 
+    def _requirements_targets_payload(self, limits: RequirementsLimits) -> Dict:
+        return {
+            "target_min_items": limits.req_min,
+            "target_max_items": limits.req_max,
+            "min_assumptions": limits.assumptions_min,
+            "min_constraints": limits.constraints_min,
+            "coverage_areas": limits.coverage_areas,
+            "coverage_keywords": limits.coverage_keywords,
+            "min_per_area": limits.min_per_area,
+        }
+
+    def _coverage_keywords_for_area(self, limits: RequirementsLimits, area: str) -> List[str]:
+        keywords = limits.coverage_keywords.get(area, [])
+        if area.lower() not in [value.lower() for value in keywords]:
+            return [area] + keywords
+        return keywords
+
+    def _missing_coverage_areas(self, payload: Dict, limits: RequirementsLimits) -> List[str]:
+        if limits.min_per_area is None or not limits.coverage_areas:
+            return []
+        min_per_area = limits.min_per_area
+        req_items = payload.get("requirements", [])
+        texts = [str(item.get("text", "")).lower() for item in req_items if isinstance(item, dict)]
+        missing: List[str] = []
+        for area in limits.coverage_areas:
+            keywords = self._coverage_keywords_for_area(limits, area)
+            count = 0
+            for text in texts:
+                if any(keyword.lower() in text for keyword in keywords):
+                    count += 1
+            if count < min_per_area:
+                missing.append(area)
+        return missing
+
+    def _ensure_requirements_targets(
+        self,
+        brief: str,
+        limits: RequirementsLimits,
+        payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        max_tokens: int,
+    ) -> tuple[Dict, List[str], bool]:
+        missing_coverage = self._missing_coverage_areas(payload, limits)
+        current_count = len(payload.get("requirements", []))
+        missing_count = max(limits.req_min - current_count, 0)
+        missing_assumptions = max(limits.assumptions_min - len(payload.get("assumptions", [])), 0)
+        missing_constraints = max(limits.constraints_min - len(payload.get("constraints", [])), 0)
+        if not any([missing_coverage, missing_count, missing_assumptions, missing_constraints]):
+            return payload, missing_coverage, False
+
+        retry_prompt = read_text(self.prompts_dir / "requirements_add_only_retry.md")
+        retry_payload = {
+            "brief": brief,
+            "current_requirements": payload,
+            "targets": self._requirements_targets_payload(limits),
+            "missing_coverage_areas": missing_coverage,
+            "missing_count": missing_count,
+            "missing_assumptions": missing_assumptions,
+            "missing_constraints": missing_constraints,
+        }
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_add_only_retry_prompt.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_add_only_retry_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / "requirements_add_only_retry_usage.json", response)
+        additions = self._extract_wrapped_json(
+            response.raw_text,
+            "REQUIREMENTS_JSON",
+            {"requirements", "assumptions", "constraints"},
+        )
+        additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
+        payload = self._merge_requirements_additions(payload, additions)
+        payload, _ = self._normalize_requirement_ids(payload)
+        missing_coverage = self._missing_coverage_areas(payload, limits)
+        return payload, missing_coverage, True
+
+    def _merge_requirements_additions(self, base: Dict, additions: Dict) -> Dict:
+        merged = {
+            "requirements": list(base.get("requirements", [])),
+            "assumptions": list(base.get("assumptions", [])),
+            "constraints": list(base.get("constraints", [])),
+        }
+        for item in additions.get("requirements", []):
+            if isinstance(item, dict):
+                merged["requirements"].append(item)
+        for item in additions.get("assumptions", []):
+            if isinstance(item, str):
+                merged["assumptions"].append(item)
+        for item in additions.get("constraints", []):
+            if isinstance(item, str):
+                merged["constraints"].append(item)
+        return merged
+
+    def _normalize_requirement_ids(self, payload: Dict) -> tuple[Dict, bool]:
+        items = payload.get("requirements", [])
+        if not isinstance(items, list):
+            return payload, False
+        normalized = False
+        used_ids: set[str] = set()
+        sequence = 1
+
+        def next_id() -> str:
+            nonlocal sequence
+            while True:
+                candidate = f"REQ-{sequence:03d}"
+                sequence += 1
+                if candidate not in used_ids:
+                    used_ids.add(candidate)
+                    return candidate
+
+        normalized_items: List[Dict] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            current_id = item.get("id")
+            needs_new = False
+            if current_id is None:
+                needs_new = True
+            elif isinstance(current_id, int):
+                needs_new = True
+            elif isinstance(current_id, str):
+                if current_id.strip().isdigit():
+                    needs_new = True
+                elif current_id in used_ids:
+                    needs_new = True
+            else:
+                needs_new = True
+
+            if needs_new:
+                item["id"] = next_id()
+                normalized = True
+            else:
+                used_ids.add(current_id)
+            normalized_items.append(item)
+
+        payload["requirements"] = normalized_items
+        return payload, normalized
+
     def _write_single_run_summary(
         self,
         artifacts_dir: Path,
@@ -427,6 +610,7 @@ class RequirementsPipeline:
         retry_count: int,
         missing_fields: List[str],
         responses: List[LLMResponse],
+        summary: Dict[str, object],
     ) -> None:
         usage_totals = self._collect_usage_totals(artifacts_dir.parent / "raw", responses)
         lines = [
@@ -438,6 +622,20 @@ class RequirementsPipeline:
             f"- missing_fields: {', '.join(missing_fields) if missing_fields else 'none'}",
             f"- retry_count: {retry_count}",
         ]
+        if artifact == "requirements" and summary:
+            target_min_items = summary.get("target_min_items")
+            actual_count = summary.get("actual_count")
+            missing_coverage = summary.get("missing_coverage_areas", [])
+            add_only_used = summary.get("add_only_retry_used")
+            id_normalized = summary.get("id_normalized")
+            lines.append(f"- target_min_items: {target_min_items}")
+            lines.append(f"- actual_count: {actual_count}")
+            if missing_coverage:
+                lines.append(f"- missing_coverage_areas: {', '.join(missing_coverage)}")
+            else:
+                lines.append("- missing_coverage_areas: none")
+            lines.append(f"- add_only_retry_used: {'yes' if add_only_used else 'no'}")
+            lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
         if self._artifact_validation.get(artifact):
             lines.append(f"- validation: {self._artifact_validation[artifact]}")
         if usage_totals:
@@ -2109,7 +2307,7 @@ class RequirementsPipeline:
         def allocate_id() -> str:
             nonlocal next_id
             while True:
-                candidate = f"REQ-TEMP-{next_id}"
+                candidate = f"REQ-{next_id:03d}"
                 next_id += 1
                 if candidate not in existing_ids:
                     existing_ids.add(candidate)
@@ -2424,16 +2622,40 @@ class RequirementsPipeline:
 
     def _limits_from_frontmatter(self, frontmatter: Dict) -> RequirementsLimits:
         req_target = frontmatter.get("requirements_target", {}) if isinstance(frontmatter, dict) else {}
-        req_min = int(frontmatter.get("target_min_reqs", req_target.get("min", 30)))
-        req_max = frontmatter.get("target_max_reqs", req_target.get("max"))
+        targets = frontmatter.get("targets", {}) if isinstance(frontmatter, dict) else {}
+        if not isinstance(targets, dict):
+            targets = {}
+        req_min_value = targets.get(
+            "target_min_items", frontmatter.get("target_min_reqs", req_target.get("min", 30))
+        )
+        req_max_value = targets.get(
+            "target_max_items", frontmatter.get("target_max_reqs", req_target.get("max"))
+        )
+        try:
+            req_min = int(req_min_value) if req_min_value is not None else 30
+        except (TypeError, ValueError):
+            req_min = 30
+        req_max = req_max_value
         if req_max == "" or req_max is None:
             req_max_int = None
         else:
-            req_max_int = int(req_max)
+            try:
+                req_max_int = int(req_max)
+            except (TypeError, ValueError):
+                req_max_int = None
         coverage_areas = frontmatter.get("coverage_areas", [])
         if isinstance(coverage_areas, str):
             coverage_areas = [coverage_areas]
-        coverage_areas = list(coverage_areas)
+        normalized_areas: List[str] = []
+        if isinstance(coverage_areas, list):
+            for entry in coverage_areas:
+                if isinstance(entry, str):
+                    normalized_areas.append(entry)
+                elif isinstance(entry, dict):
+                    name = entry.get("name")
+                    if isinstance(name, str):
+                        normalized_areas.append(name)
+        coverage_areas = normalized_areas
         min_per_area = frontmatter.get("min_per_area")
         min_per_area_int = int(min_per_area) if min_per_area is not None else None
         seed_requirements = frontmatter.get("seed_requirements", [])
@@ -2483,13 +2705,36 @@ class RequirementsPipeline:
                 artifact_token_budgets[key] = int(raw_value) if raw_value is not None else default_value
             except (TypeError, ValueError):
                 artifact_token_budgets[key] = default_value
+        min_assumptions = targets.get("min_assumptions", frontmatter.get("assumptions_min", 3))
+        min_constraints = targets.get("min_constraints", frontmatter.get("constraints_min", 3))
+        try:
+            assumptions_min = int(min_assumptions)
+        except (TypeError, ValueError):
+            assumptions_min = 3
+        try:
+            constraints_min = int(min_constraints)
+        except (TypeError, ValueError):
+            constraints_min = 3
+
+        coverage_keywords: Dict[str, List[str]] = {}
+        if isinstance(frontmatter.get("coverage_areas"), list):
+            for entry in frontmatter["coverage_areas"]:
+                if isinstance(entry, dict):
+                    name = entry.get("name")
+                    keywords = entry.get("keywords", [])
+                    if isinstance(name, str):
+                        if not isinstance(keywords, list):
+                            keywords = []
+                        coverage_keywords[name] = [str(item) for item in keywords if str(item)]
+
         return RequirementsLimits(
             req_min=req_min,
             req_max=req_max_int,
-            assumptions_min=int(frontmatter.get("assumptions_min", 3)),
-            constraints_min=int(frontmatter.get("constraints_min", 3)),
+            assumptions_min=assumptions_min,
+            constraints_min=constraints_min,
             roles_expected=list(frontmatter.get("roles_expected", [])),
             coverage_areas=coverage_areas,
+            coverage_keywords=coverage_keywords,
             min_per_area=min_per_area_int,
             seed_requirements=seed_requirements,
             requested_artifacts=requested_list,
