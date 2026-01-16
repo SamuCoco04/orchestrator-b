@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import yaml
-from jsonschema import validate
+from jsonschema import ValidationError, validate
 
 from src.adapters.gemini_adapter import GeminiAdapter
 from src.adapters.llm_base import LLMAdapter, LLMResponse
@@ -31,6 +32,7 @@ class RequirementsLimits:
     min_per_area: int | None
     seed_requirements: List[str]
     requested_artifacts: List[str]
+    artifact_token_budgets: Dict[str, int]
 
 
 class RequirementsPipeline:
@@ -55,7 +57,9 @@ class RequirementsPipeline:
         self._delta_retry_counts: Dict[str, int] = {}
         self._artifact_validation: Dict[str, str] = {}
 
-    def run(self, brief_path: Path, run_dir: Path) -> Dict[str, Dict]:
+    def run(
+        self, brief_path: Path, run_dir: Path, artifact: str = "requirements"
+    ) -> Dict[str, Dict]:
         self._review_normalization_warnings = []
         self._extraction_traces = []
         self._repair_warnings = []
@@ -77,447 +81,371 @@ class RequirementsPipeline:
 
         raw_dir = run_dir / "raw"
         artifacts_dir = run_dir / "artifacts"
-        adrs_dir = artifacts_dir / "adrs"
         raw_dir.mkdir(parents=True, exist_ok=True)
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        adrs_dir.mkdir(parents=True, exist_ok=True)
+
+        artifact_key = artifact.strip().lower()
+        if artifact_key not in self._artifact_configs():
+            raise ValueError(f"Unsupported artifact: {artifact}")
 
         gemini = self._adapter("gemini")
         chatgpt = self._adapter("chatgpt")
 
-        lead_template = read_text(self.prompts_dir / "requirements_chatgpt_lead.md")
-        lead_prompt = self._render_prompt(lead_template, limits)
-        lead_full_prompt = f"{lead_prompt}\n\nINPUT:\n{brief}\n"
-        lead_prompt_path = raw_dir / "turnr1_chatgpt_lead_prompt.txt"
-        write_text(lead_prompt_path, lead_full_prompt)
-        lead_response = chatgpt.complete(lead_full_prompt)
-        lead_response_path = raw_dir / "turnr1_lead_raw.txt"
-        write_text(lead_response_path, lead_response.raw_text)
-        self._write_usage(raw_dir / "turnr1_chatgpt_lead_usage.json", lead_response)
-
-        wrapper = self._try_parse_wrapper(lead_response.raw_text)
-        wrapper_keys: List[str] | None = None
-        if wrapper is not None:
-            wrapper_keys = sorted(wrapper.keys())
-            review_json = wrapper.get("REVIEW_JSON")
-            draft_requirements = wrapper.get("REQUIREMENTS_JSON")
-            business_rules = wrapper.get("BUSINESS_RULES_JSON")
-            workflows = wrapper.get("WORKFLOWS_JSON")
-            domain_model = wrapper.get("DOMAIN_MODEL_JSON")
-            mvp_scope = wrapper.get("MVP_SCOPE_JSON")
-        else:
-            review_json = self._extract_marked_json(
-                lead_response.raw_text,
-                "REVIEW_JSON:",
-                {"accepted", "rejected", "issues", "missing", "rationale"},
-            )
-            draft_requirements = None
-            business_rules = None
-            workflows = None
-            domain_model = None
-            mvp_scope = None
-
-        try:
-            if draft_requirements is None:
-                draft_requirements = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "REQUIREMENTS_JSON:",
-                    {"requirements", "assumptions", "constraints"},
-                )
-            if review_json is None:
-                review_json = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "REVIEW_JSON:",
-                    {"accepted", "rejected", "issues", "missing", "rationale"},
-                )
-            if self._is_requested("business_rules", limits) and business_rules is None:
-                business_rules = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "BUSINESS_RULES_JSON:",
-                    {"rules"},
-                )
-            if self._is_requested("workflows", limits) and workflows is None:
-                workflows = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "WORKFLOWS_JSON:",
-                    {"workflows"},
-                )
-            if self._is_requested("domain_model", limits) and domain_model is None:
-                domain_model = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "DOMAIN_MODEL_JSON:",
-                    {"entities", "relationships"},
-                )
-            if self._is_requested("mvp_scope", limits) and mvp_scope is None:
-                mvp_scope = self._extract_marked_json(
-                    lead_response.raw_text,
-                    "MVP_SCOPE_JSON:",
-                    {"in_scope", "out_of_scope"},
-                )
-        except ValueError:
-            retry_template = read_text(
-                self.prompts_dir / "requirements_lead_retry_requirements_only.md"
-            )
-            retry_prompt = self._render_prompt(retry_template, limits)
-            retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
-            retry_prompt_path = raw_dir / "turnr1_lead_retry_prompt.txt"
-            write_text(retry_prompt_path, retry_full_prompt)
-            retry_response = chatgpt.complete(retry_full_prompt)
-            retry_raw_path = raw_dir / "turnr1_lead_retry_raw.txt"
-            write_text(retry_raw_path, retry_response.raw_text)
-            self._write_usage(raw_dir / "turnr1_lead_retry_usage.json", retry_response)
-            try:
-                draft_requirements = self._extract_marked_json(
-                    retry_response.raw_text,
-                    "REQUIREMENTS_JSON:",
-                    {"requirements", "assumptions", "constraints"},
-                )
-                write_json(
-                    raw_dir / "turnr1_lead_retry_requirements_extracted.json",
-                    draft_requirements,
-                )
-            except ValueError as exc:
-                wrapper_note = ""
-                if wrapper_keys is not None:
-                    wrapper_note = f" Detected wrapper JSON with keys: {wrapper_keys}."
-                raise RuntimeError(
-                    "Lead returned only REVIEW_JSON; enforce prompt format."
-                    + wrapper_note
-                ) from exc
-
-        if self._is_requested("business_rules", limits) and business_rules is None:
-            business_rules = self._require_section(
-                section_name="business_rules",
-                label="BUSINESS_RULES_JSON",
-                schema_name="business_rules.schema.json",
-                retry_prompt_path="requirements_lead_retry_business_rules.md",
-                default_value={"rules": []},
-                expected_keys={"rules"},
-                brief=brief,
-                limits=limits,
-                adapter=chatgpt,
-                raw_dir=raw_dir,
-                artifacts_dir=artifacts_dir,
-            )
-        if self._is_requested("workflows", limits) and workflows is None:
-            workflows = self._require_section(
-                section_name="workflows",
-                label="WORKFLOWS_JSON",
-                schema_name="workflows.schema.json",
-                retry_prompt_path="requirements_lead_retry_workflows.md",
-                default_value={"workflows": []},
-                expected_keys={"workflows"},
-                brief=brief,
-                limits=limits,
-                adapter=chatgpt,
-                raw_dir=raw_dir,
-                artifacts_dir=artifacts_dir,
-            )
-        if self._is_requested("domain_model", limits) and domain_model is None:
-            domain_model = self._require_section(
-                section_name="domain_model",
-                label="DOMAIN_MODEL_JSON",
-                schema_name="domain_model.schema.json",
-                retry_prompt_path="requirements_lead_retry_domain_model.md",
-                default_value={"entities": [], "relationships": []},
-                expected_keys={"entities", "relationships"},
-                brief=brief,
-                limits=limits,
-                adapter=chatgpt,
-                raw_dir=raw_dir,
-                artifacts_dir=artifacts_dir,
-            )
-        if self._is_requested("mvp_scope", limits) and mvp_scope is None:
-            mvp_scope = self._require_section(
-                section_name="mvp_scope",
-                label="MVP_SCOPE_JSON",
-                schema_name="mvp_scope.schema.json",
-                retry_prompt_path="requirements_lead_retry_mvp_scope.md",
-                default_value={"in_scope": [], "out_of_scope": [], "milestones": []},
-                expected_keys={"in_scope", "out_of_scope"},
-                brief=brief,
-                limits=limits,
-                adapter=chatgpt,
-                raw_dir=raw_dir,
-                artifacts_dir=artifacts_dir,
-            )
-
-        review_extracted = review_json
-        draft_extracted = draft_requirements
-        write_json(raw_dir / "turnr1_review_extracted.json", review_extracted)
-        write_json(raw_dir / "turnr1_requirements_extracted.json", draft_extracted)
-        if business_rules is not None:
-            write_json(raw_dir / "turnr1_business_rules_extracted.json", business_rules)
-        if workflows is not None:
-            write_json(raw_dir / "turnr1_workflows_extracted.json", workflows)
-        if domain_model is not None:
-            write_json(raw_dir / "turnr1_domain_model_extracted.json", domain_model)
-        if mvp_scope is not None:
-            write_json(raw_dir / "turnr1_mvp_scope_extracted.json", mvp_scope)
-
-        review_json = self.normalize_review_json(review_json)
-        if self._review_normalization_warnings:
-            write_json(
-                artifacts_dir / "review_normalization_warnings.json",
-                {"warnings": self._review_normalization_warnings},
-            )
-
-        draft_requirements, string_count = self._normalize_requirements_payload(
-            draft_requirements, stage="draft"
-        )
-        if string_count > 2:
-            retry_requirements = self._retry_requirements_only(
-                chatgpt,
-                brief,
-                limits,
-                raw_dir,
-                "requirements_lead_retry_requirements_only.md",
-                "turnr1_requirements_retry",
-                "REQUIREMENTS_JSON:",
-                {"requirements", "assumptions", "constraints"},
-            )
-            if retry_requirements is not None:
-                draft_requirements, _ = self._normalize_requirements_payload(
-                    retry_requirements, stage="draft_retry"
-                )
-
-        write_json(raw_dir / "turnr1_requirements_normalized.json", draft_requirements)
-        self._write_requirements_warnings(artifacts_dir / "warnings.json")
-
-        requirements_schema = self._load_schema("normalized_requirements.schema.json")
-        validate(instance=draft_requirements, schema=requirements_schema)
-        review_schema = self._load_schema("requirements_review.schema.json")
-        try:
-            validate(instance=review_json, schema=review_schema)
-        except Exception as exc:
-            write_json(raw_dir / "turnr1_review_invalid_raw.json", review_extracted)
-            write_json(
-                artifacts_dir / "review_invalid_normalized.json",
-                review_json,
-            )
-            raise exc
-
-        draft_requirements, id_map = self._normalize_requirements(draft_requirements)
-        review_json = self._normalize_review(review_json, id_map)
-
-        write_json(raw_dir / "turnr1_draft.json", draft_requirements)
-        write_json(raw_dir / "turnr1_review.json", review_json)
-        write_json(artifacts_dir / "requirements_review.json", review_json)
-
-        if business_rules is not None:
-            business_rules = self._normalize_business_rules(business_rules)
-            self._validate_artifact(
-                business_rules, "business_rules.schema.json", "BUSINESS_RULES_JSON"
-            )
-            write_json(artifacts_dir / "business_rules.json", business_rules)
-            self._write_business_rules_markdown(
-                artifacts_dir / "business_rules.md", business_rules
-            )
-        if workflows is not None:
-            write_json(raw_dir / "workflows_raw.json", workflows)
-            workflows, warnings = self._repair_workflows(workflows)
-            write_json(artifacts_dir / "workflows_repaired.json", workflows)
-            if warnings:
-                self._artifact_repair_counts["workflows"] = (
-                    self._artifact_repair_counts.get("workflows", 0) + len(warnings)
-                )
-                write_json(
-                    artifacts_dir / "repairs_workflows.json",
-                    {"warnings": warnings, "repaired": workflows},
-                )
-            workflows = self._normalize_workflows(workflows)
-            write_json(artifacts_dir / "workflows_normalized.json", workflows)
-            self._validate_artifact(
-                workflows,
-                "workflows.schema.json",
-                "WORKFLOWS_JSON",
-                repair_note="Applied workflow repairs before validation.",
-            )
-            self._artifact_validation["workflows"] = "valid"
-            write_json(artifacts_dir / "workflows.json", workflows)
-            self._write_workflows_markdown(artifacts_dir / "workflows.md", workflows)
-        if domain_model is not None:
-            write_json(raw_dir / "domain_model_raw.json", domain_model)
-            domain_model, warnings = self._repair_domain_model(domain_model)
-            write_json(artifacts_dir / "domain_model_repaired.json", domain_model)
-            if warnings:
-                self._artifact_repair_counts["domain_model"] = (
-                    self._artifact_repair_counts.get("domain_model", 0) + len(warnings)
-                )
-                write_json(
-                    artifacts_dir / "repairs_domain_model.json",
-                    {"warnings": warnings, "repaired": domain_model},
-                )
-            self._validate_artifact(
-                domain_model,
-                "domain_model.schema.json",
-                "DOMAIN_MODEL_JSON",
-                repair_note="Applied domain model repairs before validation.",
-            )
-            self._artifact_validation["domain_model"] = "valid"
-            write_json(artifacts_dir / "domain_model.json", domain_model)
-            self._write_domain_model_markdown(
-                artifacts_dir / "domain_model.md", domain_model
-            )
-        if mvp_scope is not None:
-            write_json(raw_dir / "mvp_scope_raw.json", mvp_scope)
-            mvp_scope, warnings = self._repair_mvp_scope(mvp_scope)
-            write_json(artifacts_dir / "mvp_scope_repaired.json", mvp_scope)
-            if warnings:
-                self._artifact_repair_counts["mvp_scope"] = (
-                    self._artifact_repair_counts.get("mvp_scope", 0) + len(warnings)
-                )
-                write_json(
-                    artifacts_dir / "repairs_mvp_scope.json",
-                    {"warnings": warnings, "repaired": mvp_scope},
-                )
-            self._validate_artifact(
-                mvp_scope,
-                "mvp_scope.schema.json",
-                "MVP_SCOPE_JSON",
-                repair_note="Applied MVP scope repairs before validation.",
-            )
-            self._artifact_validation["mvp_scope"] = "valid"
-            write_json(artifacts_dir / "mvp_scope.json", mvp_scope)
-            self._write_mvp_scope_markdown(artifacts_dir / "mvp_scope.md", mvp_scope)
-
-        coverage = self._check_coverage(draft_requirements, limits)
-        repairs_applied = False
-        if coverage["needs_retry"]:
-            retries = self._run_coverage_retry(
-                chatgpt, brief, draft_requirements, coverage, limits, raw_dir
-            )
-            if retries is not None:
-                repairs_applied = True
-                draft_requirements = self._merge_requirements(draft_requirements, retries)
-                draft_requirements, id_map = self._normalize_requirements(draft_requirements)
-                review_json = self._normalize_review(review_json, id_map)
-                write_json(
-                    raw_dir / "turnr1_coverage_requirements_normalized.json",
-                    draft_requirements,
-                )
-                coverage = self._check_coverage(draft_requirements, limits)
-
-        cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
-        cross_prompt = self._render_prompt(cross_template, limits)
-        cross_payload = {
-            "brief": brief,
-            "requirements": draft_requirements,
-            "review": review_json,
-        }
-        cross_full_prompt = f"{cross_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
-        cross_prompt_path = raw_dir / "turnr3_gemini_cross_review_prompt.txt"
-        write_text(cross_prompt_path, cross_full_prompt)
-        cross_response = gemini.complete(cross_full_prompt)
-        cross_response_path = raw_dir / "turnr3_gemini_cross_review_response.txt"
-        write_text(cross_response_path, cross_response.raw_text)
-        write_text(raw_dir / "turnr3_gemini_cross_review_raw.txt", cross_response.raw_text)
-        self._write_usage(raw_dir / "turnr3_gemini_cross_review_usage.json", cross_response)
-
-        cross_review = extract_json(cross_response.raw_text)
-        if not isinstance(cross_review, dict):
-            raise ValueError("Turn R3 cross-review output must be a JSON object.")
-        write_json(raw_dir / "turnr3_gemini_cross_review.json", cross_review)
-        write_json(artifacts_dir / "turnr3_gemini_cross_review.json", cross_review)
-
-        apply_template = read_text(self.prompts_dir / "requirements_apply_stage_a.md")
-        apply_prompt = self._render_prompt(apply_template, limits)
-        final_requirements, changelog, apply_repairs = self._run_apply(
-            chatgpt,
-            apply_prompt,
+        payload, warnings, retry_count, missing_fields, responses = self._run_single_artifact(
+            artifact_key,
             brief,
-            draft_requirements,
-            review_json,
-            cross_review,
             limits,
+            chatgpt,
+            gemini,
             raw_dir,
             artifacts_dir,
         )
-        repairs_applied = repairs_applied or apply_repairs
-        final_coverage = self._check_coverage(final_requirements, limits)
-
-        final_artifacts = self._run_apply_stage_b(
-            chatgpt,
-            brief,
-            final_requirements,
-            limits,
-            raw_dir,
+        self._write_single_run_summary(
             artifacts_dir,
+            artifact_key,
+            payload,
+            warnings,
+            retry_count,
+            missing_fields,
+            responses,
         )
-        final_artifacts.update(
-            self._run_apply_stage_c(
-                chatgpt,
-                brief,
-                final_requirements,
-                limits,
-                raw_dir,
-                artifacts_dir,
-            )
-        )
+        return {artifact_key: payload}
 
-        write_json(raw_dir / "turnr4_final_requirements.json", final_requirements)
-        write_json(raw_dir / "turnr4_changelog.json", changelog)
-        write_json(artifacts_dir / "requirements.json", final_requirements)
-        write_json(artifacts_dir / "changelog.json", changelog)
-
-        write_requirements(artifacts_dir / "requirements.md", final_requirements)
-
-        adr_prompt = read_text(self.prompts_dir / "requirements_chatgpt_adr.md")
-        adr_payload = {
-            "requirements": final_requirements,
-            "review": review_json,
-            "cross_review": cross_review,
-            "changelog": changelog,
-            "metrics": self._metrics(final_requirements, limits),
-        }
-        adr_full_prompt = f"{adr_prompt}\n\nINPUT:\n{json.dumps(adr_payload)}\n"
-        adr_prompt_path = raw_dir / "turnr5_chatgpt_adr_prompt.txt"
-        write_text(adr_prompt_path, adr_full_prompt)
-        adr_response = chatgpt.complete(adr_full_prompt)
-        adr_response_path = raw_dir / "turnr5_chatgpt_adr_response.txt"
-        write_text(adr_response_path, adr_response.raw_text)
-        self._write_usage(raw_dir / "turnr5_chatgpt_adr_usage.json", adr_response)
-
-        adr = extract_json(adr_response.raw_text)
-        adr_schema = self._load_schema("adr.schema.json")
-        validate(instance=adr, schema=adr_schema)
-        write_json(artifacts_dir / "turnr5_chatgpt_adr.json", adr)
-        write_adr(adrs_dir / f"{adr['adr_id']}.md", adr)
-
-        acceptance_criteria = None
-        if self._is_requested("acceptance_criteria", limits):
-            acceptance_criteria = self._run_acceptance_criteria(
-                chatgpt,
-                gemini,
-                final_requirements,
-                raw_dir,
-                artifacts_dir,
-            )
-
-        self._write_run_summary(
-            artifacts_dir,
-            final_requirements,
-            final_artifacts,
-            acceptance_criteria,
-            final_coverage,
-            repairs_applied,
-            [
-                lead_response,
-                cross_response,
-                adr_response,
-            ],
-        )
-
+    def _artifact_configs(self) -> Dict[str, Dict]:
         return {
-            "draft": draft_requirements,
-            "review": review_json,
-            "cross_review": cross_review,
-            "final": final_requirements,
-            "changelog": changelog,
-            "final_artifacts": final_artifacts,
-            "acceptance_criteria": acceptance_criteria,
-            "adr": adr,
+            "requirements": {
+                "lead_prompt": "requirements_lead.md",
+                "apply_prompt": "requirements_apply.md",
+                "draft_label": "REQUIREMENTS_JSON",
+                "final_label": "FINAL_REQUIREMENTS_JSON",
+                "schema": "normalized_requirements.schema.json",
+                "expected_keys": {"requirements", "assumptions", "constraints"},
+                "default_budget": 2400,
+            },
+            "business_rules": {
+                "lead_prompt": "business_rules_lead.md",
+                "apply_prompt": "business_rules_apply.md",
+                "draft_label": "BUSINESS_RULES_JSON",
+                "final_label": "FINAL_BUSINESS_RULES_JSON",
+                "schema": "business_rules.schema.json",
+                "expected_keys": {"rules"},
+                "default_budget": 1600,
+            },
+            "workflows": {
+                "lead_prompt": "workflows_lead.md",
+                "apply_prompt": "workflows_apply.md",
+                "draft_label": "WORKFLOWS_JSON",
+                "final_label": "FINAL_WORKFLOWS_JSON",
+                "schema": "workflows.schema.json",
+                "expected_keys": {"workflows"},
+                "default_budget": 2000,
+            },
+            "domain_model": {
+                "lead_prompt": "domain_model_lead.md",
+                "apply_prompt": "domain_model_apply.md",
+                "draft_label": "DOMAIN_MODEL_JSON",
+                "final_label": "FINAL_DOMAIN_MODEL_JSON",
+                "schema": "domain_model.schema.json",
+                "expected_keys": {"entities", "relationships"},
+                "default_budget": 1600,
+            },
+            "mvp_scope": {
+                "lead_prompt": "mvp_scope_lead.md",
+                "apply_prompt": "mvp_scope_apply.md",
+                "draft_label": "MVP_SCOPE_JSON",
+                "final_label": "FINAL_MVP_SCOPE_JSON",
+                "schema": "mvp_scope.schema.json",
+                "expected_keys": {"in_scope", "out_of_scope"},
+                "default_budget": 1200,
+            },
+            "acceptance_criteria": {
+                "lead_prompt": "acceptance_criteria_lead.md",
+                "apply_prompt": "acceptance_criteria_apply.md",
+                "draft_label": "ACCEPTANCE_CRITERIA_JSON",
+                "final_label": "FINAL_ACCEPTANCE_CRITERIA_JSON",
+                "schema": "acceptance_criteria.schema.json",
+                "expected_keys": {"criteria"},
+                "default_budget": 2000,
+            },
         }
+
+    def _artifact_token_budget(self, artifact: str, limits: RequirementsLimits) -> int:
+        config = self._artifact_configs()[artifact]
+        default_budget = config["default_budget"]
+        value = limits.artifact_token_budgets.get(artifact)
+        if isinstance(value, int) and value > 0:
+            return value
+        return default_budget
+
+    @contextmanager
+    def _with_max_output_tokens(self, max_tokens: int) -> None:
+        original = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
+        os.environ["ORCH_MAX_OUTPUT_TOKENS"] = str(max_tokens)
+        try:
+            yield
+        finally:
+            if original is None:
+                os.environ.pop("ORCH_MAX_OUTPUT_TOKENS", None)
+            else:
+                os.environ["ORCH_MAX_OUTPUT_TOKENS"] = original
+
+    def _run_single_artifact(
+        self,
+        artifact: str,
+        brief: str,
+        limits: RequirementsLimits,
+        chatgpt: LLMAdapter,
+        gemini: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+    ) -> tuple[Dict, List[Dict], int, List[str], List[LLMResponse]]:
+        config = self._artifact_configs()[artifact]
+        max_tokens = self._artifact_token_budget(artifact, limits)
+        responses: List[LLMResponse] = []
+
+        lead_template = read_text(self.prompts_dir / config["lead_prompt"])
+        lead_prompt = self._render_prompt(lead_template, limits)
+        lead_payload = {"brief": brief}
+        lead_full_prompt = f"{lead_prompt}\n\nINPUT:\n{json.dumps(lead_payload)}\n"
+        write_text(raw_dir / f"{artifact}_draft_prompt.txt", lead_full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            lead_response = chatgpt.complete(lead_full_prompt)
+        responses.append(lead_response)
+        write_text(raw_dir / f"{artifact}_draft_raw.txt", lead_response.raw_text)
+        self._write_usage(raw_dir / f"{artifact}_draft_usage.json", lead_response)
+
+        draft_payload = self._extract_wrapped_json(
+            lead_response.raw_text,
+            config["draft_label"],
+            config["expected_keys"],
+        )
+        draft_payload, draft_warnings = self._repair_artifact_payload(
+            artifact, draft_payload, stage="draft"
+        )
+
+        cross_review_prompt = self._artifact_cross_review_prompt(artifact)
+        cross_payload = {"brief": brief, "artifact": draft_payload}
+        cross_full_prompt = f"{cross_review_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
+        write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
+        cross_response = gemini.complete(cross_full_prompt)
+        responses.append(cross_response)
+        write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
+        self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
+        cross_review = self._safe_extract_json(cross_response.raw_text)
+
+        apply_template = read_text(self.prompts_dir / config["apply_prompt"])
+        apply_prompt = self._render_prompt(apply_template, limits)
+        apply_payload = {
+            "brief": brief,
+            "draft": draft_payload,
+            "cross_review": cross_review,
+        }
+        apply_full_prompt = f"{apply_prompt}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
+        write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            apply_response = chatgpt.complete(apply_full_prompt)
+        responses.append(apply_response)
+        write_text(raw_dir / f"{artifact}_apply_raw.txt", apply_response.raw_text)
+        self._write_usage(raw_dir / f"{artifact}_apply_usage.json", apply_response)
+
+        final_payload = self._extract_wrapped_json(
+            apply_response.raw_text,
+            config["final_label"],
+            config["expected_keys"],
+        )
+        final_payload, final_warnings = self._repair_artifact_payload(
+            artifact, final_payload, stage="apply"
+        )
+
+        warnings = draft_warnings + final_warnings
+        if warnings:
+            self._artifact_repair_counts[artifact] = len(warnings)
+            write_json(
+                artifacts_dir / f"{artifact}_warnings.json",
+                {"warnings": warnings},
+            )
+
+        retry_count = 0
+        missing_fields: List[str] = []
+        schema = self._load_schema(config["schema"])
+        try:
+            validate(instance=final_payload, schema=schema)
+            self._artifact_validation[artifact] = "valid"
+        except ValidationError as exc:
+            missing_fields = self._extract_missing_fields(exc)
+            retry_payload = {
+                "brief": brief,
+                "draft": draft_payload,
+                "cross_review": cross_review,
+                "current": final_payload,
+                "validation_errors": [str(exc)],
+            }
+            retry_full_prompt = (
+                f"{apply_prompt}\n\nFix ONLY missing/invalid fields in the current payload. "
+                "Do not rewrite or regenerate unrelated content.\n\nINPUT:\n"
+                f"{json.dumps(retry_payload)}\n"
+            )
+            write_text(raw_dir / f"{artifact}_apply_retry_prompt.txt", retry_full_prompt)
+            with self._with_max_output_tokens(max_tokens):
+                retry_response = chatgpt.complete(retry_full_prompt)
+            responses.append(retry_response)
+            write_text(raw_dir / f"{artifact}_apply_retry_raw.txt", retry_response.raw_text)
+            self._write_usage(raw_dir / f"{artifact}_apply_retry_usage.json", retry_response)
+            retry_count += 1
+            try:
+                retry_payload_json = self._extract_wrapped_json(
+                    retry_response.raw_text,
+                    config["final_label"],
+                    config["expected_keys"],
+                )
+                retry_payload_json, retry_warnings = self._repair_artifact_payload(
+                    artifact, retry_payload_json, stage="apply_retry"
+                )
+                if retry_warnings:
+                    warnings.extend(retry_warnings)
+                    self._artifact_repair_counts[artifact] = len(warnings)
+                    write_json(
+                        artifacts_dir / f"{artifact}_warnings.json",
+                        {"warnings": warnings},
+                    )
+                validate(instance=retry_payload_json, schema=schema)
+                final_payload = retry_payload_json
+                self._artifact_validation[artifact] = "valid"
+            except ValidationError as retry_exc:
+                missing_fields = self._extract_missing_fields(retry_exc)
+                self._artifact_validation[artifact] = "invalid"
+        except Exception:
+            self._artifact_validation[artifact] = "invalid"
+
+        self._write_artifact_outputs(artifact, final_payload, artifacts_dir)
+        return final_payload, warnings, retry_count, missing_fields, responses
+
+    def _safe_extract_json(self, raw_text: str) -> Dict:
+        try:
+            parsed = extract_json(raw_text)
+        except ValueError:
+            return {"notes": raw_text.strip()}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"notes": raw_text.strip()}
+
+    def _extract_wrapped_json(
+        self, raw_text: str, label: str, expected_keys: set[str]
+    ) -> Dict:
+        payload = self._safe_extract_json(raw_text)
+        if label in payload and isinstance(payload[label], dict):
+            payload = payload[label]
+        if not isinstance(payload, dict):
+            raise ValueError(f"{label} payload must be a JSON object.")
+        missing = expected_keys.difference(payload.keys())
+        if missing:
+            raise ValueError(f"{label} missing keys: {', '.join(sorted(missing))}")
+        return payload
+
+    def _artifact_cross_review_prompt(self, artifact: str) -> str:
+        return (
+            "You are a critical reviewer. Identify ambiguity, missing details, "
+            "edge cases, and contradictions in the artifact. Do NOT rewrite the artifact. "
+            "Return JSON: {\"issues\":[],\"missing\":[],\"ambiguities\":[],"
+            "\"edge_cases\":[],\"recommendations\":[]}."
+        )
+
+    def _repair_artifact_payload(
+        self, artifact: str, payload: Dict, stage: str
+    ) -> tuple[Dict, List[Dict]]:
+        warnings: List[Dict] = []
+        if artifact == "requirements":
+            payload, repair_warnings = self._repair_requirements_payload(payload)
+            warnings.extend(repair_warnings)
+            start_len = len(self._requirements_warnings)
+            payload, _ = self._normalize_requirements_payload(payload, stage=stage)
+            warnings.extend(self._requirements_warnings[start_len:])
+            return payload, warnings
+        if artifact == "business_rules":
+            return self._normalize_business_rules(payload), warnings
+        if artifact == "workflows":
+            repaired, notes = self._repair_workflows(payload)
+            warnings.extend({"warning": note} for note in notes)
+            return repaired, warnings
+        if artifact == "domain_model":
+            repaired, notes = self._repair_domain_model(payload)
+            warnings.extend({"warning": note} for note in notes)
+            return repaired, warnings
+        if artifact == "mvp_scope":
+            repaired, notes = self._repair_mvp_scope(payload)
+            warnings.extend({"warning": note} for note in notes)
+            return repaired, warnings
+        return payload, warnings
+
+    def _write_artifact_outputs(
+        self, artifact: str, payload: Dict, artifacts_dir: Path
+    ) -> None:
+        write_json(artifacts_dir / f"{artifact}.json", payload)
+        if artifact == "requirements":
+            write_requirements(artifacts_dir / "requirements.md", payload)
+        elif artifact == "business_rules":
+            self._write_business_rules_markdown(artifacts_dir / "business_rules.md", payload)
+        elif artifact == "workflows":
+            self._write_workflows_markdown(artifacts_dir / "workflows.md", payload)
+        elif artifact == "domain_model":
+            self._write_domain_model_markdown(artifacts_dir / "domain_model.md", payload)
+        elif artifact == "mvp_scope":
+            self._write_mvp_scope_markdown(artifacts_dir / "mvp_scope.md", payload)
+        elif artifact == "acceptance_criteria":
+            self._write_acceptance_markdown(
+                artifacts_dir / "acceptance_criteria.md", payload
+            )
+
+    def _extract_missing_fields(self, exc: ValidationError) -> List[str]:
+        missing = []
+        if exc.validator == "required":
+            matches = re.findall(r"'([^']+)' is a required property", str(exc))
+            missing.extend(matches)
+        return missing
+
+    def _artifact_count(self, artifact: str, payload: Dict) -> int:
+        if artifact == "requirements":
+            return len(payload.get("requirements", []))
+        if artifact == "business_rules":
+            return len(payload.get("rules", []))
+        if artifact == "workflows":
+            return len(payload.get("workflows", []))
+        if artifact == "domain_model":
+            return len(payload.get("entities", []))
+        if artifact == "mvp_scope":
+            return len(payload.get("in_scope", []))
+        if artifact == "acceptance_criteria":
+            return len(payload.get("criteria", []))
+        return 0
+
+    def _write_single_run_summary(
+        self,
+        artifacts_dir: Path,
+        artifact: str,
+        payload: Dict,
+        warnings: List[Dict],
+        retry_count: int,
+        missing_fields: List[str],
+        responses: List[LLMResponse],
+    ) -> None:
+        usage_totals = self._collect_usage_totals(artifacts_dir.parent / "raw", responses)
+        lines = [
+            "# Run Summary",
+            "",
+            f"- artifact: {artifact}",
+            f"- item_count: {self._artifact_count(artifact, payload)}",
+            f"- repairs_applied: {'yes' if warnings else 'no'}",
+            f"- missing_fields: {', '.join(missing_fields) if missing_fields else 'none'}",
+            f"- retry_count: {retry_count}",
+        ]
+        if self._artifact_validation.get(artifact):
+            lines.append(f"- validation: {self._artifact_validation[artifact]}")
+        if usage_totals:
+            lines.append(
+                "- token_usage: "
+                + ", ".join(f"{key}={value}" for key, value in usage_totals.items())
+            )
+        write_text(artifacts_dir / "run_summary.md", "\n".join(lines) + "\n")
 
     def _adapter(self, provider: str) -> LLMAdapter:
         if self.mode == "mock":
@@ -2537,6 +2465,24 @@ class RequirementsPipeline:
                 "mvp_scope",
                 "acceptance_criteria",
             ]
+        default_budgets = {
+            "requirements": 2400,
+            "business_rules": 1600,
+            "workflows": 2000,
+            "domain_model": 1600,
+            "mvp_scope": 1200,
+            "acceptance_criteria": 2000,
+        }
+        frontmatter_budgets = frontmatter.get("artifact_token_budgets", {})
+        if not isinstance(frontmatter_budgets, dict):
+            frontmatter_budgets = {}
+        artifact_token_budgets: Dict[str, int] = {}
+        for key, default_value in default_budgets.items():
+            raw_value = frontmatter_budgets.get(key, frontmatter.get(f"{key}_max_output_tokens"))
+            try:
+                artifact_token_budgets[key] = int(raw_value) if raw_value is not None else default_value
+            except (TypeError, ValueError):
+                artifact_token_budgets[key] = default_value
         return RequirementsLimits(
             req_min=req_min,
             req_max=req_max_int,
@@ -2547,6 +2493,7 @@ class RequirementsPipeline:
             min_per_area=min_per_area_int,
             seed_requirements=seed_requirements,
             requested_artifacts=requested_list,
+            artifact_token_budgets=artifact_token_budgets,
         )
 
     def _limits_payload(self, limits: RequirementsLimits) -> Dict:

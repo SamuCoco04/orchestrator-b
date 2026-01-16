@@ -31,6 +31,18 @@ Define measurable success criteria.
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Orchestrator B")
     parser.add_argument("--pipeline", choices=["requirements", "architecture", "code"], default="requirements")
+    parser.add_argument(
+        "--artifact",
+        choices=[
+            "requirements",
+            "business_rules",
+            "workflows",
+            "domain_model",
+            "mvp_scope",
+            "acceptance_criteria",
+        ],
+        default="requirements",
+    )
     parser.add_argument("--mode", choices=["mock", "live"], required=True)
     parser.add_argument("--brief", required=True)
     parser.add_argument("--gate-cmd", action="append", default=[], help="Quality gate command")
@@ -85,7 +97,7 @@ def main() -> None:
 
     if args.pipeline == "requirements":
         pipeline = RequirementsPipeline(args.mode, base_dir)
-        pipeline.run(brief_path, run_dir)
+        pipeline.run(brief_path, run_dir, artifact=args.artifact)
     elif args.pipeline == "architecture":
         pipeline = ArchitecturePipeline(args.mode, base_dir)
         pipeline.run(brief_path, run_dir)

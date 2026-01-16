@@ -32,7 +32,7 @@ Create a `.env` file in the repository root (you can copy `.env.example`) and ad
 Then run the requirements pipeline:
 
 ```bash
-python -m src.main --pipeline requirements --mode live --brief brief.md
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact requirements
 ```
 
 Evidence locations for requirements runs:
@@ -40,12 +40,11 @@ Evidence locations for requirements runs:
 - Parsed artifacts: `runs/<run_id>/artifacts/*.json`
 - ADRs: `runs/<run_id>/artifacts/adrs/ADR-XX.md`
 
-Requirements pipeline behavior:
-- ChatGPT produces draft requirements + review
-- If REQUIREMENTS_JSON is missing, the pipeline auto-retries once for the missing block
-- Gemini cross-reviews
-- ChatGPT applies fixes with changelog and gates
-- If gates fail, a single auto-repair retry is attempted for the apply output
+Requirements pipeline behavior (single artifact mode):
+- ChatGPT produces a draft artifact
+- Gemini cross-reviews that artifact for gaps/ambiguity
+- ChatGPT applies fixes and outputs a FINAL_* JSON wrapper
+- If validation fails, a targeted retry fixes missing/invalid fields only
 
 You can also adjust generation controls:
 
@@ -66,6 +65,9 @@ requirements_target:
 assumptions_min: 3
 constraints_min: 3
 roles_expected: ["Student", "Administrator", "Coordinator"]
+artifact_token_budgets:
+  requirements: 2400
+  workflows: 2000
 ---
 ```
 
@@ -76,16 +78,20 @@ When omitted, defaults are used. These targets drive quality gates and prompt re
 ### Requirements pipeline
 
 ```bash
-python -m src.main --pipeline requirements --mode live --brief brief.md
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact requirements
 ```
 
-Outputs:
-- `runs/<run_id>/artifacts/requirements.md`
-- `runs/<run_id>/artifacts/requirements.json`
-- `runs/<run_id>/artifacts/requirements_review.json`
-- `runs/<run_id>/artifacts/changelog.json`
-- `runs/<run_id>/artifacts/turnr3_gemini_cross_review.json`
-- `runs/<run_id>/artifacts/adrs/ADR-XX.md`
+Run the four core artifact phases sequentially:
+
+```bash
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact requirements
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact business_rules
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact workflows
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact domain_model
+```
+
+Artifacts land in `runs/<run_id>/artifacts/` as `{artifact}.json` and `{artifact}.md` plus
+raw evidence under `runs/<run_id>/raw/` for each draft/cross-review/apply step.
 
 ### Architecture pipeline
 
