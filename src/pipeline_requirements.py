@@ -48,6 +48,7 @@ class RequirementsPipeline:
         self._acceptance_warnings: List[str] = []
         self._section_warnings: Dict[str, List[str]] = {}
         self._requirements_warnings: List[Dict] = []
+        self._requirements_shape_normalized = False
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -67,6 +68,7 @@ class RequirementsPipeline:
         self._acceptance_warnings = []
         self._section_warnings = {}
         self._requirements_warnings = []
+        self._requirements_shape_normalized = False
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -280,11 +282,22 @@ class RequirementsPipeline:
         write_text(raw_dir / f"{artifact}_apply_raw.txt", apply_response.raw_text)
         self._write_usage(raw_dir / f"{artifact}_apply_usage.json", apply_response)
 
+        if artifact == "requirements":
+            apply_extracted_raw = self._safe_extract_json(apply_response.raw_text)
+            write_json(
+                artifacts_dir / "requirements_apply_extracted_raw.json",
+                apply_extracted_raw,
+            )
         final_payload = self._extract_wrapped_json(
             apply_response.raw_text,
             config["final_label"],
             config["expected_keys"],
         )
+        if artifact == "requirements":
+            write_json(
+                artifacts_dir / "requirements_apply_extracted_normalized.json",
+                final_payload,
+            )
         changelog = None
         if artifact == "requirements":
             try:
@@ -365,6 +378,7 @@ class RequirementsPipeline:
                     "expand_generic_attempts": expand_generic_attempts,
                     "id_normalized": id_normalized,
                     "review_actions_applied": bool(cross_review.get("required_actions")),
+                    "requirements_shape_normalized": self._requirements_shape_normalized,
                     "coverage_counts": coverage_counts,
                 }
             )
@@ -435,6 +449,23 @@ class RequirementsPipeline:
         payload = self._safe_extract_json(raw_text)
         if isinstance(payload, dict) and label in payload and isinstance(payload[label], dict):
             payload = payload[label]
+        if isinstance(payload, dict) and "requirements" not in payload:
+            if all(key in payload for key in ["id", "text", "priority"]):
+                payload = {
+                    "requirements": [payload],
+                    "assumptions": [],
+                    "constraints": [],
+                }
+                if "REQUIREMENTS" in label:
+                    self._requirements_shape_normalized = True
+        if isinstance(payload, list):
+            payload = {
+                "requirements": payload,
+                "assumptions": [],
+                "constraints": [],
+            }
+            if "REQUIREMENTS" in label:
+                self._requirements_shape_normalized = True
         if not isinstance(payload, dict):
             snippet = raw_text.strip().replace("\n", " ")
             snippet = (snippet[:200] + "...") if len(snippet) > 200 else snippet
@@ -1032,6 +1063,7 @@ class RequirementsPipeline:
             expand_generic_attempts = summary.get("expand_generic_attempts")
             id_normalized = summary.get("id_normalized")
             review_actions_applied = summary.get("review_actions_applied")
+            shape_normalized = summary.get("requirements_shape_normalized")
             coverage_counts = summary.get("coverage_counts", {})
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
@@ -1049,6 +1081,9 @@ class RequirementsPipeline:
             lines.append(f"- expand_generic_attempts: {expand_generic_attempts}")
             lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
             lines.append(f"- review_actions_applied: {'yes' if review_actions_applied else 'no'}")
+            lines.append(
+                f"- requirements_shape_normalized: {'yes' if shape_normalized else 'no'}"
+            )
             warnings_total = len(warnings) + len(self._requirements_warnings)
             lines.append(f"- warnings: {warnings_total}")
         if self._artifact_validation.get(artifact):
