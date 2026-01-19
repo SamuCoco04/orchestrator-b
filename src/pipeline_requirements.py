@@ -319,6 +319,16 @@ class RequirementsPipeline:
         schema = self._load_schema(config["schema"])
         if artifact == "requirements":
             initial_count = len(final_payload.get("requirements", []))
+            try:
+                validate(instance=final_payload, schema=schema)
+            except ValidationError as exc:
+                self._requirements_warnings.append(
+                    {
+                        "stage": "apply",
+                        "note": "Validation failed before add-only.",
+                        "error": str(exc),
+                    }
+                )
             final_payload, missing_coverage_areas, add_only_attempts = self._add_only_requirements_loop(
                 brief=brief,
                 limits=limits,
@@ -341,7 +351,7 @@ class RequirementsPipeline:
                 final_payload, changelog
             )
             if id_normalized:
-                write_json(artifacts_dir / "id_map.json", {"id_map": id_map})
+                write_json(artifacts_dir / "requirements_id_map.json", {"id_map": id_map})
             if changelog is not None:
                 write_json(artifacts_dir / "requirements_changelog.json", changelog)
             coverage_counts = self._coverage_counts(final_payload, limits)
@@ -423,13 +433,18 @@ class RequirementsPipeline:
         self, raw_text: str, label: str, expected_keys: set[str]
     ) -> Dict:
         payload = self._safe_extract_json(raw_text)
-        if label in payload and isinstance(payload[label], dict):
+        if isinstance(payload, dict) and label in payload and isinstance(payload[label], dict):
             payload = payload[label]
         if not isinstance(payload, dict):
-            raise ValueError(f"{label} payload must be a JSON object.")
+            snippet = raw_text.strip().replace("\n", " ")
+            snippet = (snippet[:200] + "...") if len(snippet) > 200 else snippet
+            raise ValueError(f"{label} payload must be a JSON object. Snippet: {snippet}")
         missing = expected_keys.difference(payload.keys())
         if missing:
-            raise ValueError(f"{label} missing keys: {', '.join(sorted(missing))}")
+            keys = ", ".join(sorted(payload.keys()))
+            raise ValueError(
+                f"{label} missing keys: {', '.join(sorted(missing))}. Found keys: {keys}"
+            )
         return payload
 
     def _extract_wrapped_json_any(
@@ -692,36 +707,30 @@ class RequirementsPipeline:
                 "coverage_targets": coverage_targets,
                 "existing_ids": existing_ids,
                 "existing_texts": existing_texts,
-                "missing_assumptions": missing_assumptions,
-                "missing_constraints": missing_constraints,
             }
             full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
             write_text(raw_dir / f"add_only_retry_{attempts}_prompt.txt", full_prompt)
             with self._with_max_output_tokens(max_tokens):
                 response = adapter.complete(full_prompt)
-            write_text(raw_dir / f"add_only_retry_{attempts}.txt", response.raw_text)
+            write_text(raw_dir / f"requirements_add_only_retry_{attempts}_raw.txt", response.raw_text)
             self._write_usage(
-                raw_dir / f"add_only_retry_{attempts}_usage.json", response
+                raw_dir / f"requirements_add_only_retry_{attempts}_usage.json", response
             )
             try:
                 additions = self._extract_wrapped_json_any(
                     response.raw_text,
-                    ["REQUIREMENTS_ADD_JSON"],
-                    {"requirements"},
+                    ["FINAL_REQUIREMENTS_JSON"],
+                    {"requirements", "assumptions", "constraints"},
                 )
             except ValueError as exc:
                 self._requirements_warnings.append(
                     {"stage": "add_only", "note": "Add-only extraction failed.", "error": str(exc)}
                 )
                 break
-            write_json(raw_dir / f"add_only_retry_{attempts}.json", additions)
+            write_json(artifacts_dir / f"requirements_add_only_retry_{attempts}.json", additions)
             additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
-            payload = self._merge_requirements_additions(payload, {"requirements": additions.get("requirements", [])})
+            payload = self._merge_requirements_additions(payload, additions)
             missing_coverage = self._missing_coverage_areas(payload, limits)
-            write_json(
-                artifacts_dir / f"requirements_add_only_attempt{attempts}.json",
-                {"additions": additions, "merged": payload},
-            )
             try:
                 schema = self._load_schema("normalized_requirements.schema.json")
                 validate(instance=payload, schema=schema)

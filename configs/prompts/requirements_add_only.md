@@ -5,12 +5,13 @@ Your task: ADD ONLY new requirements (exactly generate_count) without rewriting 
 
 Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape:
 {
-  "REQUIREMENTS_ADD_JSON": {"requirements":[]}
+  "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}
 }
 
 Format contract:
-- REQUIREMENTS_ADD_JSON.requirements MUST be an array of objects with {id, text, priority}.
+- FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects with {id, text, priority}.
 - priority must be one of must|should|could.
+- assumptions and constraints must be empty arrays in add-only output.
 
 Rules:
 - Generate EXACTLY generate_count new requirements.
