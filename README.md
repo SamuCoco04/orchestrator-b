@@ -46,6 +46,7 @@ Requirements pipeline behavior (single artifact mode):
 - ChatGPT applies fixes and outputs a FINAL_* JSON wrapper
 - If validation fails, a targeted retry fixes missing/invalid fields only
 - Requirements runs also enforce brief targets (minimum count, coverage areas, and minimum assumptions/constraints) and will trigger add-only retries to close gaps.
+- Requirements cross-review is validated against a strict JSON schema and required actions must be applied in the follow-up GPT step.
 
 You can also adjust generation controls:
 
@@ -63,6 +64,11 @@ You can set per-project targets by adding YAML frontmatter to the brief:
 requirements_target:
   min: 30
   max: 60
+targets:
+  target_min_items: 60
+  target_max_items: 80
+  min_assumptions: 5
+  min_constraints: 5
 assumptions_min: 3
 constraints_min: 3
 roles_expected: ["Student", "Administrator", "Coordinator"]

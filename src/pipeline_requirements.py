@@ -233,8 +233,17 @@ class RequirementsPipeline:
             artifact, draft_payload, stage="draft"
         )
 
-        cross_review_prompt = self._artifact_cross_review_prompt(artifact)
-        cross_payload = {"brief": brief, "artifact": draft_payload}
+        if artifact == "requirements":
+            cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
+            cross_review_prompt = self._render_prompt(cross_template, limits)
+            cross_payload = {
+                "brief": brief,
+                "requirements": draft_payload,
+                "targets": self._requirements_targets_payload(limits),
+            }
+        else:
+            cross_review_prompt = self._artifact_cross_review_prompt(artifact)
+            cross_payload = {"brief": brief, "artifact": draft_payload}
         cross_full_prompt = f"{cross_review_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
         write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
         cross_response = gemini.complete(cross_full_prompt)
@@ -242,6 +251,10 @@ class RequirementsPipeline:
         write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
         self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
         cross_review = self._safe_extract_json(cross_response.raw_text)
+        if artifact == "requirements":
+            cross_review = self._validate_requirements_review(
+                cross_review, draft_payload, limits
+            )
 
         apply_template = read_text(self.prompts_dir / config["apply_prompt"])
         apply_prompt = self._render_prompt(apply_template, limits)
@@ -272,6 +285,19 @@ class RequirementsPipeline:
             config["final_label"],
             config["expected_keys"],
         )
+        changelog = None
+        if artifact == "requirements":
+            try:
+                changelog = self._extract_wrapped_json(
+                    apply_response.raw_text,
+                    "CHANGELOG_JSON",
+                    {"splits", "replacements", "added", "removed"},
+                )
+                write_json(raw_dir / "requirements_apply_changelog.json", changelog)
+            except ValueError as exc:
+                self._requirements_warnings.append(
+                    {"stage": "apply", "note": "Missing changelog JSON.", "error": str(exc)}
+                )
         final_payload, final_warnings = self._repair_artifact_payload(
             artifact, final_payload, stage="apply"
         )
@@ -285,30 +311,51 @@ class RequirementsPipeline:
             )
 
         retry_count = 0
-        add_only_used = False
+        add_only_attempts = 0
+        expand_generic_attempts = 0
         id_normalized = False
         missing_coverage_areas: List[str] = []
         missing_fields: List[str] = []
         schema = self._load_schema(config["schema"])
         if artifact == "requirements":
-            final_payload, id_normalized = self._normalize_requirement_ids(
-                final_payload
-            )
-            final_payload, missing_coverage_areas, add_only_used = self._ensure_requirements_targets(
+            initial_count = len(final_payload.get("requirements", []))
+            final_payload, missing_coverage_areas, add_only_attempts = self._add_only_requirements_loop(
                 brief=brief,
                 limits=limits,
                 payload=final_payload,
                 adapter=chatgpt,
                 raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
             )
+            final_payload, expand_generic_attempts = self._expand_generic_requirements(
+                brief=brief,
+                limits=limits,
+                payload=final_payload,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=max_tokens,
+            )
+            final_payload, id_normalized, id_map, changelog = self._normalize_requirement_ids(
+                final_payload, changelog
+            )
+            if id_normalized:
+                write_json(artifacts_dir / "id_map.json", {"id_map": id_map})
+            if changelog is not None:
+                write_json(artifacts_dir / "requirements_changelog.json", changelog)
+            coverage_counts = self._coverage_counts(final_payload, limits)
             summary.update(
                 {
+                    "initial_count": initial_count,
                     "target_min_items": limits.req_min,
                     "actual_count": len(final_payload.get("requirements", [])),
                     "missing_coverage_areas": missing_coverage_areas,
-                    "add_only_retry_used": add_only_used,
+                    "add_only_attempts": add_only_attempts,
+                    "expand_generic_attempts": expand_generic_attempts,
                     "id_normalized": id_normalized,
+                    "review_actions_applied": bool(cross_review.get("required_actions")),
+                    "coverage_counts": coverage_counts,
                 }
             )
         try:
@@ -384,6 +431,85 @@ class RequirementsPipeline:
         if missing:
             raise ValueError(f"{label} missing keys: {', '.join(sorted(missing))}")
         return payload
+
+    def _extract_wrapped_json_any(
+        self, raw_text: str, labels: List[str], expected_keys: set[str]
+    ) -> Dict:
+        payload = self._safe_extract_json(raw_text)
+        if isinstance(payload, dict):
+            for label in labels:
+                if label in payload and isinstance(payload[label], dict):
+                    payload = payload[label]
+                    break
+        if not isinstance(payload, dict):
+            raise ValueError("Payload must be a JSON object.")
+        missing = expected_keys.difference(payload.keys())
+        if missing:
+            raise ValueError(f"Payload missing keys: {', '.join(sorted(missing))}")
+        return payload
+
+    def _validate_requirements_review(
+        self, review: Dict, draft_payload: Dict, limits: RequirementsLimits
+    ) -> Dict:
+        schema = self._load_schema("requirements_cross_review.schema.json")
+        try:
+            validate(instance=review, schema=schema)
+        except ValidationError as exc:
+            self._requirements_warnings.append(
+                {"stage": "cross_review", "note": "Review schema invalid.", "error": str(exc)}
+            )
+            review = self._fallback_review(draft_payload, limits)
+            return review
+
+        gaps = (
+            review.get("missing_coverage")
+            or review.get("too_generic")
+            or review.get("duplicates_or_overlaps")
+        )
+        if gaps and not review.get("required_actions"):
+            self._requirements_warnings.append(
+                {"stage": "cross_review", "note": "Review missing required_actions; adding fallback."}
+            )
+            review["required_actions"] = [
+                {
+                    "type": "ADD",
+                    "area": None,
+                    "count": 0,
+                    "ids": [],
+                    "instruction": "Review gaps detected; add missing coverage and refine generic items.",
+                }
+            ]
+        return review
+
+    def _fallback_review(self, draft_payload: Dict, limits: RequirementsLimits) -> Dict:
+        coverage_counts = self._coverage_counts(draft_payload, limits)
+        missing_coverage = []
+        if limits.min_per_area is not None:
+            for area in limits.coverage_areas:
+                current = coverage_counts.get(area, 0)
+                target = limits.min_per_area
+                add = max(target - current, 0)
+                if add:
+                    missing_coverage.append(
+                        {"area": area, "current": current, "target": target, "add": add}
+                    )
+        required_actions = [
+            {
+                "type": "ADD",
+                "area": None,
+                "count": sum(item["add"] for item in missing_coverage) if missing_coverage else 0,
+                "ids": [],
+                "instruction": "Add missing requirements for uncovered areas.",
+            }
+        ]
+        return {
+            "review_version": "1.0",
+            "missing_coverage": missing_coverage,
+            "too_generic": [],
+            "duplicates_or_overlaps": [],
+            "required_actions": required_actions,
+            "notes": ["Fallback review generated due to invalid review output."],
+        }
 
     def _artifact_cross_review_prompt(self, artifact: str) -> str:
         return (
@@ -495,49 +621,264 @@ class RequirementsPipeline:
                 missing.append(area)
         return missing
 
-    def _ensure_requirements_targets(
+    def _coverage_counts(self, payload: Dict, limits: RequirementsLimits) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        if not limits.coverage_areas:
+            return counts
+        req_items = payload.get("requirements", [])
+        texts = [str(item.get("text", "")).lower() for item in req_items if isinstance(item, dict)]
+        for area in limits.coverage_areas:
+            keywords = self._coverage_keywords_for_area(limits, area)
+            count = 0
+            for text in texts:
+                if any(keyword.lower() in text for keyword in keywords):
+                    count += 1
+            counts[area] = count
+        return counts
+
+    def _add_only_requirements_loop(
         self,
         brief: str,
         limits: RequirementsLimits,
         payload: Dict,
         adapter: LLMAdapter,
         raw_dir: Path,
+        artifacts_dir: Path,
         max_tokens: int,
-    ) -> tuple[Dict, List[str], bool]:
+    ) -> tuple[Dict, List[str], int]:
+        attempts = 0
         missing_coverage = self._missing_coverage_areas(payload, limits)
+        while attempts < 2:
+            current_count = len(payload.get("requirements", []))
+            missing_count = max(limits.req_min - current_count, 0)
+            missing_assumptions = max(limits.assumptions_min - len(payload.get("assumptions", [])), 0)
+            missing_constraints = max(limits.constraints_min - len(payload.get("constraints", [])), 0)
+            if missing_count <= 0:
+                return payload, missing_coverage, attempts
+            attempts += 1
+            coverage_counts = self._coverage_counts(payload, limits)
+            coverage_targets: List[Dict[str, int | str]] = []
+            if limits.min_per_area is not None:
+                for area in limits.coverage_areas:
+                    current = coverage_counts.get(area, 0)
+                    target = limits.min_per_area
+                    coverage_targets.append(
+                        {
+                            "area": area,
+                            "current": current,
+                            "target": target,
+                            "add": max(target - current, 0),
+                        }
+                    )
+            existing_ids = [
+                item.get("id")
+                for item in payload.get("requirements", [])
+                if isinstance(item, dict)
+            ]
+            existing_texts = [
+                item.get("text")
+                for item in payload.get("requirements", [])
+                if isinstance(item, dict)
+            ]
+            retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
+            retry_payload = {
+                "brief": brief,
+                "current_requirements": payload,
+                "targets": self._requirements_targets_payload(limits),
+                "missing_count": missing_count,
+                "generate_count": missing_count,
+                "missing_coverage_areas": missing_coverage,
+                "coverage_counts": coverage_counts,
+                "coverage_targets": coverage_targets,
+                "existing_ids": existing_ids,
+                "existing_texts": existing_texts,
+                "missing_assumptions": missing_assumptions,
+                "missing_constraints": missing_constraints,
+            }
+            full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+            write_text(raw_dir / f"add_only_retry_{attempts}_prompt.txt", full_prompt)
+            with self._with_max_output_tokens(max_tokens):
+                response = adapter.complete(full_prompt)
+            write_text(raw_dir / f"add_only_retry_{attempts}.txt", response.raw_text)
+            self._write_usage(
+                raw_dir / f"add_only_retry_{attempts}_usage.json", response
+            )
+            try:
+                additions = self._extract_wrapped_json_any(
+                    response.raw_text,
+                    ["REQUIREMENTS_ADD_JSON"],
+                    {"requirements"},
+                )
+            except ValueError as exc:
+                self._requirements_warnings.append(
+                    {"stage": "add_only", "note": "Add-only extraction failed.", "error": str(exc)}
+                )
+                break
+            write_json(raw_dir / f"add_only_retry_{attempts}.json", additions)
+            additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
+            payload = self._merge_requirements_additions(payload, {"requirements": additions.get("requirements", [])})
+            missing_coverage = self._missing_coverage_areas(payload, limits)
+            write_json(
+                artifacts_dir / f"requirements_add_only_attempt{attempts}.json",
+                {"additions": additions, "merged": payload},
+            )
+            try:
+                schema = self._load_schema("normalized_requirements.schema.json")
+                validate(instance=payload, schema=schema)
+            except ValidationError as exc:
+                self._requirements_warnings.append(
+                    {"stage": "add_only", "note": "Validation failed after add-only.", "error": str(exc)}
+                )
         current_count = len(payload.get("requirements", []))
         missing_count = max(limits.req_min - current_count, 0)
-        missing_assumptions = max(limits.assumptions_min - len(payload.get("assumptions", [])), 0)
-        missing_constraints = max(limits.constraints_min - len(payload.get("constraints", [])), 0)
-        if not any([missing_coverage, missing_count, missing_assumptions, missing_constraints]):
-            return payload, missing_coverage, False
+        if missing_count > 0:
+            placeholders = self._fallback_requirements(missing_count, limits)
+            payload = self._merge_requirements_additions(payload, {"requirements": placeholders})
+            missing_coverage = self._missing_coverage_areas(payload, limits)
+            self._requirements_warnings.append(
+                {
+                    "stage": "add_only",
+                    "note": "Filled remaining count with fallback requirements.",
+                    "missing_count": missing_count,
+                }
+            )
+        return payload, missing_coverage, attempts
 
-        retry_prompt = read_text(self.prompts_dir / "requirements_add_only_retry.md")
+    def _fallback_requirements(self, missing_count: int, limits: RequirementsLimits) -> List[Dict]:
+        placeholders: List[Dict] = []
+        areas = limits.coverage_areas or ["General"]
+        for index in range(missing_count):
+            area = areas[index % len(areas)]
+            placeholders.append(
+                {
+                    "id": None,
+                    "text": f"The system shall define and enforce behavior for {area} as described in the brief.",
+                    "priority": "should",
+                }
+            )
+        return placeholders
+
+    def _expand_generic_requirements(
+        self,
+        brief: str,
+        limits: RequirementsLimits,
+        payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> tuple[Dict, int]:
+        generic_items = self._generic_requirements(payload, limits)
+        req_count = len(payload.get("requirements", []))
+        if not req_count:
+            return payload, 0
+        generic_ratio = len(generic_items) / req_count
+        if len(generic_items) <= 10 and generic_ratio <= 0.25:
+            return payload, 0
+        retry_prompt = read_text(self.prompts_dir / "requirements_expand_generic.md")
         retry_payload = {
             "brief": brief,
-            "current_requirements": payload,
-            "targets": self._requirements_targets_payload(limits),
-            "missing_coverage_areas": missing_coverage,
-            "missing_count": missing_count,
-            "missing_assumptions": missing_assumptions,
-            "missing_constraints": missing_constraints,
+            "generic_requirements": generic_items,
         }
         full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
-        write_text(raw_dir / "requirements_add_only_retry_prompt.txt", full_prompt)
+        write_text(raw_dir / "requirements_expand_generic_attempt1_prompt.txt", full_prompt)
         with self._with_max_output_tokens(max_tokens):
             response = adapter.complete(full_prompt)
-        write_text(raw_dir / "requirements_add_only_retry_raw.txt", response.raw_text)
-        self._write_usage(raw_dir / "requirements_add_only_retry_usage.json", response)
-        additions = self._extract_wrapped_json(
+        write_text(
+            raw_dir / "requirements_expand_generic_attempt1_raw.txt",
             response.raw_text,
-            "REQUIREMENTS_JSON",
-            {"requirements", "assumptions", "constraints"},
         )
-        additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
-        payload = self._merge_requirements_additions(payload, additions)
-        payload, _ = self._normalize_requirement_ids(payload)
-        missing_coverage = self._missing_coverage_areas(payload, limits)
-        return payload, missing_coverage, True
+        self._write_usage(
+            raw_dir / "requirements_expand_generic_attempt1_usage.json", response
+        )
+        try:
+            replacements = self._extract_wrapped_json_any(
+                response.raw_text,
+                ["REPLACEMENTS_JSON"],
+                {"replacements"},
+            )
+        except ValueError as exc:
+            self._requirements_warnings.append(
+                {
+                    "stage": "expand_generic",
+                    "note": "Expand-generic extraction failed.",
+                    "error": str(exc),
+                }
+            )
+            return payload, 0
+        payload = self._apply_requirement_replacements(payload, replacements)
+        payload, _ = self._repair_artifact_payload("requirements", payload, stage="expand_generic")
+        write_json(
+            artifacts_dir / "requirements_expand_generic_attempt1.json",
+            {"generic": generic_items, "replacements": replacements, "merged": payload},
+        )
+        try:
+            schema = self._load_schema("normalized_requirements.schema.json")
+            validate(instance=payload, schema=schema)
+        except ValidationError as exc:
+            self._requirements_warnings.append(
+                {
+                    "stage": "expand_generic",
+                    "note": "Validation failed after expand-generic.",
+                    "error": str(exc),
+                }
+            )
+        return payload, 1
+
+    def _generic_requirements(
+        self, payload: Dict, limits: RequirementsLimits
+    ) -> List[Dict[str, str]]:
+        patterns = [
+            r"provide .* features",
+            r"provide .* capabilities",
+            r"implement .* functionalities",
+            r"implement .* features",
+        ]
+        generic_items: List[Dict[str, str]] = []
+        for item in payload.get("requirements", []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", ""))
+            lower_text = text.lower()
+            is_generic = False
+            for area in limits.coverage_areas:
+                if area in text:
+                    is_generic = True
+                    break
+            if not is_generic:
+                for pattern in patterns:
+                    if re.search(pattern, lower_text):
+                        is_generic = True
+                        break
+            if is_generic:
+                req_id = str(item.get("id", ""))
+                generic_items.append({"id": req_id, "text": text})
+        return generic_items
+
+    def _apply_requirement_replacements(self, payload: Dict, replacements: Dict) -> Dict:
+        replacement_map: Dict[str, List[Dict]] = {}
+        for entry in replacements.get("replacements", []):
+            if not isinstance(entry, dict):
+                continue
+            from_id = entry.get("from")
+            into = entry.get("into", [])
+            if isinstance(from_id, str) and isinstance(into, list):
+                replacement_map[from_id] = [item for item in into if isinstance(item, dict)]
+
+        if not replacement_map:
+            return payload
+
+        updated: List[Dict] = []
+        for item in payload.get("requirements", []):
+            if not isinstance(item, dict):
+                continue
+            req_id = item.get("id")
+            if isinstance(req_id, str) and req_id in replacement_map:
+                updated.extend(replacement_map[req_id])
+            else:
+                updated.append(item)
+        payload["requirements"] = updated
+        return payload
 
     def _merge_requirements_additions(self, base: Dict, additions: Dict) -> Dict:
         merged = {
@@ -556,12 +897,15 @@ class RequirementsPipeline:
                 merged["constraints"].append(item)
         return merged
 
-    def _normalize_requirement_ids(self, payload: Dict) -> tuple[Dict, bool]:
+    def _normalize_requirement_ids(
+        self, payload: Dict, changelog: Dict | None
+    ) -> tuple[Dict, bool, List[Dict[str, str]], Dict | None]:
         items = payload.get("requirements", [])
         if not isinstance(items, list):
-            return payload, False
+            return payload, False, [], changelog
         normalized = False
         used_ids: set[str] = set()
+        id_map: List[Dict[str, str]] = []
         sequence = 1
 
         def next_id() -> str:
@@ -579,6 +923,8 @@ class RequirementsPipeline:
                 continue
             current_id = item.get("id")
             needs_new = False
+            if not isinstance(current_id, str):
+                needs_new = True
             if current_id is None:
                 needs_new = True
             elif isinstance(current_id, int):
@@ -592,14 +938,60 @@ class RequirementsPipeline:
                 needs_new = True
 
             if needs_new:
-                item["id"] = next_id()
+                new_id = next_id()
+                id_map.append({"from": str(current_id), "to": new_id})
+                item["id"] = new_id
                 normalized = True
             else:
                 used_ids.add(current_id)
             normalized_items.append(item)
 
         payload["requirements"] = normalized_items
-        return payload, normalized
+        sequential_ids = [item.get("id") for item in normalized_items if isinstance(item, dict)]
+        if sequential_ids:
+            expected = [f"REQ-{i:03d}" for i in range(1, len(sequential_ids) + 1)]
+            if sequential_ids != expected:
+                normalized = True
+                id_map.extend(
+                    [
+                        {"from": str(old_id), "to": new_id}
+                        for old_id, new_id in zip(sequential_ids, expected)
+                    ]
+                )
+                for item, new_id in zip(normalized_items, expected):
+                    item["id"] = new_id
+        payload["requirements"] = normalized_items
+        if id_map and changelog is not None:
+            changelog = self._rewrite_changelog_ids(changelog, id_map)
+        return payload, normalized, id_map, changelog
+
+    def _rewrite_changelog_ids(self, changelog: Dict, id_map: List[Dict[str, str]]) -> Dict:
+        mapping = {entry["from"]: entry["to"] for entry in id_map if "from" in entry and "to" in entry}
+
+        def remap(value: str) -> str:
+            return mapping.get(value, value)
+
+        def remap_list(values: List[str]) -> List[str]:
+            return [remap(value) for value in values if isinstance(value, str)]
+
+        updated = dict(changelog)
+        for key in ["added", "removed", "replacements"]:
+            if isinstance(updated.get(key), list):
+                updated[key] = remap_list(updated[key])
+        if isinstance(updated.get("splits"), list):
+            splits = []
+            for entry in updated["splits"]:
+                if isinstance(entry, dict) and "from" in entry and "into" in entry:
+                    splits.append(
+                        {
+                            "from": remap(str(entry.get("from"))),
+                            "into": remap_list(entry.get("into", [])),
+                        }
+                    )
+                else:
+                    splits.append(entry)
+            updated["splits"] = splits
+        return updated
 
     def _write_single_run_summary(
         self,
@@ -624,18 +1016,32 @@ class RequirementsPipeline:
         ]
         if artifact == "requirements" and summary:
             target_min_items = summary.get("target_min_items")
+            initial_count = summary.get("initial_count")
             actual_count = summary.get("actual_count")
             missing_coverage = summary.get("missing_coverage_areas", [])
-            add_only_used = summary.get("add_only_retry_used")
+            add_only_attempts = summary.get("add_only_attempts")
+            expand_generic_attempts = summary.get("expand_generic_attempts")
             id_normalized = summary.get("id_normalized")
+            review_actions_applied = summary.get("review_actions_applied")
+            coverage_counts = summary.get("coverage_counts", {})
             lines.append(f"- target_min_items: {target_min_items}")
-            lines.append(f"- actual_count: {actual_count}")
+            lines.append(f"- initial_count: {initial_count}")
+            lines.append(f"- final_count: {actual_count}")
             if missing_coverage:
                 lines.append(f"- missing_coverage_areas: {', '.join(missing_coverage)}")
             else:
                 lines.append("- missing_coverage_areas: none")
-            lines.append(f"- add_only_retry_used: {'yes' if add_only_used else 'no'}")
+            if isinstance(coverage_counts, dict) and coverage_counts:
+                counts_str = ", ".join(
+                    f\"{area}={count}\" for area, count in coverage_counts.items()
+                )
+                lines.append(f\"- coverage_counts: {counts_str}\")
+            lines.append(f"- add_only_attempts: {add_only_attempts}")
+            lines.append(f"- expand_generic_attempts: {expand_generic_attempts}")
             lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
+            lines.append(f"- review_actions_applied: {'yes' if review_actions_applied else 'no'}")
+            warnings_total = len(warnings) + len(self._requirements_warnings)
+            lines.append(f"- warnings: {warnings_total}")
         if self._artifact_validation.get(artifact):
             lines.append(f"- validation: {self._artifact_validation[artifact]}")
         if usage_totals:
