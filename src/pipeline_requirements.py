@@ -1033,9 +1033,9 @@ class RequirementsPipeline:
                 lines.append("- missing_coverage_areas: none")
             if isinstance(coverage_counts, dict) and coverage_counts:
                 counts_str = ", ".join(
-                    f\"{area}={count}\" for area, count in coverage_counts.items()
+                    f"{area}={count}" for area, count in coverage_counts.items()
                 )
-                lines.append(f\"- coverage_counts: {counts_str}\")
+                lines.append(f"- coverage_counts: {counts_str}")
             lines.append(f"- add_only_attempts: {add_only_attempts}")
             lines.append(f"- expand_generic_attempts: {expand_generic_attempts}")
             lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
