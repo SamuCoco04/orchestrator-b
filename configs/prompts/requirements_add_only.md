@@ -5,11 +5,11 @@ Your task: ADD ONLY new requirements (exactly generate_count) without rewriting 
 
 Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape:
 {
-  "REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}
+  "REQUIREMENTS_ADD_JSON": {"requirements":[]}
 }
 
 Format contract:
-- REQUIREMENTS_JSON.requirements MUST be an array of objects with {id, text, priority}.
+- REQUIREMENTS_ADD_JSON.requirements MUST be an array of objects with {id, text, priority}.
 - priority must be one of must|should|could.
 
 Rules:
@@ -17,4 +17,5 @@ Rules:
 - Do NOT rewrite, delete, or duplicate existing requirements.
 - Avoid duplicating any existing IDs or texts provided in the input.
 - If missing coverage areas are listed, explicitly mention them in new requirements.
+- Requirements must be atomic and testable.
 - No markdown, no extra keys.

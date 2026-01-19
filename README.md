@@ -46,6 +46,7 @@ Requirements pipeline behavior (single artifact mode):
 - ChatGPT applies fixes and outputs a FINAL_* JSON wrapper
 - If validation fails, a targeted retry fixes missing/invalid fields only
 - Requirements runs also enforce brief targets (minimum count, coverage areas, and minimum assumptions/constraints) and will trigger add-only retries to close gaps.
+- Requirements cross-review is validated against a strict JSON schema and required actions must be applied in the follow-up GPT step.
 
 You can also adjust generation controls:
 
