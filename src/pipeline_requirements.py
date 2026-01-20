@@ -444,12 +444,12 @@ class RequirementsPipeline:
 
         if artifact == "requirements":
             try:
-            apply_extracted_raw = self._extract_wrapped_json(
-                apply_response.raw_text,
-                config["final_label"],
-                config["expected_keys"],
-                context="requirements_apply",
-            )
+                apply_extracted_raw = self._extract_wrapped_json(
+                    apply_response.raw_text,
+                    config["final_label"],
+                    config["expected_keys"],
+                    context="requirements_apply",
+                )
                 write_json(
                     artifacts_dir / "requirements_apply_extracted_raw.json",
                     apply_extracted_raw,
