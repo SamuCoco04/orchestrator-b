@@ -21,6 +21,10 @@ from src.gates.parsers import extract_json
 from src.utils.io import read_text, write_json, write_text
 
 
+class RequirementsFormatError(ValueError):
+    pass
+
+
 @dataclass
 class RequirementsLimits:
     req_min: int
@@ -97,6 +101,7 @@ class RequirementsPipeline:
         self._assumptions_added = 0
         self._constraints_added = 0
         self._add_only_parse_failures = 0
+        self._apply_format_retry_used = False
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -128,6 +133,7 @@ class RequirementsPipeline:
         self._assumptions_added = 0
         self._constraints_added = 0
         self._add_only_parse_failures = 0
+        self._apply_format_retry_used = False
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -353,16 +359,32 @@ class RequirementsPipeline:
         self._write_usage(raw_dir / f"{artifact}_apply_usage.json", apply_response)
 
         if artifact == "requirements":
-            apply_extracted_raw = self._extract_wrapped_json(
-                apply_response.raw_text,
-                config["final_label"],
-                config["expected_keys"],
-            )
-            write_json(
-                artifacts_dir / "requirements_apply_extracted_raw.json",
-                apply_extracted_raw,
-            )
-            final_payload = apply_extracted_raw
+            try:
+                apply_extracted_raw = self._extract_wrapped_json(
+                    apply_response.raw_text,
+                    config["final_label"],
+                    config["expected_keys"],
+                )
+                write_json(
+                    artifacts_dir / "requirements_apply_extracted_raw.json",
+                    apply_extracted_raw,
+                )
+                final_payload = apply_extracted_raw
+            except RequirementsFormatError:
+                final_payload = self._format_retry_requirements(
+                    brief=brief,
+                    apply_raw=apply_response.raw_text,
+                    adapter=chatgpt,
+                    raw_dir=raw_dir,
+                    artifacts_dir=artifacts_dir,
+                    max_tokens=max_tokens,
+                    expected_keys=config["expected_keys"],
+                )
+                write_json(
+                    artifacts_dir / "requirements_apply_extracted_raw.json",
+                    final_payload,
+                )
+                self._apply_format_retry_used = True
         else:
             final_payload = self._extract_wrapped_json(
                 apply_response.raw_text,
@@ -501,6 +523,7 @@ class RequirementsPipeline:
                     "coverage_fix_used": self._coverage_fix_used,
                     "assumptions_added": self._assumptions_added,
                     "constraints_added": self._constraints_added,
+                    "apply_format_retry_used": self._apply_format_retry_used,
                 }
             )
             if self._requirements_filtered_out:
@@ -601,6 +624,11 @@ class RequirementsPipeline:
             last_snippet = snippet
             if not isinstance(candidate, dict):
                 return None
+            if self._is_requirement_object(candidate) and label not in candidate:
+                raise RequirementsFormatError(
+                    f"{label} missing wrapper; found requirement object. Path: {path}. "
+                    f"Snippet: {snippet}"
+                )
             if label in candidate:
                 wrapper_value = candidate[label]
                 if not isinstance(wrapper_value, dict):
@@ -654,14 +682,11 @@ class RequirementsPipeline:
                 ) from exc
 
         if isinstance(parsed, dict) and "requirements" not in parsed:
-            if all(key in parsed for key in ["id", "text", "priority"]):
-                parsed = {
-                    "requirements": [parsed],
-                    "assumptions": [],
-                    "constraints": [],
-                }
-                if "REQUIREMENTS" in label:
-                    self._requirements_shape_normalized = True
+            if self._is_requirement_object(parsed):
+                raise RequirementsFormatError(
+                    f"{label} missing wrapper; found requirement object. "
+                    f"Snippet: {snippet_for(last_snippet)}"
+                )
         if isinstance(parsed, list):
             parsed = {
                 "requirements": parsed,
@@ -1190,6 +1215,34 @@ class RequirementsPipeline:
                     f"Attempt {attempt}."
                 ) from retry_exc
 
+    def _format_retry_requirements(
+        self,
+        brief: str,
+        apply_raw: str,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+        expected_keys: set[str],
+    ) -> Dict:
+        retry_prompt = read_text(self.prompts_dir / "requirements_apply_format_retry.md")
+        retry_payload = {"brief": brief, "apply_raw": apply_raw}
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_apply_format_retry_prompt.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_apply_format_retry_raw.txt", response.raw_text)
+        self._write_usage(
+            raw_dir / "requirements_apply_format_retry_usage.json", response
+        )
+        extracted = self._extract_wrapped_json(
+            response.raw_text, "FINAL_REQUIREMENTS_JSON", expected_keys
+        )
+        write_json(
+            artifacts_dir / "requirements_apply_format_retry_extracted.json", extracted
+        )
+        return extracted
+
     def _out_of_scope_from_frontmatter(self, frontmatter: Dict) -> List[str]:
         if not isinstance(frontmatter, dict):
             return []
@@ -1215,6 +1268,10 @@ class RequirementsPipeline:
                 else:
                     return True
         return False
+
+    def _is_requirement_object(self, candidate: Dict) -> bool:
+        keys = set(candidate.keys())
+        return {"id", "text", "priority"}.issubset(keys) and "requirements" not in keys
 
     def _low_quality_phrases(self) -> List[str]:
         return [
@@ -1848,6 +1905,7 @@ class RequirementsPipeline:
             coverage_fix_used = summary.get("coverage_fix_used")
             assumptions_added = summary.get("assumptions_added")
             constraints_added = summary.get("constraints_added")
+            apply_format_retry_used = summary.get("apply_format_retry_used")
             coverage_counts = summary.get("coverage_counts", {})
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
@@ -1890,6 +1948,10 @@ class RequirementsPipeline:
                 lines.append(f"- assumptions_added: {assumptions_added}")
             if constraints_added is not None:
                 lines.append(f"- constraints_added: {constraints_added}")
+            if apply_format_retry_used is not None:
+                lines.append(
+                    f"- apply_format_retry_used: {'yes' if apply_format_retry_used else 'no'}"
+                )
             if isinstance(balance_results, dict) and balance_results:
                 counts = balance_results.get("counts", {})
                 missing = balance_results.get("missing", {})

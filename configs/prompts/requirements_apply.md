@@ -25,6 +25,9 @@ Format contract:
 - assumptions and constraints must be arrays of strings only.
 - CHANGELOG_JSON.splits must be objects with {from, into}.
 - CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
+- Output ONE JSON object only (no markdown).
+- Must include top-level key FINAL_REQUIREMENTS_JSON with keys: requirements, assumptions, constraints.
+- Never output a single requirement object.
 
 Rules:
 - Apply Gemini critique to remove ambiguity, add missing detail, and cover edge cases.
