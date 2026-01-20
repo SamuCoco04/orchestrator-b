@@ -25,6 +25,88 @@ class RequirementsFormatError(ValueError):
     pass
 
 
+def parse_json_loose(text: str) -> Dict:
+    parsed, repairs = _parse_json_loose_with_repairs(text)
+    parse_json_loose.last_repairs = repairs
+    return parsed
+
+
+parse_json_loose.last_repairs = []
+
+
+def _parse_json_loose_with_repairs(text: str) -> tuple[Dict, List[str]]:
+    repairs: List[str] = []
+    cleaned = text.strip()
+    if cleaned != text:
+        repairs.append("trimmed_whitespace")
+
+    lines = cleaned.splitlines()
+    stripped_lines = [line for line in lines if not line.lstrip().startswith("```")]
+    if stripped_lines != lines:
+        repairs.append("fences_removed")
+        cleaned = "\n".join(stripped_lines)
+
+    before_quotes = cleaned
+    cleaned = cleaned.replace("\u201c", "\"").replace("\u201d", "\"").replace("\u2019", "'")
+    if cleaned != before_quotes:
+        repairs.append("smart_quotes_normalized")
+
+    before_controls = cleaned
+    cleaned = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", cleaned)
+    if cleaned != before_controls:
+        repairs.append("control_chars_removed")
+
+    extracted = _extract_first_json_object_static(cleaned)
+    if extracted and extracted != cleaned:
+        repairs.append("balanced_json_extracted")
+        cleaned = extracted
+
+    cleaned_no_trailing = re.sub(r",\s*([}\]])", r"\1", cleaned)
+    if cleaned_no_trailing != cleaned:
+        repairs.append("trailing_commas_removed")
+        cleaned = cleaned_no_trailing
+
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        snippet = cleaned.strip().replace("\n", " ")
+        snippet = (snippet[:200] + "...") if len(snippet) > 200 else snippet
+        raise ValueError(f"Loose JSON parse failed. Snippet: {snippet}. Error: {exc}") from exc
+    if not isinstance(parsed, dict):
+        snippet = cleaned.strip().replace("\n", " ")
+        snippet = (snippet[:200] + "...") if len(snippet) > 200 else snippet
+        raise ValueError(f"Loose JSON parse must return object. Snippet: {snippet}")
+    return parsed, repairs
+
+
+def _extract_first_json_object_static(text: str) -> str | None:
+    start = text.find("{")
+    if start == -1:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == "\"":
+            in_string = not in_string
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
+
+
 @dataclass
 class RequirementsLimits:
     req_min: int
@@ -102,6 +184,7 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._json_parse_repairs: List[Dict[str, object]] = []
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -134,6 +217,7 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._json_parse_repairs = []
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -360,11 +444,12 @@ class RequirementsPipeline:
 
         if artifact == "requirements":
             try:
-                apply_extracted_raw = self._extract_wrapped_json(
-                    apply_response.raw_text,
-                    config["final_label"],
-                    config["expected_keys"],
-                )
+            apply_extracted_raw = self._extract_wrapped_json(
+                apply_response.raw_text,
+                config["final_label"],
+                config["expected_keys"],
+                context="requirements_apply",
+            )
                 write_json(
                     artifacts_dir / "requirements_apply_extracted_raw.json",
                     apply_extracted_raw,
@@ -546,6 +631,11 @@ class RequirementsPipeline:
                     artifacts_dir / "requirements_duplicates_debug.json",
                     {"duplicates": self._requirements_duplicates_debug},
                 )
+            if self._json_parse_repairs:
+                write_json(
+                    artifacts_dir / "requirements_json_parse_repairs.json",
+                    {"repairs": self._json_parse_repairs},
+                )
             write_json(artifacts_dir / "coverage_counts.json", coverage_counts)
         try:
             validate(instance=final_payload, schema=schema)
@@ -609,7 +699,7 @@ class RequirementsPipeline:
         return {"notes": raw_text.strip()}
 
     def _extract_wrapped_json(
-        self, raw_text: str, label: str, expected_keys: set[str]
+        self, raw_text: str, label: str, expected_keys: set[str], context: str | None = None
     ) -> Dict:
         attempts: List[str] = []
         last_snippet = raw_text.strip().replace("\n", " ")
@@ -648,25 +738,28 @@ class RequirementsPipeline:
                 return candidate
             return None
 
-        stripped = raw_text.strip()
+        parsed = None
         try:
-            parsed = json.loads(stripped)
-        except json.JSONDecodeError:
-            parsed = None
-            attempts.append("direct-json (parse-failed)")
-        if parsed is not None:
-            candidate = handle_candidate(parsed, "direct-json", snippet_for(stripped))
+            parsed = parse_json_loose(raw_text)
+            candidate = handle_candidate(parsed, "loose-json", snippet_for(raw_text))
             if candidate is not None:
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
                 return candidate
+            self._record_parse_repairs(context, parse_json_loose.last_repairs)
+        except ValueError:
+            attempts.append("loose-json (parse-failed)")
 
-        attempts.append("largest-json")
-        largest = self._largest_json_object(raw_text)
-        if largest is not None:
-            candidate = handle_candidate(
-                largest["parsed"], "largest-json", snippet_for(largest["snippet"])
-            )
-            if candidate is not None:
-                return candidate
+        extracted = self._extract_first_json_object(raw_text)
+        if extracted:
+            try:
+                parsed = parse_json_loose(extracted)
+                candidate = handle_candidate(parsed, "balanced-json", snippet_for(extracted))
+                if candidate is not None:
+                    self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    return candidate
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
+            except ValueError:
+                attempts.append("balanced-json (parse-failed)")
 
         marker = f"{label}:"
         if marker in raw_text:
@@ -1236,7 +1329,10 @@ class RequirementsPipeline:
             raw_dir / "requirements_apply_format_retry_usage.json", response
         )
         extracted = self._extract_wrapped_json(
-            response.raw_text, "FINAL_REQUIREMENTS_JSON", expected_keys
+            response.raw_text,
+            "FINAL_REQUIREMENTS_JSON",
+            expected_keys,
+            context="requirements_apply_format_retry",
         )
         write_json(
             artifacts_dir / "requirements_apply_format_retry_extracted.json", extracted
@@ -1272,6 +1368,38 @@ class RequirementsPipeline:
     def _is_requirement_object(self, candidate: Dict) -> bool:
         keys = set(candidate.keys())
         return {"id", "text", "priority"}.issubset(keys) and "requirements" not in keys
+
+    def _record_parse_repairs(self, context: str | None, repairs: List[str]) -> None:
+        if not context or not repairs:
+            return
+        self._json_parse_repairs.append({"context": context, "repairs": repairs})
+
+    def _extract_first_json_object(self, text: str) -> str | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "\"":
+                in_string = not in_string
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return None
 
     def _low_quality_phrases(self) -> List[str]:
         return [
