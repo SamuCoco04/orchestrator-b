@@ -32,7 +32,7 @@ Create a `.env` file in the repository root (you can copy `.env.example`) and ad
 Then run the requirements pipeline:
 
 ```bash
-python -m src.main --pipeline requirements --mode live --brief brief.md --artifact requirements
+python -m src.main --pipeline requirements --mode live --brief brief.md --artifact requirements --max-output-tokens 1600
 ```
 
 Evidence locations for requirements runs:
@@ -67,8 +67,8 @@ requirements_target:
 targets:
   target_min_items: 60
   target_max_items: 80
-  min_assumptions: 5
-  min_constraints: 5
+  assumptions_min: 5
+  constraints_min: 5
 assumptions_min: 3
 constraints_min: 3
 roles_expected: ["Student", "Administrator", "Coordinator"]
