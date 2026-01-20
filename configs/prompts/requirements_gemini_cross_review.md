@@ -1,4 +1,4 @@
-Return ONLY valid JSON matching the cross-review schema. No markdown, no extra text.
+Return ONLY valid JSON matching this schema. No markdown, no extra text.
 
 Targets from brief:
 - requirements_min={{REQ_MIN}}
@@ -10,20 +10,21 @@ Targets from brief:
 
 You must:
 - Compute per-area counts using the draft requirements and coverage_areas (case-insensitive).
-- If min_per_area is provided, set target=min_per_area for each area.
-- For each area, populate missing_coverage with current, target, and add counts.
-- Identify generic requirements and list them in too_generic with reason and fix.
-- Identify overlaps or duplicates and list in duplicates_or_overlaps.
+- Identify missing coverage areas and list them in missing_areas.
+- Identify overlapping/duplicate topics and list them in duplication_suspects.
+- Identify generic requirements and list them in too_generic with reason only.
+- Identify domain-specific gaps and list them in domain_missing.
 - required_actions MUST include explicit tasks for every gap found above.
 
 Return JSON with this exact shape:
 {
-  "review_version": "1.0",
-  "missing_coverage": [{"area":"","current":0,"target":0,"add":0}],
-  "too_generic": [{"id":"","reason":"","fix":""}],
-  "duplicates_or_overlaps": [{"ids":["",""],"reason":"","merge_or_split":""}],
+  "missing_areas": ["..."],
+  "duplication_suspects": ["..."],
+  "too_generic": [{"id":"REQ-001","reason":"..."}],
+  "domain_missing": ["..."],
   "required_actions": [
-    {"type":"ADD","area":null,"count":0,"ids":[],"instruction":""}
-  ],
-  "notes": ["..."]
+    {"action":"add_requirements","count":0,"areas":["..."]},
+    {"action":"strengthen_specificity","ids":["REQ-001"]},
+    {"action":"dedupe_requirements","ids":["REQ-001","REQ-002"]}
+  ]
 }

@@ -1,6 +1,6 @@
 MUST follow the brief strictly. Use it as the source of truth.
 
-You are given current requirements, coverage counts, balance targets, and a target count (generate_count).
+You are given current requirements, coverage counts, balance targets, Gemini review JSON, and a target count (generate_count).
 Your task: ADD ONLY new requirements (exactly generate_count) without rewriting existing items.
 
 Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape:
@@ -17,6 +17,7 @@ Rules:
 - Generate EXACTLY generate_count new requirements.
 - Do NOT rewrite, delete, or duplicate existing requirements.
 - Avoid duplicating any existing IDs or texts provided in the input.
+- Satisfy Gemini required_actions by adding requirements that address the requested areas.
 - If missing coverage areas are listed, explicitly mention them in new requirements.
 - If missing balance targets are listed, ensure new requirements close those gaps.
 - Each new requirement must include: actor + domain object + action + observable outcome.

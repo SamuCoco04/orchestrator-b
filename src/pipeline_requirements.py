@@ -184,6 +184,8 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._gemini_review_present = False
+        self._gemini_review_used = False
         self._extraction_debug: List[Dict[str, object]] = []
         self._json_parse_repairs: List[Dict[str, object]] = []
         self._list_repair_counts: Dict[str, int] = {
@@ -218,6 +220,8 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._gemini_review_present = False
+        self._gemini_review_used = False
         self._extraction_debug = []
         self._json_parse_repairs = []
         self._list_repair_counts = {
@@ -384,6 +388,7 @@ class RequirementsPipeline:
             lead_response.raw_text,
             config["draft_label"],
             config["expected_keys"],
+            context=f"{artifact}_draft",
         )
         draft_payload, draft_warnings = self._repair_artifact_payload(
             artifact, draft_payload, stage="draft"
@@ -411,6 +416,8 @@ class RequirementsPipeline:
             cross_review = self._validate_requirements_review(
                 cross_review, draft_payload, limits
             )
+            write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
+            self._gemini_review_present = True
 
         apply_template = read_text(self.prompts_dir / config["apply_prompt"])
         apply_prompt = self._render_prompt(apply_template, limits)
@@ -435,7 +442,10 @@ class RequirementsPipeline:
                 f"{missing_points_list}\n\nFor each missing point, add at least 2 new functional "
                 "requirements (or modify existing ones) that directly address it."
                 "\nMove NFR-like statements to constraints instead of requirements."
+                "\nYou MUST satisfy each required_actions entry from the Gemini review JSON."
+                "\nReport addressed_actions as an array of strings in ADDRESSED_ACTIONS_JSON."
             )
+            self._gemini_review_used = True
         apply_full_prompt = f"{apply_prompt}{apply_instruction}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
         write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
         with self._with_max_output_tokens(max_tokens):
@@ -490,6 +500,34 @@ class RequirementsPipeline:
                     )
                 else:
                     raise
+            try:
+                addressed_actions = self._extract_wrapped_json_any(
+                    apply_response.raw_text,
+                    ["ADDRESSED_ACTIONS_JSON"],
+                    {"addressed_actions"},
+                )
+                write_json(
+                    artifacts_dir / "requirements_addressed_actions.json",
+                    addressed_actions,
+                )
+                write_json(
+                    artifacts_dir / "requirements_apply_log.json",
+                    {
+                        "required_actions": cross_review.get("required_actions", []),
+                        "addressed_actions": addressed_actions.get("addressed_actions", []),
+                    },
+                )
+            except ValueError:
+                self._requirements_warnings.append(
+                    {"stage": "apply", "note": "Missing addressed_actions JSON."}
+                )
+                write_json(
+                    artifacts_dir / "requirements_apply_log.json",
+                    {
+                        "required_actions": cross_review.get("required_actions", []),
+                        "addressed_actions": [],
+                    },
+                )
         else:
             final_payload = self._extract_wrapped_json(
                 apply_response.raw_text,
@@ -535,7 +573,7 @@ class RequirementsPipeline:
         schema = self._load_schema(config["schema"])
         if artifact == "requirements":
             final_payload, filtered_out, quality_warnings = self._apply_quality_gate(
-                final_payload, limits
+                final_payload, limits, remove_items=False
             )
             if filtered_out:
                 self._requirements_filtered_out.extend(filtered_out)
@@ -563,6 +601,7 @@ class RequirementsPipeline:
                 limits=limits,
                 payload=final_payload,
                 adapter=chatgpt,
+                gemini_review=cross_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
@@ -610,11 +649,13 @@ class RequirementsPipeline:
                     "initial_count": count_before_add_only,
                     "target_min_items": limits.req_min,
                     "actual_count": len(final_payload.get("requirements", [])),
+                    "assumptions_count": len(final_payload.get("assumptions", [])),
+                    "constraints_count": len(final_payload.get("constraints", [])),
                     "missing_coverage_areas": missing_coverage_areas,
                     "add_only_attempts": add_only_attempts,
                     "count_before_add_only": count_before_add_only,
                     "count_after_add_only": count_after_add_only,
-                    "add_only_chunk_size": 20,
+                    "add_only_chunk_size": None,
                     "add_only_requested": add_only_requested,
                     "add_only_parse_failures": self._add_only_parse_failures,
                     "expand_generic_attempts": expand_generic_attempts,
@@ -629,6 +670,11 @@ class RequirementsPipeline:
                     "assumptions_added": self._assumptions_added,
                     "constraints_added": self._constraints_added,
                     "apply_format_retry_used": self._apply_format_retry_used,
+                    "gemini_review_present": self._gemini_review_present,
+                    "gemini_review_used": self._gemini_review_used,
+                    "wrapper_repairs_applied": bool(
+                        self._apply_format_retry_used or self._json_parse_repairs
+                    ),
                 }
             )
             if self._requirements_filtered_out:
@@ -729,6 +775,7 @@ class RequirementsPipeline:
         attempts: List[str] = []
         last_snippet = raw_text.strip().replace("\n", " ")
         truncation_detected = self._detect_truncation(raw_text)
+        debug_enabled = self._env("ORCH_DEBUG_EXTRACTION", "0") == "1"
 
         def snippet_for(text: str) -> str:
             cleaned = text.strip().replace("\n", " ")
@@ -780,6 +827,7 @@ class RequirementsPipeline:
                     "raw-decode",
                     truncation_detected,
                     None,
+                    debug_enabled,
                 )
                 return candidate
         else:
@@ -797,6 +845,7 @@ class RequirementsPipeline:
                         "fenced-json",
                         truncation_detected,
                         None,
+                        debug_enabled,
                     )
                     return candidate
                 self._record_parse_repairs(context, parse_json_loose.last_repairs)
@@ -816,12 +865,33 @@ class RequirementsPipeline:
                         "label-balanced",
                         truncation_detected,
                         None,
+                        debug_enabled,
                     )
                     return candidate
                 self._record_parse_repairs(context, parse_json_loose.last_repairs)
             except ValueError as exc:
                 parse_error = str(exc)
                 attempts.append("label-balanced (parse-failed)")
+
+        marker_extracted = self._extract_json_after_marker(raw_text, label)
+        if marker_extracted is not None:
+            try:
+                parsed = parse_json_loose(marker_extracted)
+                candidate = handle_candidate(parsed, "label-marker", snippet_for(marker_extracted))
+                if candidate is not None:
+                    self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    self._record_extraction_debug(
+                        context,
+                        "label-marker",
+                        truncation_detected,
+                        None,
+                        debug_enabled,
+                    )
+                    return candidate
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
+            except ValueError as exc:
+                parse_error = str(exc)
+                attempts.append("label-marker (parse-failed)")
 
         largest = self._largest_balanced_json(raw_text)
         if largest is not None:
@@ -835,6 +905,7 @@ class RequirementsPipeline:
                         "largest-balanced",
                         truncation_detected,
                         None,
+                        debug_enabled,
                     )
                     return candidate
                 self._record_parse_repairs(context, parse_json_loose.last_repairs)
@@ -858,6 +929,7 @@ class RequirementsPipeline:
                     "payload-direct",
                     truncation_detected,
                     None,
+                    debug_enabled,
                 )
                 return parsed
 
@@ -866,6 +938,7 @@ class RequirementsPipeline:
             "failed",
             truncation_detected,
             parse_error,
+            debug_enabled,
         )
         raise ValueError(
             f"{label} extraction failed. Attempts: {', '.join(attempts) or 'none'}. "
@@ -918,13 +991,13 @@ class RequirementsPipeline:
             self._requirements_warnings.append(
                 {"stage": "cross_review", "note": "Review schema invalid.", "error": str(exc)}
             )
-            review = self._fallback_review(draft_payload, limits)
-            return review
+            return self._fallback_review(draft_payload, limits)
 
         gaps = (
-            review.get("missing_coverage")
+            review.get("missing_areas")
             or review.get("too_generic")
-            or review.get("duplicates_or_overlaps")
+            or review.get("duplication_suspects")
+            or review.get("domain_missing")
         )
         if gaps and not review.get("required_actions"):
             self._requirements_warnings.append(
@@ -932,43 +1005,37 @@ class RequirementsPipeline:
             )
             review["required_actions"] = [
                 {
-                    "type": "ADD",
-                    "area": None,
+                    "action": "add_requirements",
                     "count": 0,
-                    "ids": [],
-                    "instruction": "Review gaps detected; add missing coverage and refine generic items.",
+                    "areas": [],
                 }
             ]
         return review
 
     def _fallback_review(self, draft_payload: Dict, limits: RequirementsLimits) -> Dict:
         coverage_counts = self._coverage_counts(draft_payload, limits)
-        missing_coverage = []
+        missing_areas: List[str] = []
+        add_count = 0
         if limits.min_per_area is not None:
             for area in limits.coverage_areas:
                 current = coverage_counts.get(area, 0)
                 target = limits.min_per_area
                 add = max(target - current, 0)
                 if add:
-                    missing_coverage.append(
-                        {"area": area, "current": current, "target": target, "add": add}
-                    )
-        required_actions = [
-            {
-                "type": "ADD",
-                "area": None,
-                "count": sum(item["add"] for item in missing_coverage) if missing_coverage else 0,
-                "ids": [],
-                "instruction": "Add missing requirements for uncovered areas.",
-            }
-        ]
+                    missing_areas.append(area)
+                    add_count += add
         return {
-            "review_version": "1.0",
-            "missing_coverage": missing_coverage,
+            "missing_areas": missing_areas,
+            "duplication_suspects": [],
             "too_generic": [],
-            "duplicates_or_overlaps": [],
-            "required_actions": required_actions,
-            "notes": ["Fallback review generated due to invalid review output."],
+            "domain_missing": [],
+            "required_actions": [
+                {
+                    "action": "add_requirements",
+                    "count": add_count,
+                    "areas": missing_areas,
+                }
+            ],
         }
 
     def _artifact_cross_review_prompt(self, artifact: str) -> str:
@@ -1169,6 +1236,7 @@ class RequirementsPipeline:
         limits: RequirementsLimits,
         payload: Dict,
         adapter: LLMAdapter,
+        gemini_review: Dict,
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
@@ -1214,6 +1282,11 @@ class RequirementsPipeline:
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         ]
+        existing_fingerprints = [
+            self._semantic_fingerprint(str(item.get("text", "")))
+            for item in payload.get("requirements", [])
+            if isinstance(item, dict)
+        ]
         retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
         retry_payload = {
             "brief": brief,
@@ -1229,6 +1302,8 @@ class RequirementsPipeline:
             "out_of_scope": self._out_of_scope_terms,
             "existing_ids": existing_ids,
             "existing_texts": existing_texts,
+            "existing_fingerprints": existing_fingerprints,
+            "gemini_review": gemini_review,
         }
         missing_balance_lines = [
             f"- {entry['target']}: {entry['missing']}"
@@ -1272,6 +1347,10 @@ class RequirementsPipeline:
         with self._with_max_output_tokens(max_tokens):
             response = adapter.complete(full_prompt)
         write_text(raw_dir / f"add_only_attempt_{attempt}_raw.txt", response.raw_text)
+        write_text(
+            raw_dir / f"requirements_add_only_attempt_{attempt}_raw.txt",
+            response.raw_text,
+        )
         self._write_usage(raw_dir / f"requirements_add_only_retry_{attempt}_usage.json", response)
         additions = self._parse_add_only_response(
             response.raw_text,
@@ -1281,24 +1360,42 @@ class RequirementsPipeline:
             limits=limits,
             payload=payload,
             adapter=adapter,
+            gemini_review=gemini_review,
             raw_dir=raw_dir,
             artifacts_dir=artifacts_dir,
             max_tokens=max_tokens,
         )
         write_json(artifacts_dir / f"requirements_add_only_retry_{attempt}.json", additions)
         write_json(artifacts_dir / f"add_only_attempt_{attempt}.json", additions)
+        write_json(
+            artifacts_dir / f"requirements_add_only_attempt_{attempt}.json",
+            additions,
+        )
         additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
         additions, filtered, reasons = self._filter_additions(additions, self._out_of_scope_terms)
+        attempt_warnings: List[Dict[str, object]] = []
         if filtered:
             self._requirements_filler_filtered.extend(
                 [{"item": item, "reason": reason} for item, reason in zip(filtered, reasons)]
             )
-        payload = self._merge_requirements_additions(payload, additions)
-        payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
+            attempt_warnings.extend(
+                [
+                    {"stage": "filter_additions", "item": item, "reason": reason}
+                    for item, reason in zip(filtered, reasons)
+                ]
+            )
+        additions, filtered_out, quality_warnings = self._apply_quality_gate(additions, limits)
         if filtered_out:
             self._requirements_filtered_out.extend(filtered_out)
+            attempt_warnings.extend(
+                [{"stage": "quality_gate", "item": item} for item in filtered_out]
+            )
         if quality_warnings:
             self._requirements_quality_warnings.extend(quality_warnings)
+            attempt_warnings.extend(
+                [{"stage": "quality_gate", "warning": warning} for warning in quality_warnings]
+            )
+        payload = self._merge_requirements_additions(payload, additions)
         missing_coverage = self._missing_coverage_areas(payload, limits)
         balance_results = self._balance_check(payload, limits)
         self._requirements_balance_results = balance_results
@@ -1309,6 +1406,11 @@ class RequirementsPipeline:
             self._requirements_warnings.append(
                 {"stage": "add_only", "note": "Validation failed after add-only.", "error": str(exc)}
             )
+            attempt_warnings.append({"stage": "validation", "error": str(exc)})
+        write_json(
+            artifacts_dir / f"requirements_add_only_warnings_{attempt}.json",
+            {"warnings": attempt_warnings},
+        )
         return payload, missing_coverage, balance_results
 
     def _parse_add_only_response(
@@ -1320,6 +1422,7 @@ class RequirementsPipeline:
         limits: RequirementsLimits,
         payload: Dict,
         adapter: LLMAdapter,
+        gemini_review: Dict,
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
@@ -1351,6 +1454,12 @@ class RequirementsPipeline:
                     for item in payload.get("requirements", [])
                     if isinstance(item, dict)
                 ],
+                "existing_fingerprints": [
+                    self._semantic_fingerprint(str(item.get("text", "")))
+                    for item in payload.get("requirements", [])
+                    if isinstance(item, dict)
+                ],
+                "gemini_review": gemini_review,
             }
             retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
             retry_full_prompt = (
@@ -1363,6 +1472,10 @@ class RequirementsPipeline:
                 retry_response = adapter.complete(retry_full_prompt)
             write_text(
                 raw_dir / f"add_only_attempt_{attempt}_retry_raw.txt",
+                retry_response.raw_text,
+            )
+            write_text(
+                raw_dir / f"requirements_add_only_attempt_{attempt}_retry_raw.txt",
                 retry_response.raw_text,
             )
             self._write_usage(
@@ -1482,9 +1595,12 @@ class RequirementsPipeline:
         strategy: str,
         truncation_detected: bool,
         parse_error: str | None,
+        debug_enabled: bool,
     ) -> None:
-        if not context:
+        if not context and not debug_enabled:
             return
+        if not context:
+            context = "unspecified"
         entry: Dict[str, object] = {
             "context": context,
             "strategy": strategy,
@@ -1540,6 +1656,13 @@ class RequirementsPipeline:
 
     def _extract_json_after_label(self, text: str, label: str) -> str | None:
         match = re.search(re.escape(label), text, re.IGNORECASE)
+        if not match:
+            return None
+        snippet = text[match.end():]
+        return self._extract_first_json_object(snippet)
+
+    def _extract_json_after_marker(self, text: str, label: str) -> str | None:
+        match = re.search(rf"{re.escape(label)}\s*:\s*", text, re.IGNORECASE)
         if not match:
             return None
         snippet = text[match.end():]
@@ -1650,7 +1773,7 @@ class RequirementsPipeline:
         return self._low_quality_reason(text) is not None
 
     def _apply_quality_gate(
-        self, payload: Dict, limits: RequirementsLimits
+        self, payload: Dict, limits: RequirementsLimits, remove_items: bool = True
     ) -> tuple[Dict, List[Dict], List[Dict]]:
         filtered_out: List[Dict] = []
         warnings: List[Dict] = []
@@ -1668,7 +1791,9 @@ class RequirementsPipeline:
             else:
                 filtered_requirements.append(item)
         filtered_payload = dict(payload)
-        filtered_payload["requirements"] = filtered_requirements
+        filtered_payload["requirements"] = filtered_requirements if remove_items else payload.get(
+            "requirements", []
+        )
         return filtered_payload, filtered_out, warnings
 
     def _balance_check(self, payload: Dict, limits: RequirementsLimits) -> Dict[str, object]:
@@ -1713,28 +1838,42 @@ class RequirementsPipeline:
 
     def _gemini_missing_points(self, review: Dict) -> List[str]:
         points: List[str] = []
-        for entry in review.get("missing_coverage", []):
+        for entry in review.get("missing_areas", []):
+            if isinstance(entry, str) and entry.strip():
+                points.append(entry.strip())
+        for entry in review.get("domain_missing", []):
+            if isinstance(entry, str) and entry.strip():
+                points.append(entry.strip())
+        for entry in review.get("duplication_suspects", []):
+            if isinstance(entry, str) and entry.strip():
+                points.append(f"Check duplication: {entry.strip()}")
+        for entry in review.get("too_generic", []):
             if isinstance(entry, dict):
-                area = entry.get("area")
-                add = entry.get("add")
-                if area:
-                    if isinstance(add, int):
-                        points.append(f"{area} (add {add})")
-                    else:
-                        points.append(str(area))
+                req_id = entry.get("id")
+                reason = entry.get("reason")
+                if req_id and reason:
+                    points.append(f"Refine {req_id}: {reason}")
+                elif req_id:
+                    points.append(f"Refine {req_id}")
         for action in review.get("required_actions", []):
             if not isinstance(action, dict):
                 continue
-            if action.get("type") == "ADD":
-                instruction = action.get("instruction")
-                area = action.get("area")
-                if instruction:
-                    points.append(str(instruction))
-                elif area:
-                    points.append(f"Add requirements for {area}")
-        for note in review.get("notes", []):
-            if isinstance(note, str) and note.strip():
-                points.append(note.strip())
+            action_type = action.get("action")
+            if action_type == "add_requirements":
+                areas = action.get("areas", [])
+                count = action.get("count")
+                if areas:
+                    points.append(f"Add requirements for areas: {', '.join(areas)}")
+                if isinstance(count, int) and count > 0:
+                    points.append(f"Add {count} requirements")
+            if action_type == "strengthen_specificity":
+                ids = action.get("ids", [])
+                if ids:
+                    points.append(f"Strengthen specificity: {', '.join(ids)}")
+            if action_type == "dedupe_requirements":
+                ids = action.get("ids", [])
+                if ids:
+                    points.append(f"Dedupe requirements: {', '.join(ids)}")
         seen = set()
         deduped = []
         for point in points:
@@ -1749,6 +1888,7 @@ class RequirementsPipeline:
         limits: RequirementsLimits,
         payload: Dict,
         adapter: LLMAdapter,
+        gemini_review: Dict,
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
@@ -1757,14 +1897,14 @@ class RequirementsPipeline:
         requested_counts: List[int] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
-        chunk_size = 20
-        max_attempts = 3
+        chunk_size = None
+        max_attempts = 2
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
             missing_count = max(limits.req_min - current_count, 0)
             if missing_count <= 0:
                 return payload, missing_coverage, attempts, balance_results, requested_counts
-            generate_count = min(missing_count, chunk_size)
+            generate_count = missing_count
             attempts += 1
             requested_counts.append(generate_count)
             (
@@ -1776,6 +1916,7 @@ class RequirementsPipeline:
                 limits=limits,
                 payload=payload,
                 adapter=adapter,
+                gemini_review=gemini_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
@@ -2202,6 +2343,8 @@ class RequirementsPipeline:
             target_min_items = summary.get("target_min_items")
             initial_count = summary.get("initial_count")
             actual_count = summary.get("actual_count")
+            assumptions_count = summary.get("assumptions_count")
+            constraints_count = summary.get("constraints_count")
             missing_coverage = summary.get("missing_coverage_areas", [])
             add_only_attempts = summary.get("add_only_attempts")
             count_before_add_only = summary.get("count_before_add_only")
@@ -2221,9 +2364,16 @@ class RequirementsPipeline:
             constraints_added = summary.get("constraints_added")
             apply_format_retry_used = summary.get("apply_format_retry_used")
             coverage_counts = summary.get("coverage_counts", {})
+            wrapper_repairs_applied = summary.get("wrapper_repairs_applied")
+            gemini_review_present = summary.get("gemini_review_present")
+            gemini_review_used = summary.get("gemini_review_used")
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
+            if assumptions_count is not None:
+                lines.append(f"- assumptions_count: {assumptions_count}")
+            if constraints_count is not None:
+                lines.append(f"- constraints_count: {constraints_count}")
             if missing_coverage:
                 lines.append(f"- missing_coverage_areas: {', '.join(missing_coverage)}")
             else:
@@ -2265,6 +2415,18 @@ class RequirementsPipeline:
             if apply_format_retry_used is not None:
                 lines.append(
                     f"- apply_format_retry_used: {'yes' if apply_format_retry_used else 'no'}"
+                )
+            if wrapper_repairs_applied is not None:
+                lines.append(
+                    f"- wrapper_repairs_applied: {'yes' if wrapper_repairs_applied else 'no'}"
+                )
+            if gemini_review_present is not None:
+                lines.append(
+                    f"- gemini_review_present: {'yes' if gemini_review_present else 'no'}"
+                )
+            if gemini_review_used is not None:
+                lines.append(
+                    f"- gemini_review_used: {'yes' if gemini_review_used else 'no'}"
                 )
             if isinstance(balance_results, dict) and balance_results:
                 counts = balance_results.get("counts", {})
@@ -4352,21 +4514,27 @@ class RequirementsPipeline:
             except (TypeError, ValueError):
                 artifact_token_budgets[key] = default_value
         min_assumptions = targets.get(
-            "assumptions_min",
-            targets.get("min_assumptions", frontmatter.get("assumptions_min", 3)),
+            "min_assumptions",
+            targets.get(
+                "assumptions_min",
+                frontmatter.get("min_assumptions", frontmatter.get("assumptions_min", 5)),
+            ),
         )
         min_constraints = targets.get(
-            "constraints_min",
-            targets.get("min_constraints", frontmatter.get("constraints_min", 3)),
+            "min_constraints",
+            targets.get(
+                "constraints_min",
+                frontmatter.get("min_constraints", frontmatter.get("constraints_min", 5)),
+            ),
         )
         try:
-            assumptions_min = int(min_assumptions)
+            assumptions_min = max(3, int(min_assumptions))
         except (TypeError, ValueError):
-            assumptions_min = 3
+            assumptions_min = 5
         try:
-            constraints_min = int(min_constraints)
+            constraints_min = max(3, int(min_constraints))
         except (TypeError, ValueError):
-            constraints_min = 3
+            constraints_min = 5
         min_student_reqs_raw = targets.get("min_student_reqs", 25)
         min_coordinator_reqs_raw = targets.get("min_coordinator_reqs", 15)
         min_admin_reqs_raw = targets.get("min_admin_reqs", 8)
