@@ -96,6 +96,7 @@ class RequirementsPipeline:
         self._coverage_fix_used = False
         self._assumptions_added = 0
         self._constraints_added = 0
+        self._add_only_parse_failures = 0
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -126,6 +127,7 @@ class RequirementsPipeline:
         self._coverage_fix_used = False
         self._assumptions_added = 0
         self._constraints_added = 0
+        self._add_only_parse_failures = 0
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -412,7 +414,7 @@ class RequirementsPipeline:
                 self._requirements_filtered_out.extend(filtered_out)
             if quality_warnings:
                 self._requirements_quality_warnings.extend(quality_warnings)
-            initial_count = len(final_payload.get("requirements", []))
+            count_before_add_only = len(final_payload.get("requirements", []))
             try:
                 validate(instance=final_payload, schema=schema)
             except ValidationError as exc:
@@ -428,6 +430,7 @@ class RequirementsPipeline:
                 missing_coverage_areas,
                 add_only_attempts,
                 balance_results,
+                add_only_requested,
             ) = self._add_only_requirements_loop(
                 brief=brief,
                 limits=limits,
@@ -437,6 +440,7 @@ class RequirementsPipeline:
                 artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
             )
+            count_after_add_only = len(final_payload.get("requirements", []))
             final_payload, expand_generic_attempts = self._expand_generic_requirements(
                 brief=brief,
                 limits=limits,
@@ -476,11 +480,16 @@ class RequirementsPipeline:
             coverage_counts = self._coverage_counts(final_payload, limits)
             summary.update(
                 {
-                    "initial_count": initial_count,
+                    "initial_count": count_before_add_only,
                     "target_min_items": limits.req_min,
                     "actual_count": len(final_payload.get("requirements", [])),
                     "missing_coverage_areas": missing_coverage_areas,
                     "add_only_attempts": add_only_attempts,
+                    "count_before_add_only": count_before_add_only,
+                    "count_after_add_only": count_after_add_only,
+                    "add_only_chunk_size": 20,
+                    "add_only_requested": add_only_requested,
+                    "add_only_parse_failures": self._add_only_parse_failures,
                     "expand_generic_attempts": expand_generic_attempts,
                     "id_normalized": id_normalized,
                     "review_actions_applied": bool(cross_review.get("required_actions")),
@@ -956,6 +965,231 @@ class RequirementsPipeline:
         filtered_payload["requirements"] = filtered_requirements
         return filtered_payload, filtered_out, reasons
 
+    def _semantic_fingerprint(self, text: str) -> str:
+        normalized = re.sub(r"[^\w\s]", " ", text.lower())
+        tokens = [token for token in normalized.split() if len(token) > 2]
+        tokens = sorted(set(tokens))
+        return " ".join(tokens)
+
+    def _run_add_only_attempt(
+        self,
+        brief: str,
+        limits: RequirementsLimits,
+        payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+        attempt: int,
+        generate_count: int,
+    ) -> tuple[Dict, List[str], Dict[str, object]]:
+        balance_results = self._balance_check(payload, limits)
+        missing_coverage = self._missing_coverage_areas(payload, limits)
+        coverage_counts = self._coverage_counts(payload, limits)
+        coverage_targets: List[Dict[str, int | str]] = []
+        if limits.min_per_area is not None:
+            for area in limits.coverage_areas:
+                current = coverage_counts.get(area, 0)
+                target = limits.min_per_area
+                coverage_targets.append(
+                    {
+                        "area": area,
+                        "current": current,
+                        "target": target,
+                        "add": max(target - current, 0),
+                    }
+                )
+        missing_balance = balance_results.get("missing", {})
+        missing_balance_targets = [
+            {"target": "student_reqs", "missing": missing_balance.get("student_reqs", 0)},
+            {
+                "target": "coordinator_reqs",
+                "missing": missing_balance.get("coordinator_reqs", 0),
+            },
+            {"target": "admin_reqs", "missing": missing_balance.get("admin_reqs", 0)},
+            {
+                "target": "domain_keyword_hits",
+                "missing": missing_balance.get("domain_keyword_hits", 0),
+            },
+        ]
+        existing_ids = [
+            item.get("id")
+            for item in payload.get("requirements", [])
+            if isinstance(item, dict)
+        ]
+        existing_texts = [
+            str(item.get("text", ""))[:120]
+            for item in payload.get("requirements", [])
+            if isinstance(item, dict)
+        ]
+        retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
+        retry_payload = {
+            "brief": brief,
+            "current_requirements": payload,
+            "targets": self._requirements_targets_payload(limits),
+            "missing_count": max(limits.req_min - len(payload.get("requirements", [])), 0),
+            "generate_count": generate_count,
+            "missing_coverage_areas": missing_coverage,
+            "coverage_counts": coverage_counts,
+            "coverage_targets": coverage_targets,
+            "missing_balance_targets": missing_balance_targets,
+            "balance_results": balance_results,
+            "out_of_scope": self._out_of_scope_terms,
+            "existing_ids": existing_ids,
+            "existing_texts": existing_texts,
+        }
+        missing_balance_lines = [
+            f"- {entry['target']}: {entry['missing']}"
+            for entry in missing_balance_targets
+            if isinstance(entry.get("missing"), int) and entry.get("missing") > 0
+        ]
+        missing_balance_summary = (
+            "\n".join(missing_balance_lines) if missing_balance_lines else "- none"
+        )
+        existing_ids_summary = ", ".join(str(item) for item in existing_ids if item) or "none"
+        existing_texts_summary = "; ".join(text for text in existing_texts if text) or "none"
+        missing_coverage_summary = ", ".join(missing_coverage) if missing_coverage else "none"
+        coverage_counts_summary = (
+            ", ".join(f"{area}={count}" for area, count in coverage_counts.items())
+            if coverage_counts
+            else "none"
+        )
+        forbidden_phrases = "; ".join(self._low_quality_phrases())
+        out_of_scope_summary = (
+            ", ".join(self._out_of_scope_terms) if self._out_of_scope_terms else "none"
+        )
+        full_prompt = (
+            f"{retry_prompt}\n\nExisting requirement IDs: {existing_ids_summary}\n"
+            f"Existing requirement texts (snippets): {existing_texts_summary}\n"
+            f"Coverage counts: {coverage_counts_summary}\n"
+            f"Missing coverage areas: {missing_coverage_summary}\n"
+            f"Missing balance targets:\n{missing_balance_summary}\n"
+            f"Out-of-scope items (do NOT include): {out_of_scope_summary}\n"
+            f"Generate EXACTLY {generate_count} new requirements.\n"
+            "Each new requirement must mention a concrete actor "
+            "(Student/Coordinator/Admin/System) and reference a domain object "
+            "(procedure/document/deadline/exception/approval/signature/mobility/"
+            "notification/audit/integration).\n"
+            "Avoid generic wording like \"implement <coverage area> measures\".\n"
+            f"Cap 'could' priorities to at most 20% of {generate_count} items.\n"
+            f"Forbidden placeholder phrases: {forbidden_phrases}\n\nINPUT:\n"
+            f"{json.dumps(retry_payload)}\n"
+        )
+        write_text(raw_dir / f"add_only_retry_{attempt}_prompt.txt", full_prompt)
+        write_text(raw_dir / f"add_only_prompt_attempt_{attempt}.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / f"add_only_attempt_{attempt}_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / f"requirements_add_only_retry_{attempt}_usage.json", response)
+        additions = self._parse_add_only_response(
+            response.raw_text,
+            attempt=attempt,
+            generate_count=generate_count,
+            brief=brief,
+            limits=limits,
+            payload=payload,
+            adapter=adapter,
+            raw_dir=raw_dir,
+            artifacts_dir=artifacts_dir,
+            max_tokens=max_tokens,
+        )
+        write_json(artifacts_dir / f"requirements_add_only_retry_{attempt}.json", additions)
+        write_json(artifacts_dir / f"add_only_attempt_{attempt}.json", additions)
+        additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
+        additions, filtered, reasons = self._filter_additions(additions, self._out_of_scope_terms)
+        if filtered:
+            self._requirements_filler_filtered.extend(
+                [{"item": item, "reason": reason} for item, reason in zip(filtered, reasons)]
+            )
+        payload = self._merge_requirements_additions(payload, additions)
+        payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
+        if filtered_out:
+            self._requirements_filtered_out.extend(filtered_out)
+        if quality_warnings:
+            self._requirements_quality_warnings.extend(quality_warnings)
+        missing_coverage = self._missing_coverage_areas(payload, limits)
+        balance_results = self._balance_check(payload, limits)
+        self._requirements_balance_results = balance_results
+        try:
+            schema = self._load_schema("normalized_requirements.schema.json")
+            validate(instance=payload, schema=schema)
+        except ValidationError as exc:
+            self._requirements_warnings.append(
+                {"stage": "add_only", "note": "Validation failed after add-only.", "error": str(exc)}
+            )
+        return payload, missing_coverage, balance_results
+
+    def _parse_add_only_response(
+        self,
+        raw_text: str,
+        attempt: int,
+        generate_count: int,
+        brief: str,
+        limits: RequirementsLimits,
+        payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> Dict:
+        try:
+            return self._extract_wrapped_json_any(
+                raw_text,
+                ["FINAL_REQUIREMENTS_JSON"],
+                {"requirements", "assumptions", "constraints"},
+            )
+        except ValueError as exc:
+            self._add_only_parse_failures += 1
+            retry_count = max(5, generate_count // 2)
+            retry_payload = {
+                "brief": brief,
+                "current_requirements": payload,
+                "targets": self._requirements_targets_payload(limits),
+                "missing_count": max(limits.req_min - len(payload.get("requirements", [])), 0),
+                "generate_count": retry_count,
+                "missing_coverage_areas": self._missing_coverage_areas(payload, limits),
+                "coverage_counts": self._coverage_counts(payload, limits),
+                "existing_ids": [
+                    item.get("id")
+                    for item in payload.get("requirements", [])
+                    if isinstance(item, dict)
+                ],
+                "existing_texts": [
+                    str(item.get("text", ""))[:120]
+                    for item in payload.get("requirements", [])
+                    if isinstance(item, dict)
+                ],
+            }
+            retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
+            retry_full_prompt = (
+                f"{retry_prompt}\n\nGenerate EXACTLY {retry_count} new requirements. "
+                "Use short, testable requirements.\n\nINPUT:\n"
+                f"{json.dumps(retry_payload)}\n"
+            )
+            write_text(raw_dir / f"add_only_attempt_{attempt}_retry_prompt.txt", retry_full_prompt)
+            with self._with_max_output_tokens(max_tokens):
+                retry_response = adapter.complete(retry_full_prompt)
+            write_text(
+                raw_dir / f"add_only_attempt_{attempt}_retry_raw.txt",
+                retry_response.raw_text,
+            )
+            self._write_usage(
+                raw_dir / f"requirements_add_only_retry_{attempt}_retry_usage.json",
+                retry_response,
+            )
+            try:
+                return self._extract_wrapped_json_any(
+                    retry_response.raw_text,
+                    ["FINAL_REQUIREMENTS_JSON"],
+                    {"requirements", "assumptions", "constraints"},
+                )
+            except ValueError as retry_exc:
+                self._add_only_parse_failures += 1
+                raise RuntimeError(
+                    "Add-only failed due to truncation/parse errors after retry. "
+                    f"Attempt {attempt}."
+                ) from retry_exc
+
     def _out_of_scope_from_frontmatter(self, frontmatter: Dict) -> List[str]:
         if not isinstance(frontmatter, dict):
             return []
@@ -1147,183 +1381,39 @@ class RequirementsPipeline:
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
-    ) -> tuple[Dict, List[str], int, Dict[str, object]]:
+    ) -> tuple[Dict, List[str], int, Dict[str, object], List[int]]:
         attempts = 0
+        requested_counts: List[int] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
-        max_attempts = 2
-        extra_attempt_used = False
+        chunk_size = 20
+        max_attempts = 3
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
             missing_count = max(limits.req_min - current_count, 0)
-            coverage_counts = self._coverage_counts(payload, limits)
-            coverage_targets: List[Dict[str, int | str]] = []
-            coverage_add_needed = 0
-            if limits.min_per_area is not None:
-                for area in limits.coverage_areas:
-                    current = coverage_counts.get(area, 0)
-                    target = limits.min_per_area
-                    add_needed = max(target - current, 0)
-                    coverage_add_needed += add_needed
-                    coverage_targets.append(
-                        {
-                            "area": area,
-                            "current": current,
-                            "target": target,
-                            "add": add_needed,
-                        }
-                    )
-            missing_balance = balance_results.get("missing", {})
-            role_missing_total = sum(
-                missing_balance.get(key, 0)
-                for key in ["student_reqs", "coordinator_reqs", "admin_reqs"]
-                if isinstance(missing_balance.get(key, 0), int)
-            )
-            missing_keyword_hits = int(missing_balance.get("domain_keyword_hits", 0) or 0)
-            generate_count = max(
-                missing_count,
-                coverage_add_needed,
-                role_missing_total,
-                missing_keyword_hits,
-            )
-            if generate_count <= 0 and not missing_coverage and balance_results.get("meets"):
-                return payload, missing_coverage, attempts, balance_results
+            if missing_count <= 0:
+                return payload, missing_coverage, attempts, balance_results, requested_counts
+            generate_count = min(missing_count, chunk_size)
             attempts += 1
-            existing_ids = [
-                item.get("id")
-                for item in payload.get("requirements", [])
-                if isinstance(item, dict)
-            ]
-            existing_texts = [
-                str(item.get("text", ""))[:120]
-                for item in payload.get("requirements", [])
-                if isinstance(item, dict)
-            ]
-            missing_balance_targets = [
-                {
-                    "target": "student_reqs",
-                    "missing": missing_balance.get("student_reqs", 0),
-                },
-                {
-                    "target": "coordinator_reqs",
-                    "missing": missing_balance.get("coordinator_reqs", 0),
-                },
-                {
-                    "target": "admin_reqs",
-                    "missing": missing_balance.get("admin_reqs", 0),
-                },
-                {
-                    "target": "domain_keyword_hits",
-                    "missing": missing_balance.get("domain_keyword_hits", 0),
-                },
-            ]
-            retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
-            retry_payload = {
-                "brief": brief,
-                "current_requirements": payload,
-                "targets": self._requirements_targets_payload(limits),
-                "missing_count": missing_count,
-                "generate_count": generate_count,
-                "missing_coverage_areas": missing_coverage,
-                "coverage_counts": coverage_counts,
-                "coverage_targets": coverage_targets,
-                "missing_balance_targets": missing_balance_targets,
-                "balance_results": balance_results,
-                "out_of_scope": self._out_of_scope_terms,
-                "existing_ids": existing_ids,
-                "existing_texts": existing_texts,
-            }
-            missing_balance_lines = [
-                f"- {entry['target']}: {entry['missing']}"
-                for entry in missing_balance_targets
-                if isinstance(entry.get("missing"), int) and entry.get("missing") > 0
-            ]
-            missing_balance_summary = (
-                "\n".join(missing_balance_lines) if missing_balance_lines else "- none"
+            requested_counts.append(generate_count)
+            (
+                payload,
+                missing_coverage,
+                balance_results,
+            ) = self._run_add_only_attempt(
+                brief=brief,
+                limits=limits,
+                payload=payload,
+                adapter=adapter,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=max_tokens,
+                attempt=attempts,
+                generate_count=generate_count,
             )
-            existing_ids_summary = ", ".join(str(item) for item in existing_ids if item) or "none"
-            existing_texts_summary = (
-                "; ".join(text for text in existing_texts if text) or "none"
-            )
-            missing_coverage_summary = (
-                ", ".join(missing_coverage) if missing_coverage else "none"
-            )
-            forbidden_phrases = "; ".join(self._low_quality_phrases())
-            out_of_scope_summary = (
-                ", ".join(self._out_of_scope_terms) if self._out_of_scope_terms else "none"
-            )
-            full_prompt = (
-                f"{retry_prompt}\n\nExisting requirement IDs: {existing_ids_summary}\n"
-                f"Existing requirement texts (snippets): {existing_texts_summary}\n"
-                f"Missing coverage areas: {missing_coverage_summary}\n"
-                f"Missing balance targets:\n{missing_balance_summary}\n"
-                f"Out-of-scope items (do NOT include): {out_of_scope_summary}\n"
-                f"Generate EXACTLY {generate_count} new requirements.\n"
-                "Each new requirement must mention a concrete actor "
-                "(Student/Coordinator/Admin/System) and reference a domain object "
-                "(procedure/document/deadline/exception/approval/signature/mobility/"
-                "notification/audit/integration).\n"
-                "Avoid generic wording like \"implement <coverage area> measures\".\n"
-                f"Cap 'could' priorities to at most 20% of {generate_count} items.\n"
-                f"Forbidden placeholder phrases: {forbidden_phrases}\n\nINPUT:\n"
-                f"{json.dumps(retry_payload)}\n"
-            )
-            write_text(raw_dir / f"add_only_retry_{attempts}_prompt.txt", full_prompt)
-            write_text(raw_dir / f"add_only_prompt_attempt_{attempts}.txt", full_prompt)
-            with self._with_max_output_tokens(max_tokens):
-                response = adapter.complete(full_prompt)
-            write_text(raw_dir / f"add_only_attempt_{attempts}_raw.txt", response.raw_text)
-            self._write_usage(
-                raw_dir / f"requirements_add_only_retry_{attempts}_usage.json", response
-            )
-            try:
-                additions = self._extract_wrapped_json_any(
-                    response.raw_text,
-                    ["FINAL_REQUIREMENTS_JSON"],
-                    {"requirements", "assumptions", "constraints"},
-                )
-            except ValueError as exc:
-                self._requirements_warnings.append(
-                    {"stage": "add_only", "note": "Add-only extraction failed.", "error": str(exc)}
-                )
-                break
-            write_json(artifacts_dir / f"requirements_add_only_retry_{attempts}.json", additions)
-            write_json(artifacts_dir / f"add_only_attempt_{attempts}.json", additions)
-            additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
-            additions, filtered, reasons = self._filter_additions(
-                additions, self._out_of_scope_terms
-            )
-            if filtered:
-                self._requirements_filler_filtered.extend(
-                    [{"item": item, "reason": reason} for item, reason in zip(filtered, reasons)]
-                )
-            payload = self._merge_requirements_additions(payload, additions)
-            payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
-            if filtered_out:
-                self._requirements_filtered_out.extend(filtered_out)
-            if quality_warnings:
-                self._requirements_quality_warnings.extend(quality_warnings)
-            missing_coverage = self._missing_coverage_areas(payload, limits)
-            balance_results = self._balance_check(payload, limits)
-            self._requirements_balance_results = balance_results
-            try:
-                schema = self._load_schema("normalized_requirements.schema.json")
-                validate(instance=payload, schema=schema)
-            except ValidationError as exc:
-                self._requirements_warnings.append(
-                    {"stage": "add_only", "note": "Validation failed after add-only.", "error": str(exc)}
-                )
-            if (
-                filtered
-                and attempts >= max_attempts
-                and len(payload.get("requirements", [])) < limits.req_min
-                and not extra_attempt_used
-            ):
-                max_attempts += 1
-                extra_attempt_used = True
         current_count = len(payload.get("requirements", []))
         missing_count = max(limits.req_min - current_count, 0)
-        if missing_count > 0 or missing_coverage or not balance_results.get("meets"):
+        if missing_count > 0:
             self._requirements_warnings.append(
                 {
                     "stage": "add_only",
@@ -1333,7 +1423,7 @@ class RequirementsPipeline:
                     "balance_results": balance_results,
                 }
             )
-        return payload, missing_coverage, attempts, balance_results
+        return payload, missing_coverage, attempts, balance_results, requested_counts
 
     def _fallback_requirements(self, missing_count: int, limits: RequirementsLimits) -> List[Dict]:
         placeholders: List[Dict] = []
@@ -1555,11 +1645,17 @@ class RequirementsPipeline:
             for item in merged["requirements"]
             if isinstance(item, dict)
         }
+        existing_fingerprints = {
+            self._semantic_fingerprint(str(item.get("text", "")).strip())
+            for item in merged["requirements"]
+            if isinstance(item, dict)
+        }
         for item in additions.get("requirements", []):
             if isinstance(item, dict):
                 item_id = item.get("id")
                 item_text = str(item.get("text", "")).strip()
                 normalized_text = item_text.lower()
+                fingerprint = self._semantic_fingerprint(item_text)
                 if isinstance(item_id, str) and item_id in existing_ids:
                     self._requirements_duplicates_debug.append(
                         {
@@ -1578,10 +1674,21 @@ class RequirementsPipeline:
                         }
                     )
                     continue
+                if fingerprint and fingerprint in existing_fingerprints:
+                    self._requirements_duplicates_debug.append(
+                        {
+                            "reason": "duplicate_semantic",
+                            "id": item_id,
+                            "text": item_text,
+                        }
+                    )
+                    continue
                 if isinstance(item_id, str):
                     existing_ids.add(item_id)
                 if normalized_text:
                     existing_texts.add(normalized_text)
+                if fingerprint:
+                    existing_fingerprints.add(fingerprint)
                 merged["requirements"].append(item)
         for item in additions.get("assumptions", []):
             if isinstance(item, str):
@@ -1611,8 +1718,20 @@ class RequirementsPipeline:
                     used_ids.add(candidate)
                     return candidate
 
+        indexed_items: List[Tuple[int, Dict]] = [
+            (index, item) for index, item in enumerate(items) if isinstance(item, dict)
+        ]
+        def sort_key(entry: Tuple[int, Dict]) -> Tuple[int, int]:
+            index, item = entry
+            current_id = item.get("id")
+            if isinstance(current_id, str):
+                match = re.match(r"REQ-(\d+)", current_id.strip(), re.IGNORECASE)
+                if match:
+                    return (0, int(match.group(1)))
+            return (1, index)
+
         normalized_items: List[Dict] = []
-        for item in items:
+        for _, item in sorted(indexed_items, key=sort_key):
             if not isinstance(item, dict):
                 continue
             current_id = item.get("id")
@@ -1714,6 +1833,11 @@ class RequirementsPipeline:
             actual_count = summary.get("actual_count")
             missing_coverage = summary.get("missing_coverage_areas", [])
             add_only_attempts = summary.get("add_only_attempts")
+            count_before_add_only = summary.get("count_before_add_only")
+            count_after_add_only = summary.get("count_after_add_only")
+            add_only_chunk_size = summary.get("add_only_chunk_size")
+            add_only_requested = summary.get("add_only_requested", [])
+            add_only_parse_failures = summary.get("add_only_parse_failures")
             expand_generic_attempts = summary.get("expand_generic_attempts")
             id_normalized = summary.get("id_normalized")
             review_actions_applied = summary.get("review_actions_applied")
@@ -1738,6 +1862,18 @@ class RequirementsPipeline:
                 )
                 lines.append(f"- coverage_counts: {counts_str}")
             lines.append(f"- add_only_attempts: {add_only_attempts}")
+            if count_before_add_only is not None:
+                lines.append(f"- count_before_add_only: {count_before_add_only}")
+            if count_after_add_only is not None:
+                lines.append(f"- count_after_add_only: {count_after_add_only}")
+            if add_only_chunk_size is not None:
+                lines.append(f"- add_only_chunk_size: {add_only_chunk_size}")
+            if isinstance(add_only_requested, list) and add_only_requested:
+                lines.append(
+                    "- add_only_requested: " + ", ".join(str(value) for value in add_only_requested)
+                )
+            if add_only_parse_failures is not None:
+                lines.append(f"- add_only_parse_failures: {add_only_parse_failures}")
             lines.append(f"- expand_generic_attempts: {expand_generic_attempts}")
             lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
             lines.append(f"- review_actions_applied: {'yes' if review_actions_applied else 'no'}")

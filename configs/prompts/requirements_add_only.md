@@ -21,5 +21,7 @@ Rules:
 - If missing balance targets are listed, ensure new requirements close those gaps.
 - Each new requirement must include: actor + domain object + action + observable outcome.
 - Avoid placeholders such as: "as described in the brief", "define and enforce behavior", "user-friendly interface", "provide guidelines".
+- Output ONLY JSON; do NOT include assumptions or constraints in add-only output.
+- Do NOT exceed generate_count under any circumstance.
 - Requirements must be atomic and testable.
 - No markdown, no extra keys.
