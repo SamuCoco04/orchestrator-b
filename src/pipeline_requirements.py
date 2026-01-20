@@ -92,6 +92,7 @@ class RequirementsPipeline:
         self._coverage_area_terms: List[str] = []
         self._out_of_scope_terms: List[str] = []
         self._requirements_filler_filtered: List[Dict] = []
+        self._requirements_duplicates_debug: List[Dict] = []
         self._coverage_fix_used = False
         self._assumptions_added = 0
         self._constraints_added = 0
@@ -121,6 +122,7 @@ class RequirementsPipeline:
         self._coverage_area_terms = []
         self._out_of_scope_terms = []
         self._requirements_filler_filtered = []
+        self._requirements_duplicates_debug = []
         self._coverage_fix_used = False
         self._assumptions_added = 0
         self._constraints_added = 0
@@ -349,20 +351,21 @@ class RequirementsPipeline:
         self._write_usage(raw_dir / f"{artifact}_apply_usage.json", apply_response)
 
         if artifact == "requirements":
-            apply_extracted_raw = self._safe_extract_json(apply_response.raw_text)
+            apply_extracted_raw = self._extract_wrapped_json(
+                apply_response.raw_text,
+                config["final_label"],
+                config["expected_keys"],
+            )
             write_json(
                 artifacts_dir / "requirements_apply_extracted_raw.json",
                 apply_extracted_raw,
             )
-        final_payload = self._extract_wrapped_json(
-            apply_response.raw_text,
-            config["final_label"],
-            config["expected_keys"],
-        )
-        if artifact == "requirements":
-            write_json(
-                artifacts_dir / "requirements_apply_extracted_normalized.json",
-                final_payload,
+            final_payload = apply_extracted_raw
+        else:
+            final_payload = self._extract_wrapped_json(
+                apply_response.raw_text,
+                config["final_label"],
+                config["expected_keys"],
             )
         changelog = None
         if artifact == "requirements":
@@ -380,6 +383,11 @@ class RequirementsPipeline:
         final_payload, final_warnings = self._repair_artifact_payload(
             artifact, final_payload, stage="apply"
         )
+        if artifact == "requirements":
+            write_json(
+                artifacts_dir / "requirements_apply_extracted_normalized.json",
+                final_payload,
+            )
 
         warnings = draft_warnings + final_warnings
         if warnings:
@@ -501,6 +509,11 @@ class RequirementsPipeline:
                     artifacts_dir / "requirements_quality_warnings.json",
                     {"warnings": self._requirements_quality_warnings},
                 )
+            if self._requirements_duplicates_debug:
+                write_json(
+                    artifacts_dir / "requirements_duplicates_debug.json",
+                    {"duplicates": self._requirements_duplicates_debug},
+                )
             write_json(artifacts_dir / "coverage_counts.json", coverage_counts)
         try:
             validate(instance=final_payload, schema=schema)
@@ -566,37 +579,117 @@ class RequirementsPipeline:
     def _extract_wrapped_json(
         self, raw_text: str, label: str, expected_keys: set[str]
     ) -> Dict:
-        payload = self._safe_extract_json(raw_text)
-        if isinstance(payload, dict) and label in payload and isinstance(payload[label], dict):
-            payload = payload[label]
-        if isinstance(payload, dict) and "requirements" not in payload:
-            if all(key in payload for key in ["id", "text", "priority"]):
-                payload = {
-                    "requirements": [payload],
+        attempts: List[str] = []
+        last_snippet = raw_text.strip().replace("\n", " ")
+
+        def snippet_for(text: str) -> str:
+            cleaned = text.strip().replace("\n", " ")
+            return (cleaned[:200] + "...") if len(cleaned) > 200 else cleaned
+
+        def handle_candidate(candidate: object, path: str, snippet: str) -> Dict | None:
+            attempts.append(path)
+            nonlocal last_snippet
+            last_snippet = snippet
+            if not isinstance(candidate, dict):
+                return None
+            if label in candidate:
+                wrapper_value = candidate[label]
+                if not isinstance(wrapper_value, dict):
+                    raise ValueError(
+                        f"{label} wrapper is not a JSON object. Path: {path}. "
+                        f"Snippet: {snippet}"
+                    )
+                missing_keys = expected_keys.difference(wrapper_value.keys())
+                if missing_keys:
+                    keys = ", ".join(sorted(wrapper_value.keys()))
+                    raise ValueError(
+                        f"{label} wrapper missing keys: {', '.join(sorted(missing_keys))}. "
+                        f"Found keys: {keys}. Path: {path}. Snippet: {snippet}"
+                    )
+                return wrapper_value
+            if expected_keys.issubset(candidate.keys()):
+                return candidate
+            return None
+
+        stripped = raw_text.strip()
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            parsed = None
+            attempts.append("direct-json (parse-failed)")
+        if parsed is not None:
+            candidate = handle_candidate(parsed, "direct-json", snippet_for(stripped))
+            if candidate is not None:
+                return candidate
+
+        attempts.append("largest-json")
+        largest = self._largest_json_object(raw_text)
+        if largest is not None:
+            candidate = handle_candidate(
+                largest["parsed"], "largest-json", snippet_for(largest["snippet"])
+            )
+            if candidate is not None:
+                return candidate
+
+        marker = f"{label}:"
+        if marker in raw_text:
+            attempts.append("marked-block")
+            try:
+                extracted = self._extract_marked_json(raw_text, marker, expected_keys)
+                return extracted
+            except ValueError as exc:
+                last_snippet = snippet_for(raw_text)
+                raise ValueError(
+                    f"{label} marked block extraction failed. Attempts: {', '.join(attempts)}. "
+                    f"Snippet: {last_snippet}. Error: {exc}"
+                ) from exc
+
+        if isinstance(parsed, dict) and "requirements" not in parsed:
+            if all(key in parsed for key in ["id", "text", "priority"]):
+                parsed = {
+                    "requirements": [parsed],
                     "assumptions": [],
                     "constraints": [],
                 }
                 if "REQUIREMENTS" in label:
                     self._requirements_shape_normalized = True
-        if isinstance(payload, list):
-            payload = {
-                "requirements": payload,
+        if isinstance(parsed, list):
+            parsed = {
+                "requirements": parsed,
                 "assumptions": [],
                 "constraints": [],
             }
             if "REQUIREMENTS" in label:
                 self._requirements_shape_normalized = True
-        if not isinstance(payload, dict):
-            snippet = raw_text.strip().replace("\n", " ")
-            snippet = (snippet[:200] + "...") if len(snippet) > 200 else snippet
-            raise ValueError(f"{label} payload must be a JSON object. Snippet: {snippet}")
-        missing = expected_keys.difference(payload.keys())
-        if missing:
-            keys = ", ".join(sorted(payload.keys()))
-            raise ValueError(
-                f"{label} missing keys: {', '.join(sorted(missing))}. Found keys: {keys}"
-            )
-        return payload
+        if isinstance(parsed, dict):
+            missing = expected_keys.difference(parsed.keys())
+            if not missing:
+                return parsed
+
+        raise ValueError(
+            f"{label} extraction failed. Attempts: {', '.join(attempts) or 'none'}. "
+            f"Snippet: {snippet_for(last_snippet)}"
+        )
+
+    def _largest_json_object(self, raw_text: str) -> Dict[str, object] | None:
+        decoder = json.JSONDecoder()
+        best: Dict[str, object] | None = None
+        idx = 0
+        while idx < len(raw_text):
+            start = self._find_next_json_start(raw_text, idx)
+            if start == -1:
+                break
+            try:
+                parsed, end = decoder.raw_decode(raw_text[start:])
+            except json.JSONDecodeError:
+                idx = start + 1
+                continue
+            snippet = raw_text[start : start + end]
+            if isinstance(parsed, dict):
+                if best is None or len(snippet) > len(str(best["snippet"])):
+                    best = {"parsed": parsed, "snippet": snippet}
+            idx = start + end
+        return best
 
     def _extract_wrapped_json_any(
         self, raw_text: str, labels: List[str], expected_keys: set[str]
@@ -1195,6 +1288,7 @@ class RequirementsPipeline:
                 )
                 break
             write_json(artifacts_dir / f"requirements_add_only_retry_{attempts}.json", additions)
+            write_json(artifacts_dir / f"add_only_attempt_{attempts}.json", additions)
             additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
             additions, filtered, reasons = self._filter_additions(
                 additions, self._out_of_scope_terms
@@ -1451,8 +1545,43 @@ class RequirementsPipeline:
             "assumptions": list(base.get("assumptions", [])),
             "constraints": list(base.get("constraints", [])),
         }
+        existing_ids = {
+            str(item.get("id")).strip()
+            for item in merged["requirements"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+        existing_texts = {
+            str(item.get("text", "")).strip().lower()
+            for item in merged["requirements"]
+            if isinstance(item, dict)
+        }
         for item in additions.get("requirements", []):
             if isinstance(item, dict):
+                item_id = item.get("id")
+                item_text = str(item.get("text", "")).strip()
+                normalized_text = item_text.lower()
+                if isinstance(item_id, str) and item_id in existing_ids:
+                    self._requirements_duplicates_debug.append(
+                        {
+                            "reason": "duplicate_id",
+                            "id": item_id,
+                            "text": item_text,
+                        }
+                    )
+                    continue
+                if normalized_text and normalized_text in existing_texts:
+                    self._requirements_duplicates_debug.append(
+                        {
+                            "reason": "duplicate_text",
+                            "id": item_id,
+                            "text": item_text,
+                        }
+                    )
+                    continue
+                if isinstance(item_id, str):
+                    existing_ids.add(item_id)
+                if normalized_text:
+                    existing_texts.add(normalized_text)
                 merged["requirements"].append(item)
         for item in additions.get("assumptions", []):
             if isinstance(item, str):
