@@ -184,6 +184,7 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._extraction_debug: List[Dict[str, object]] = []
         self._json_parse_repairs: List[Dict[str, object]] = []
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
@@ -217,6 +218,7 @@ class RequirementsPipeline:
         self._constraints_added = 0
         self._add_only_parse_failures = 0
         self._apply_format_retry_used = False
+        self._extraction_debug = []
         self._json_parse_repairs = []
         self._list_repair_counts = {
             "requirements": 0,
@@ -470,6 +472,24 @@ class RequirementsPipeline:
                     final_payload,
                 )
                 self._apply_format_retry_used = True
+            except ValueError:
+                truncation_detected = self._detect_truncation(apply_response.raw_text)
+                if truncation_detected:
+                    final_payload = self._format_fix_requirements(
+                        brief=brief,
+                        apply_raw=apply_response.raw_text,
+                        adapter=chatgpt,
+                        raw_dir=raw_dir,
+                        artifacts_dir=artifacts_dir,
+                        max_tokens=max_tokens,
+                        expected_keys=config["expected_keys"],
+                    )
+                    write_json(
+                        artifacts_dir / "requirements_apply_extracted_raw.json",
+                        final_payload,
+                    )
+                else:
+                    raise
         else:
             final_payload = self._extract_wrapped_json(
                 apply_response.raw_text,
@@ -636,6 +656,11 @@ class RequirementsPipeline:
                     artifacts_dir / "requirements_json_parse_repairs.json",
                     {"repairs": self._json_parse_repairs},
                 )
+            if self._extraction_debug:
+                write_json(
+                    artifacts_dir / "extraction_debug.json",
+                    {"events": self._extraction_debug},
+                )
             write_json(artifacts_dir / "coverage_counts.json", coverage_counts)
         try:
             validate(instance=final_payload, schema=schema)
@@ -703,10 +728,22 @@ class RequirementsPipeline:
     ) -> Dict:
         attempts: List[str] = []
         last_snippet = raw_text.strip().replace("\n", " ")
+        truncation_detected = self._detect_truncation(raw_text)
 
         def snippet_for(text: str) -> str:
             cleaned = text.strip().replace("\n", " ")
             return (cleaned[:200] + "...") if len(cleaned) > 200 else cleaned
+
+        def unwrap_wrapper(candidate: Dict) -> Dict | None:
+            if label in candidate and isinstance(candidate[label], dict):
+                return candidate[label]
+            lower_label = label.lower()
+            for key, value in candidate.items():
+                if isinstance(key, str) and key.lower() == lower_label and isinstance(value, dict):
+                    return value
+            if expected_keys.issubset(candidate.keys()):
+                return candidate
+            return None
 
         def handle_candidate(candidate: object, path: str, snippet: str) -> Dict | None:
             attempts.append(path)
@@ -719,13 +756,8 @@ class RequirementsPipeline:
                     f"{label} missing wrapper; found requirement object. Path: {path}. "
                     f"Snippet: {snippet}"
                 )
-            if label in candidate:
-                wrapper_value = candidate[label]
-                if not isinstance(wrapper_value, dict):
-                    raise ValueError(
-                        f"{label} wrapper is not a JSON object. Path: {path}. "
-                        f"Snippet: {snippet}"
-                    )
+            wrapper_value = unwrap_wrapper(candidate)
+            if wrapper_value is not None:
                 missing_keys = expected_keys.difference(wrapper_value.keys())
                 if missing_keys:
                     keys = ", ".join(sorted(wrapper_value.keys()))
@@ -734,45 +766,83 @@ class RequirementsPipeline:
                         f"Found keys: {keys}. Path: {path}. Snippet: {snippet}"
                     )
                 return wrapper_value
-            if expected_keys.issubset(candidate.keys()):
-                return candidate
             return None
 
+        parse_error: str | None = None
         parsed = None
-        try:
-            parsed = parse_json_loose(raw_text)
-            candidate = handle_candidate(parsed, "loose-json", snippet_for(raw_text))
-            if candidate is not None:
-                self._record_parse_repairs(context, parse_json_loose.last_repairs)
-                return candidate
-            self._record_parse_repairs(context, parse_json_loose.last_repairs)
-        except ValueError:
-            attempts.append("loose-json (parse-failed)")
 
-        extracted = self._extract_first_json_object(raw_text)
-        if extracted:
+        decoded = self._raw_decode_json_object(raw_text)
+        if decoded is not None:
+            candidate = handle_candidate(decoded, "raw-decode", snippet_for(raw_text))
+            if candidate is not None:
+                self._record_extraction_debug(
+                    context,
+                    "raw-decode",
+                    truncation_detected,
+                    None,
+                )
+                return candidate
+        else:
+            attempts.append("raw-decode (parse-failed)")
+
+        fenced = self._extract_fenced_json(raw_text)
+        if fenced is not None:
             try:
-                parsed = parse_json_loose(extracted)
-                candidate = handle_candidate(parsed, "balanced-json", snippet_for(extracted))
+                parsed = parse_json_loose(fenced)
+                candidate = handle_candidate(parsed, "fenced-json", snippet_for(fenced))
                 if candidate is not None:
                     self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    self._record_extraction_debug(
+                        context,
+                        "fenced-json",
+                        truncation_detected,
+                        None,
+                    )
                     return candidate
                 self._record_parse_repairs(context, parse_json_loose.last_repairs)
-            except ValueError:
-                attempts.append("balanced-json (parse-failed)")
-
-        marker = f"{label}:"
-        if marker in raw_text:
-            attempts.append("marked-block")
-            try:
-                extracted = self._extract_marked_json(raw_text, marker, expected_keys)
-                return extracted
             except ValueError as exc:
-                last_snippet = snippet_for(raw_text)
-                raise ValueError(
-                    f"{label} marked block extraction failed. Attempts: {', '.join(attempts)}. "
-                    f"Snippet: {last_snippet}. Error: {exc}"
-                ) from exc
+                parse_error = str(exc)
+                attempts.append("fenced-json (parse-failed)")
+
+        label_extracted = self._extract_json_after_label(raw_text, label)
+        if label_extracted is not None:
+            try:
+                parsed = parse_json_loose(label_extracted)
+                candidate = handle_candidate(parsed, "label-balanced", snippet_for(label_extracted))
+                if candidate is not None:
+                    self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    self._record_extraction_debug(
+                        context,
+                        "label-balanced",
+                        truncation_detected,
+                        None,
+                    )
+                    return candidate
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
+            except ValueError as exc:
+                parse_error = str(exc)
+                attempts.append("label-balanced (parse-failed)")
+
+        largest = self._largest_balanced_json(raw_text)
+        if largest is not None:
+            try:
+                parsed = parse_json_loose(largest)
+                candidate = handle_candidate(parsed, "largest-balanced", snippet_for(largest))
+                if candidate is not None:
+                    self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    self._record_extraction_debug(
+                        context,
+                        "largest-balanced",
+                        truncation_detected,
+                        None,
+                    )
+                    return candidate
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
+            except ValueError as exc:
+                parse_error = str(exc)
+                attempts.append("largest-balanced (parse-failed)")
+        else:
+            attempts.append("largest-balanced (none)")
 
         if isinstance(parsed, dict) and "requirements" not in parsed:
             if self._is_requirement_object(parsed):
@@ -780,19 +850,23 @@ class RequirementsPipeline:
                     f"{label} missing wrapper; found requirement object. "
                     f"Snippet: {snippet_for(last_snippet)}"
                 )
-        if isinstance(parsed, list):
-            parsed = {
-                "requirements": parsed,
-                "assumptions": [],
-                "constraints": [],
-            }
-            if "REQUIREMENTS" in label:
-                self._requirements_shape_normalized = True
         if isinstance(parsed, dict):
             missing = expected_keys.difference(parsed.keys())
             if not missing:
+                self._record_extraction_debug(
+                    context,
+                    "payload-direct",
+                    truncation_detected,
+                    None,
+                )
                 return parsed
 
+        self._record_extraction_debug(
+            context,
+            "failed",
+            truncation_detected,
+            parse_error,
+        )
         raise ValueError(
             f"{label} extraction failed. Attempts: {', '.join(attempts) or 'none'}. "
             f"Snippet: {snippet_for(last_snippet)}"
@@ -1339,6 +1413,34 @@ class RequirementsPipeline:
         )
         return extracted
 
+    def _format_fix_requirements(
+        self,
+        brief: str,
+        apply_raw: str,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+        expected_keys: set[str],
+    ) -> Dict:
+        retry_prompt = read_text(self.prompts_dir / "requirements_apply_format_fix.md")
+        retry_payload = {"brief": brief, "apply_raw": apply_raw}
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_apply_format_fix_prompt.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_apply_format_fix_raw.txt", response.raw_text)
+        self._write_usage(
+            raw_dir / "requirements_apply_format_fix_usage.json", response
+        )
+        extracted = self._extract_wrapped_json(
+            response.raw_text,
+            "FINAL_REQUIREMENTS_JSON",
+            expected_keys,
+            context="requirements_apply_format_fix",
+        )
+        return extracted
+
     def _out_of_scope_from_frontmatter(self, frontmatter: Dict) -> List[str]:
         if not isinstance(frontmatter, dict):
             return []
@@ -1374,6 +1476,24 @@ class RequirementsPipeline:
             return
         self._json_parse_repairs.append({"context": context, "repairs": repairs})
 
+    def _record_extraction_debug(
+        self,
+        context: str | None,
+        strategy: str,
+        truncation_detected: bool,
+        parse_error: str | None,
+    ) -> None:
+        if not context:
+            return
+        entry: Dict[str, object] = {
+            "context": context,
+            "strategy": strategy,
+            "truncation_detected": truncation_detected,
+        }
+        if parse_error:
+            entry["parse_error"] = parse_error[:200]
+        self._extraction_debug.append(entry)
+
     def _extract_first_json_object(self, text: str) -> str | None:
         start = text.find("{")
         if start == -1:
@@ -1400,6 +1520,72 @@ class RequirementsPipeline:
                 if depth == 0:
                     return text[start : idx + 1]
         return None
+
+    def _raw_decode_json_object(self, text: str) -> Dict | None:
+        start = text.find("{")
+        if start == -1:
+            return None
+        decoder = json.JSONDecoder()
+        try:
+            parsed, _ = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def _extract_fenced_json(self, text: str) -> str | None:
+        matches = list(re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE))
+        if not matches:
+            return None
+        return matches[0].group(1)
+
+    def _extract_json_after_label(self, text: str, label: str) -> str | None:
+        match = re.search(re.escape(label), text, re.IGNORECASE)
+        if not match:
+            return None
+        snippet = text[match.end():]
+        return self._extract_first_json_object(snippet)
+
+    def _largest_balanced_json(self, text: str) -> str | None:
+        objects: List[str] = []
+        idx = 0
+        while idx < len(text):
+            candidate = self._extract_first_json_object(text[idx:])
+            if not candidate:
+                break
+            objects.append(candidate)
+            idx += text[idx:].find(candidate) + len(candidate)
+        if not objects:
+            return None
+        return max(objects, key=len)
+
+    def _detect_truncation(self, text: str) -> bool:
+        stripped = text.rstrip()
+        if stripped and not stripped.endswith("}"):
+            return True
+        depth_brace = 0
+        depth_bracket = 0
+        in_string = False
+        escape = False
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "\"":
+                in_string = not in_string
+            if in_string:
+                continue
+            if ch == "{":
+                depth_brace += 1
+            elif ch == "}":
+                depth_brace -= 1
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                depth_bracket -= 1
+        return depth_brace != 0 or depth_bracket != 0
 
     def _low_quality_phrases(self) -> List[str]:
         return [

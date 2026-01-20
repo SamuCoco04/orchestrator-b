@@ -29,6 +29,8 @@ Format contract:
 - FINAL_DOMAIN_MODEL_JSON must include entities and relationships.
 - FINAL_MVP_SCOPE_JSON must include in_scope and out_of_scope.
 - FINAL_MVP_SCOPE_JSON.milestones must be an array of objects with {name, description}.
+- Output ONE JSON object only (no markdown).
+- If output is long, MINIFY JSON (no extra whitespace) to stay within token limits.
 
 Example requirements array:
 [

@@ -28,6 +28,7 @@ Format contract:
 - Output ONE JSON object only (no markdown).
 - Must include top-level key FINAL_REQUIREMENTS_JSON with keys: requirements, assumptions, constraints.
 - Never output a single requirement object.
+- If output is long, MINIFY JSON (no extra whitespace) to stay within token limits.
 
 Rules:
 - Apply Gemini critique to remove ambiguity, add missing detail, and cover edge cases.
