@@ -186,6 +186,8 @@ class RequirementsPipeline:
         self._apply_format_retry_used = False
         self._gemini_review_present = False
         self._gemini_review_used = False
+        self._gemini_final_review_used = False
+        self._post_review_add_only_used = False
         self._extraction_debug: List[Dict[str, object]] = []
         self._json_parse_repairs: List[Dict[str, object]] = []
         self._list_repair_counts: Dict[str, int] = {
@@ -222,6 +224,8 @@ class RequirementsPipeline:
         self._apply_format_retry_used = False
         self._gemini_review_present = False
         self._gemini_review_used = False
+        self._gemini_final_review_used = False
+        self._post_review_add_only_used = False
         self._extraction_debug = []
         self._json_parse_repairs = []
         self._list_repair_counts = {
@@ -390,9 +394,13 @@ class RequirementsPipeline:
             config["expected_keys"],
             context=f"{artifact}_draft",
         )
+        if artifact == "requirements":
+            write_json(artifacts_dir / "requirements_draft_extracted.json", draft_payload)
         draft_payload, draft_warnings = self._repair_artifact_payload(
             artifact, draft_payload, stage="draft"
         )
+        if artifact == "requirements":
+            write_json(artifacts_dir / "requirements_draft_normalized.json", draft_payload)
 
         if artifact == "requirements":
             cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
@@ -413,10 +421,16 @@ class RequirementsPipeline:
         self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
         cross_review = self._safe_extract_json(cross_response.raw_text)
         if artifact == "requirements":
+            write_json(
+                artifacts_dir / "requirements_cross_review_extracted.json", cross_review
+            )
             cross_review = self._validate_requirements_review(
                 cross_review, draft_payload, limits
             )
             write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
+            write_json(
+                artifacts_dir / "requirements_cross_review_normalized.json", cross_review
+            )
             self._gemini_review_present = True
 
         apply_template = read_text(self.prompts_dir / config["apply_prompt"])
@@ -573,7 +587,7 @@ class RequirementsPipeline:
         schema = self._load_schema(config["schema"])
         if artifact == "requirements":
             final_payload, filtered_out, quality_warnings = self._apply_quality_gate(
-                final_payload, limits, remove_items=False
+                final_payload, limits
             )
             if filtered_out:
                 self._requirements_filtered_out.extend(filtered_out)
@@ -607,6 +621,8 @@ class RequirementsPipeline:
                 max_tokens=max_tokens,
             )
             count_after_add_only = len(final_payload.get("requirements", []))
+            missing_before_add_only = max(limits.req_min - count_before_add_only, 0)
+            missing_after_add_only = max(limits.req_min - count_after_add_only, 0)
             final_payload, expand_generic_attempts = self._expand_generic_requirements(
                 brief=brief,
                 limits=limits,
@@ -625,15 +641,31 @@ class RequirementsPipeline:
                 artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
             )
+            assumptions_fixed = assumptions_added > 0
+            constraints_fixed = constraints_added > 0
             self._assumptions_added += assumptions_added
             self._constraints_added += constraints_added
             final_payload, filtered_out, quality_warnings = self._apply_quality_gate(
-                final_payload, limits
+                final_payload, limits, remove_items=False
             )
             if filtered_out:
                 self._requirements_filtered_out.extend(filtered_out)
             if quality_warnings:
                 self._requirements_quality_warnings.extend(quality_warnings)
+            final_payload, self._post_review_add_only_used = self._run_final_review_add_only(
+                brief=brief,
+                limits=limits,
+                payload=final_payload,
+                adapter=chatgpt,
+                gemini_adapter=gemini,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=max_tokens,
+                attempt_offset=add_only_attempts,
+            )
+            total_add_only_attempts = add_only_attempts + (
+                1 if self._post_review_add_only_used else 0
+            )
             balance_results = self._balance_check(final_payload, limits)
             self._requirements_balance_results = balance_results
             final_payload, id_normalized, id_map, changelog = self._normalize_requirement_ids(
@@ -653,6 +685,9 @@ class RequirementsPipeline:
                     "constraints_count": len(final_payload.get("constraints", [])),
                     "missing_coverage_areas": missing_coverage_areas,
                     "add_only_attempts": add_only_attempts,
+                    "total_add_only_attempts": total_add_only_attempts,
+                    "missing_before_add_only": missing_before_add_only,
+                    "missing_after_add_only": missing_after_add_only,
                     "count_before_add_only": count_before_add_only,
                     "count_after_add_only": count_after_add_only,
                     "add_only_chunk_size": None,
@@ -664,14 +699,21 @@ class RequirementsPipeline:
                     "requirements_shape_normalized": self._requirements_shape_normalized,
                     "filtered_out_count": len(self._requirements_filtered_out),
                     "filler_filtered_count": len(self._requirements_filler_filtered),
+                    "dedupe_count": len(self._requirements_duplicates_debug),
                     "balance_check_results": balance_results,
                     "coverage_counts": coverage_counts,
                     "coverage_fix_used": self._coverage_fix_used,
                     "assumptions_added": self._assumptions_added,
                     "constraints_added": self._constraints_added,
+                    "assumptions_fixed": assumptions_fixed,
+                    "constraints_fixed": constraints_fixed,
                     "apply_format_retry_used": self._apply_format_retry_used,
                     "gemini_review_present": self._gemini_review_present,
                     "gemini_review_used": self._gemini_review_used,
+                    "gemini_final_review_used": self._gemini_final_review_used,
+                    "post_review_add_only_used": self._post_review_add_only_used,
+                    "min_enforcement_unmet": len(final_payload.get("requirements", []))
+                    < limits.req_min,
                     "wrapper_repairs_applied": bool(
                         self._apply_format_retry_used or self._json_parse_repairs
                     ),
@@ -799,6 +841,20 @@ class RequirementsPipeline:
             if not isinstance(candidate, dict):
                 return None
             if self._is_requirement_object(candidate) and label not in candidate:
+                if expected_keys == {"requirements", "assumptions", "constraints"}:
+                    wrapped = {
+                        "requirements": [candidate],
+                        "assumptions": [],
+                        "constraints": [],
+                    }
+                    self._requirements_warnings.append(
+                        {
+                            "stage": "extract",
+                            "note": "Single requirement object returned; wrapped into requirements.",
+                            "path": path,
+                        }
+                    )
+                    return wrapped
                 raise RequirementsFormatError(
                     f"{label} missing wrapper; found requirement object. Path: {path}. "
                     f"Snippet: {snippet}"
@@ -893,6 +949,26 @@ class RequirementsPipeline:
                 parse_error = str(exc)
                 attempts.append("label-marker (parse-failed)")
 
+        between_braces = self._extract_between_braces(raw_text)
+        if between_braces is not None:
+            try:
+                parsed = parse_json_loose(between_braces)
+                candidate = handle_candidate(parsed, "between-braces", snippet_for(between_braces))
+                if candidate is not None:
+                    self._record_parse_repairs(context, parse_json_loose.last_repairs)
+                    self._record_extraction_debug(
+                        context,
+                        "between-braces",
+                        truncation_detected,
+                        None,
+                        debug_enabled,
+                    )
+                    return candidate
+                self._record_parse_repairs(context, parse_json_loose.last_repairs)
+            except ValueError as exc:
+                parse_error = str(exc)
+                attempts.append("between-braces (parse-failed)")
+
         largest = self._largest_balanced_json(raw_text)
         if largest is not None:
             try:
@@ -917,10 +993,11 @@ class RequirementsPipeline:
 
         if isinstance(parsed, dict) and "requirements" not in parsed:
             if self._is_requirement_object(parsed):
-                raise RequirementsFormatError(
-                    f"{label} missing wrapper; found requirement object. "
-                    f"Snippet: {snippet_for(last_snippet)}"
-                )
+                return {
+                    "requirements": [parsed],
+                    "assumptions": [],
+                    "constraints": [],
+                }
         if isinstance(parsed, dict):
             missing = expected_keys.difference(parsed.keys())
             if not missing:
@@ -940,8 +1017,10 @@ class RequirementsPipeline:
             parse_error,
             debug_enabled,
         )
+        context_label = context or "unknown"
         raise ValueError(
-            f"{label} extraction failed. Attempts: {', '.join(attempts) or 'none'}. "
+            f"{label} extraction failed for {context_label}. "
+            f"Attempts: {', '.join(attempts) or 'none'}. "
             f"Snippet: {snippet_for(last_snippet)}"
         )
 
@@ -1371,7 +1450,15 @@ class RequirementsPipeline:
             artifacts_dir / f"requirements_add_only_attempt_{attempt}.json",
             additions,
         )
+        write_json(
+            artifacts_dir / f"requirements_add_only_attempt_{attempt}_extracted.json",
+            additions,
+        )
         additions, _ = self._repair_artifact_payload("requirements", additions, stage="add_only")
+        write_json(
+            artifacts_dir / f"requirements_add_only_attempt_{attempt}_normalized.json",
+            additions,
+        )
         additions, filtered, reasons = self._filter_additions(additions, self._out_of_scope_terms)
         attempt_warnings: List[Dict[str, object]] = []
         if filtered:
@@ -1396,6 +1483,17 @@ class RequirementsPipeline:
                 [{"stage": "quality_gate", "warning": warning} for warning in quality_warnings]
             )
         payload = self._merge_requirements_additions(payload, additions)
+        payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
+        if filtered_out:
+            self._requirements_filtered_out.extend(filtered_out)
+            attempt_warnings.extend(
+                [{"stage": "quality_gate_post_merge", "item": item} for item in filtered_out]
+            )
+        if quality_warnings:
+            self._requirements_quality_warnings.extend(quality_warnings)
+            attempt_warnings.extend(
+                [{"stage": "quality_gate_post_merge", "warning": warning} for warning in quality_warnings]
+            )
         missing_coverage = self._missing_coverage_areas(payload, limits)
         balance_results = self._balance_check(payload, limits)
         self._requirements_balance_results = balance_results
@@ -1430,7 +1528,7 @@ class RequirementsPipeline:
         try:
             return self._extract_wrapped_json_any(
                 raw_text,
-                ["FINAL_REQUIREMENTS_JSON"],
+                ["REQUIREMENTS_JSON"],
                 {"requirements", "assumptions", "constraints"},
             )
         except ValueError as exc:
@@ -1485,7 +1583,7 @@ class RequirementsPipeline:
             try:
                 return self._extract_wrapped_json_any(
                     retry_response.raw_text,
-                    ["FINAL_REQUIREMENTS_JSON"],
+                    ["REQUIREMENTS_JSON"],
                     {"requirements", "assumptions", "constraints"},
                 )
             except ValueError as retry_exc:
@@ -1667,6 +1765,13 @@ class RequirementsPipeline:
             return None
         snippet = text[match.end():]
         return self._extract_first_json_object(snippet)
+
+    def _extract_between_braces(self, text: str) -> str | None:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        return text[start : end + 1]
 
     def _largest_balanced_json(self, text: str) -> str | None:
         objects: List[str] = []
@@ -1937,6 +2042,65 @@ class RequirementsPipeline:
             )
         return payload, missing_coverage, attempts, balance_results, requested_counts
 
+    def _run_final_review_add_only(
+        self,
+        brief: str,
+        limits: RequirementsLimits,
+        payload: Dict,
+        adapter: LLMAdapter,
+        gemini_adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+        attempt_offset: int,
+    ) -> tuple[Dict, bool]:
+        prompt = read_text(self.prompts_dir / "requirements_gemini_final_review.md")
+        review_payload = {
+            "brief": brief,
+            "requirements": payload,
+            "targets": self._requirements_targets_payload(limits),
+        }
+        full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(review_payload)}\n"
+        write_text(raw_dir / "requirements_final_review_prompt.txt", full_prompt)
+        response = gemini_adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_final_review_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / "requirements_final_review_usage.json", response)
+        extracted = self._safe_extract_json(response.raw_text)
+        write_json(artifacts_dir / "requirements_final_review_extracted.json", extracted)
+        normalized = self._normalize_final_review(extracted)
+        write_json(artifacts_dir / "requirements_final_review_normalized.json", normalized)
+        self._gemini_final_review_used = True
+
+        missing_n = max(limits.req_min - len(payload.get("requirements", [])), 0)
+        missing_areas = normalized.get("missing_areas", [])
+        if not missing_n and not missing_areas:
+            return payload, False
+        generate_count = missing_n if missing_n > 0 else max(1, len(missing_areas))
+        if limits.req_max is not None:
+            remaining = max(limits.req_max - len(payload.get("requirements", [])), 0)
+            generate_count = min(generate_count, remaining)
+        if generate_count <= 0:
+            self._requirements_warnings.append(
+                {
+                    "stage": "final_review_add_only",
+                    "note": "Skipping add-only due to max requirement limit.",
+                }
+            )
+            return payload, False
+        payload, _, _ = self._run_add_only_attempt(
+            brief=brief,
+            limits=limits,
+            payload=payload,
+            adapter=adapter,
+            gemini_review=normalized,
+            raw_dir=raw_dir,
+            artifacts_dir=artifacts_dir,
+            max_tokens=max_tokens,
+            attempt=attempt_offset + 1,
+            generate_count=generate_count,
+        )
+        return payload, True
+
     def _fallback_requirements(self, missing_count: int, limits: RequirementsLimits) -> List[Dict]:
         placeholders: List[Dict] = []
         areas = limits.coverage_areas or ["General"]
@@ -1950,6 +2114,18 @@ class RequirementsPipeline:
                 }
             )
         return placeholders
+
+    def _normalize_final_review(self, review: Dict) -> Dict[str, List[str]]:
+        def normalize_list(value: object) -> List[str]:
+            if not isinstance(value, list):
+                return []
+            return [str(item).strip() for item in value if str(item).strip()]
+
+        return {
+            "missing_areas": normalize_list(review.get("missing_areas")),
+            "duplicate_candidates": normalize_list(review.get("duplicate_candidates")),
+            "top_ambiguities": normalize_list(review.get("top_ambiguities")),
+        }
 
     def _add_assumptions_constraints(
         self,
@@ -1971,7 +2147,7 @@ class RequirementsPipeline:
             "Add ONLY assumptions and constraints to meet the missing counts. "
             "Do NOT add or rewrite requirements. "
             "Return a SINGLE JSON object with wrapper:\n"
-            '{\n  "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}\n}\n'
+            '{\n  "REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}\n}\n'
             "Rules:\n"
             "- Generate EXACTLY missing_assumptions assumptions and EXACTLY missing_constraints constraints.\n"
             "- Each assumption/constraint must be concise and testable.\n"
@@ -1996,7 +2172,7 @@ class RequirementsPipeline:
         try:
             additions = self._extract_wrapped_json_any(
                 response.raw_text,
-                ["FINAL_REQUIREMENTS_JSON"],
+                ["REQUIREMENTS_JSON"],
                 {"requirements", "assumptions", "constraints"},
             )
         except ValueError as exc:
@@ -2217,74 +2393,20 @@ class RequirementsPipeline:
         if not isinstance(items, list):
             return payload, False, [], changelog
         normalized = False
-        used_ids: set[str] = set()
         id_map: List[Dict[str, str]] = []
-        sequence = 1
-
-        def next_id() -> str:
-            nonlocal sequence
-            while True:
-                candidate = f"REQ-{sequence:03d}"
-                sequence += 1
-                if candidate not in used_ids:
-                    used_ids.add(candidate)
-                    return candidate
-
-        indexed_items: List[Tuple[int, Dict]] = [
-            (index, item) for index, item in enumerate(items) if isinstance(item, dict)
-        ]
-        def sort_key(entry: Tuple[int, Dict]) -> Tuple[int, int]:
-            index, item = entry
-            current_id = item.get("id")
-            if isinstance(current_id, str):
-                match = re.match(r"REQ-(\d+)", current_id.strip(), re.IGNORECASE)
-                if match:
-                    return (0, int(match.group(1)))
-            return (1, index)
-
         normalized_items: List[Dict] = []
-        for _, item in sorted(indexed_items, key=sort_key):
+        sequence = 1
+        for item in items:
             if not isinstance(item, dict):
                 continue
             current_id = item.get("id")
-            needs_new = False
-            if not isinstance(current_id, str):
-                needs_new = True
-            if current_id is None:
-                needs_new = True
-            elif isinstance(current_id, int):
-                needs_new = True
-            elif isinstance(current_id, str):
-                if current_id.strip().isdigit():
-                    needs_new = True
-                elif current_id in used_ids:
-                    needs_new = True
-            else:
-                needs_new = True
-
-            if needs_new:
-                new_id = next_id()
+            new_id = f"REQ-{sequence:03d}"
+            sequence += 1
+            if current_id != new_id:
                 id_map.append({"from": str(current_id), "to": new_id})
-                item["id"] = new_id
                 normalized = True
-            else:
-                used_ids.add(current_id)
+            item["id"] = new_id
             normalized_items.append(item)
-
-        payload["requirements"] = normalized_items
-        sequential_ids = [item.get("id") for item in normalized_items if isinstance(item, dict)]
-        if sequential_ids:
-            expected = [f"REQ-{i:03d}" for i in range(1, len(sequential_ids) + 1)]
-            if sequential_ids != expected:
-                normalized = True
-                id_map.extend(
-                    [
-                        {"from": str(old_id), "to": new_id}
-                        for old_id, new_id in zip(sequential_ids, expected)
-                    ]
-                )
-                for item, new_id in zip(normalized_items, expected):
-                    item["id"] = new_id
         payload["requirements"] = normalized_items
         if id_map and changelog is not None:
             changelog = self._rewrite_changelog_ids(changelog, id_map)
@@ -2347,6 +2469,9 @@ class RequirementsPipeline:
             constraints_count = summary.get("constraints_count")
             missing_coverage = summary.get("missing_coverage_areas", [])
             add_only_attempts = summary.get("add_only_attempts")
+            total_add_only_attempts = summary.get("total_add_only_attempts")
+            missing_before_add_only = summary.get("missing_before_add_only")
+            missing_after_add_only = summary.get("missing_after_add_only")
             count_before_add_only = summary.get("count_before_add_only")
             count_after_add_only = summary.get("count_after_add_only")
             add_only_chunk_size = summary.get("add_only_chunk_size")
@@ -2358,15 +2483,21 @@ class RequirementsPipeline:
             shape_normalized = summary.get("requirements_shape_normalized")
             filtered_out_count = summary.get("filtered_out_count")
             filler_filtered_count = summary.get("filler_filtered_count")
+            dedupe_count = summary.get("dedupe_count")
             balance_results = summary.get("balance_check_results", {})
             coverage_fix_used = summary.get("coverage_fix_used")
             assumptions_added = summary.get("assumptions_added")
             constraints_added = summary.get("constraints_added")
+            assumptions_fixed = summary.get("assumptions_fixed")
+            constraints_fixed = summary.get("constraints_fixed")
             apply_format_retry_used = summary.get("apply_format_retry_used")
             coverage_counts = summary.get("coverage_counts", {})
             wrapper_repairs_applied = summary.get("wrapper_repairs_applied")
             gemini_review_present = summary.get("gemini_review_present")
             gemini_review_used = summary.get("gemini_review_used")
+            gemini_final_review_used = summary.get("gemini_final_review_used")
+            post_review_add_only_used = summary.get("post_review_add_only_used")
+            min_enforcement_unmet = summary.get("min_enforcement_unmet")
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
@@ -2384,6 +2515,12 @@ class RequirementsPipeline:
                 )
                 lines.append(f"- coverage_counts: {counts_str}")
             lines.append(f"- add_only_attempts: {add_only_attempts}")
+            if total_add_only_attempts is not None:
+                lines.append(f"- total_add_only_attempts: {total_add_only_attempts}")
+            if missing_before_add_only is not None:
+                lines.append(f"- missing_before_add_only: {missing_before_add_only}")
+            if missing_after_add_only is not None:
+                lines.append(f"- missing_after_add_only: {missing_after_add_only}")
             if count_before_add_only is not None:
                 lines.append(f"- count_before_add_only: {count_before_add_only}")
             if count_after_add_only is not None:
@@ -2406,12 +2543,18 @@ class RequirementsPipeline:
                 lines.append(f"- filtered_out_count: {filtered_out_count}")
             if filler_filtered_count is not None:
                 lines.append(f"- filler_filtered_count: {filler_filtered_count}")
+            if dedupe_count is not None:
+                lines.append(f"- dedupe_count: {dedupe_count}")
             if coverage_fix_used is not None:
                 lines.append(f"- coverage_fix_used: {'yes' if coverage_fix_used else 'no'}")
             if assumptions_added is not None:
                 lines.append(f"- assumptions_added: {assumptions_added}")
             if constraints_added is not None:
                 lines.append(f"- constraints_added: {constraints_added}")
+            if assumptions_fixed is not None:
+                lines.append(f"- assumptions_fixed: {'yes' if assumptions_fixed else 'no'}")
+            if constraints_fixed is not None:
+                lines.append(f"- constraints_fixed: {'yes' if constraints_fixed else 'no'}")
             if apply_format_retry_used is not None:
                 lines.append(
                     f"- apply_format_retry_used: {'yes' if apply_format_retry_used else 'no'}"
@@ -2428,6 +2571,19 @@ class RequirementsPipeline:
                 lines.append(
                     f"- gemini_review_used: {'yes' if gemini_review_used else 'no'}"
                 )
+            if gemini_final_review_used is not None:
+                lines.append(
+                    f"- gemini_final_review_used: {'yes' if gemini_final_review_used else 'no'}"
+                )
+            if post_review_add_only_used is not None:
+                lines.append(
+                    f"- post_review_add_only_used: {'yes' if post_review_add_only_used else 'no'}"
+                )
+            if min_enforcement_unmet is not None:
+                if min_enforcement_unmet:
+                    lines.append("- minimum_enforcement: unmet (retries exhausted)")
+                else:
+                    lines.append("- minimum_enforcement: met")
             if isinstance(balance_results, dict) and balance_results:
                 counts = balance_results.get("counts", {})
                 missing = balance_results.get("missing", {})

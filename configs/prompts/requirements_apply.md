@@ -13,7 +13,9 @@ Input includes: brief, draft requirements, and Gemini cross-review JSON.
 You MUST implement every item in required_actions. If required_actions includes add_requirements with a count, you MUST add exactly that many requirements.
 Ensure requirements are atomic and testable.
 
-Return a SINGLE JSON object (no markdown, no commentary):
+Before the JSON, include a short "APPLIED_CHANGES" list (plain text, 3-8 bullets) describing what you changed.
+
+Then return a SINGLE JSON object (no markdown, no commentary):
 {
   "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]},
   "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]},
