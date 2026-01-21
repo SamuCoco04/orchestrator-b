@@ -125,6 +125,8 @@ class RequirementsLimits:
     seed_requirements: List[str]
     requested_artifacts: List[str]
     artifact_token_budgets: Dict[str, int]
+    lead_token_budgets: Dict[str, int]
+    apply_token_budgets: Dict[str, int]
 
 
 class RequirementsPipeline:
@@ -359,6 +361,30 @@ class RequirementsPipeline:
             return value
         return default_budget
 
+    def _stage_max_tokens(
+        self, limits: RequirementsLimits, artifact: str, stage: str, default_budget: int
+    ) -> int:
+        if stage == "lead":
+            value = limits.lead_token_budgets.get(artifact, default_budget)
+        elif stage == "apply":
+            value = limits.apply_token_budgets.get(artifact, default_budget)
+        else:
+            value = default_budget
+        try:
+            max_value = int(value)
+        except (TypeError, ValueError):
+            max_value = default_budget
+        cap_raw = self._env("ORCH_MAX_OUTPUT_TOKENS", "")
+        cap_value: int | None = None
+        if isinstance(cap_raw, str) and cap_raw.strip():
+            try:
+                cap_value = int(cap_raw)
+            except (TypeError, ValueError):
+                cap_value = None
+        if cap_value and cap_value > 0:
+            return min(max_value, cap_value)
+        return max_value
+
     @contextmanager
     def _with_max_output_tokens(self, max_tokens: int) -> None:
         original = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
@@ -382,7 +408,9 @@ class RequirementsPipeline:
         artifacts_dir: Path,
     ) -> tuple[Dict, List[Dict], int, List[str], List[LLMResponse], Dict]:
         config = self._artifact_configs()[artifact]
-        max_tokens = self._artifact_token_budget(artifact, limits)
+        base_budget = self._artifact_token_budget(artifact, limits)
+        lead_tokens = self._stage_max_tokens(limits, artifact, "lead", base_budget)
+        apply_tokens = self._stage_max_tokens(limits, artifact, "apply", base_budget)
         responses: List[LLMResponse] = []
         summary: Dict[str, object] = {}
 
@@ -391,7 +419,7 @@ class RequirementsPipeline:
         lead_payload = {"brief": brief}
         lead_full_prompt = f"{lead_prompt}\n\nINPUT:\n{json.dumps(lead_payload)}\n"
         write_text(raw_dir / f"{artifact}_draft_prompt.txt", lead_full_prompt)
-        with self._with_max_output_tokens(max_tokens):
+        with self._with_max_output_tokens(lead_tokens):
             lead_response = chatgpt.complete(lead_full_prompt)
         responses.append(lead_response)
         write_text(raw_dir / f"{artifact}_draft_raw.txt", lead_response.raw_text)
@@ -477,7 +505,7 @@ class RequirementsPipeline:
             self._gemini_review_used = True
         apply_full_prompt = f"{apply_prompt}{apply_instruction}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
         write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
-        with self._with_max_output_tokens(max_tokens):
+        with self._with_max_output_tokens(apply_tokens):
             apply_response = chatgpt.complete(apply_full_prompt)
         responses.append(apply_response)
         write_text(raw_dir / f"{artifact}_apply_raw.txt", apply_response.raw_text)
@@ -503,7 +531,7 @@ class RequirementsPipeline:
                     adapter=chatgpt,
                     raw_dir=raw_dir,
                     artifacts_dir=artifacts_dir,
-                    max_tokens=max_tokens,
+                    max_tokens=apply_tokens,
                     expected_keys=config["expected_keys"],
                 )
                 write_json(
@@ -520,7 +548,7 @@ class RequirementsPipeline:
                         adapter=chatgpt,
                         raw_dir=raw_dir,
                         artifacts_dir=artifacts_dir,
-                        max_tokens=max_tokens,
+                        max_tokens=apply_tokens,
                         expected_keys=config["expected_keys"],
                     )
                     write_json(
@@ -591,9 +619,7 @@ class RequirementsPipeline:
                 final_payload,
             )
             apply_report_errors: List[str] = []
-            if apply_report is None:
-                apply_report_errors.append("Missing APPLY_REPORT_JSON.")
-            else:
+            if apply_report is not None:
                 apply_report_errors = self._validate_apply_report(
                     apply_report,
                     final_payload,
@@ -610,7 +636,7 @@ class RequirementsPipeline:
                     adapter=chatgpt,
                     raw_dir=raw_dir,
                     artifacts_dir=artifacts_dir,
-                    max_tokens=max_tokens,
+                    max_tokens=apply_tokens,
                     expected_keys=config["expected_keys"],
                 )
 
@@ -662,7 +688,7 @@ class RequirementsPipeline:
                 gemini_review=cross_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
-                max_tokens=max_tokens,
+                max_tokens=apply_tokens,
             )
             count_after_add_only = len(final_payload.get("requirements", []))
             missing_before_add_only = max(limits.req_min - count_before_add_only, 0)
@@ -674,7 +700,7 @@ class RequirementsPipeline:
                 adapter=chatgpt,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
-                max_tokens=max_tokens,
+                max_tokens=apply_tokens,
             )
             final_payload, assumptions_added, constraints_added = self._add_assumptions_constraints(
                 brief=brief,
@@ -683,7 +709,7 @@ class RequirementsPipeline:
                 adapter=chatgpt,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
-                max_tokens=max_tokens,
+                max_tokens=apply_tokens,
             )
             assumptions_fixed = assumptions_added > 0
             constraints_fixed = constraints_added > 0
@@ -705,7 +731,7 @@ class RequirementsPipeline:
                 cross_review=cross_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
-                max_tokens=max_tokens,
+                max_tokens=apply_tokens,
                 attempt_offset=add_only_attempts,
             )
             total_add_only_attempts = add_only_attempts + (
@@ -723,6 +749,8 @@ class RequirementsPipeline:
             coverage_counts = self._coverage_counts(final_payload, limits)
             summary.update(
                 {
+                    "lead_max_output_tokens": lead_tokens,
+                    "apply_max_output_tokens": apply_tokens,
                     "initial_count": count_before_add_only,
                     "target_min_items": limits.req_min,
                     "actual_count": len(final_payload.get("requirements", [])),
@@ -816,7 +844,7 @@ class RequirementsPipeline:
                 f"{json.dumps(retry_payload)}\n"
             )
             write_text(raw_dir / f"{artifact}_apply_retry_prompt.txt", retry_full_prompt)
-            with self._with_max_output_tokens(max_tokens):
+            with self._with_max_output_tokens(apply_tokens):
                 retry_response = chatgpt.complete(retry_full_prompt)
             responses.append(retry_response)
             write_text(raw_dir / f"{artifact}_apply_retry_raw.txt", retry_response.raw_text)
@@ -1157,6 +1185,13 @@ class RequirementsPipeline:
             write_json(artifacts_dir / f"requirements_apply_report_{stage}.json", report)
             return report
         except ValueError as exc:
+            self._record_apply_report_missing(
+                artifacts_dir=artifacts_dir,
+                stage=stage,
+                artifact="requirements",
+                raw_text=raw_text,
+                reason=str(exc),
+            )
             self._requirements_warnings.append(
                 {
                     "stage": stage,
@@ -1165,6 +1200,27 @@ class RequirementsPipeline:
                 }
             )
             return None
+
+    def _record_apply_report_missing(
+        self,
+        artifacts_dir: Path,
+        stage: str,
+        artifact: str,
+        raw_text: str,
+        reason: str,
+    ) -> None:
+        snippet = raw_text.strip().replace("\n", " ")
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        write_json(
+            artifacts_dir / "apply_report_missing_warning.json",
+            {
+                "stage": stage,
+                "artifact": artifact,
+                "reason": reason,
+                "snippet": snippet,
+            },
+        )
 
     def _validate_apply_report(
         self, report: Dict, payload: Dict, required_actions: List[Dict]
@@ -1265,7 +1321,14 @@ class RequirementsPipeline:
             response.raw_text, artifacts_dir, stage="apply_retry_actions"
         )
         if report is None:
-            raise RuntimeError("APPLY_REPORT_JSON missing in apply retry.")
+            self._record_apply_report_missing(
+                artifacts_dir=artifacts_dir,
+                stage="apply_retry_actions",
+                artifact="requirements",
+                raw_text=response.raw_text,
+                reason="APPLY_REPORT_JSON missing in apply retry.",
+            )
+            return retry_payload_json, {}
         report_errors = self._validate_apply_report(
             report, retry_payload_json, cross_review.get("required_actions", [])
         )
@@ -2789,6 +2852,8 @@ class RequirementsPipeline:
             actual_count = summary.get("actual_count")
             assumptions_count = summary.get("assumptions_count")
             constraints_count = summary.get("constraints_count")
+            lead_max_tokens = summary.get("lead_max_output_tokens")
+            apply_max_tokens = summary.get("apply_max_output_tokens")
             missing_coverage = summary.get("missing_coverage_areas", [])
             add_only_attempts = summary.get("add_only_attempts")
             total_add_only_attempts = summary.get("total_add_only_attempts")
@@ -2826,6 +2891,10 @@ class RequirementsPipeline:
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
+            if lead_max_tokens is not None:
+                lines.append(f"- lead_max_output_tokens: {lead_max_tokens}")
+            if apply_max_tokens is not None:
+                lines.append(f"- apply_max_output_tokens: {apply_max_tokens}")
             if assumptions_count is not None:
                 lines.append(f"- assumptions_count: {assumptions_count}")
             if constraints_count is not None:
@@ -5004,6 +5073,25 @@ class RequirementsPipeline:
                 artifact_token_budgets[key] = int(raw_value) if raw_value is not None else default_value
             except (TypeError, ValueError):
                 artifact_token_budgets[key] = default_value
+        token_budgets = frontmatter.get("token_budgets", {})
+        if not isinstance(token_budgets, dict):
+            token_budgets = {}
+        lead_token_budgets: Dict[str, int] = {}
+        apply_token_budgets: Dict[str, int] = {}
+        for key, default_value in artifact_token_budgets.items():
+            stage_budget = token_budgets.get(key, {})
+            if not isinstance(stage_budget, dict):
+                stage_budget = {}
+            lead_value = stage_budget.get("lead_max_output_tokens")
+            apply_value = stage_budget.get("apply_max_output_tokens")
+            try:
+                lead_token_budgets[key] = int(lead_value) if lead_value is not None else default_value
+            except (TypeError, ValueError):
+                lead_token_budgets[key] = default_value
+            try:
+                apply_token_budgets[key] = int(apply_value) if apply_value is not None else default_value
+            except (TypeError, ValueError):
+                apply_token_budgets[key] = default_value
         min_assumptions = targets.get(
             "min_assumptions",
             targets.get(
@@ -5102,6 +5190,8 @@ class RequirementsPipeline:
             seed_requirements=seed_requirements,
             requested_artifacts=requested_list,
             artifact_token_budgets=artifact_token_budgets,
+            lead_token_budgets=lead_token_budgets,
+            apply_token_budgets=apply_token_budgets,
         )
 
     def _limits_payload(self, limits: RequirementsLimits) -> Dict:
