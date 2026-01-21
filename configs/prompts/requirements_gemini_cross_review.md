@@ -11,20 +11,17 @@ Targets from brief:
 You must:
 - Compute per-area counts using the draft requirements and coverage_areas (case-insensitive).
 - Identify missing coverage areas and list them in missing_areas.
-- Identify overlapping/duplicate topics and list them in duplication_suspects.
-- Identify generic requirements and list them in too_generic with reason only.
-- Identify domain-specific gaps and list them in domain_missing.
-- required_actions MUST include explicit tasks for every gap found above.
+- Identify blocking issues as plain strings in blocking_issues.
+- Identify weak requirements (umbrella or non-testable) in weak_requirements by ID.
+- required_actions MUST include explicit tasks for every gap found above with stable action IDs.
 
 Return JSON with this exact shape:
 {
+  "blocking_issues": ["..."],
   "missing_areas": ["..."],
-  "duplication_suspects": ["..."],
-  "too_generic": [{"id":"REQ-001","reason":"..."}],
-  "domain_missing": ["..."],
+  "weak_requirements": ["REQ-001"],
   "required_actions": [
-    {"action":"add_requirements","count":0,"areas":["..."]},
-    {"action":"strengthen_specificity","ids":["REQ-001"]},
-    {"action":"dedupe_requirements","ids":["REQ-001","REQ-002"]}
+    {"id":"A-01","type":"split_paraguas","severity":"blocking","targets":["REQ-001"],"instruction":"Replace umbrella requirements with 3-6 atomic shall requirements each."},
+    {"id":"A-02","type":"coverage_gap","severity":"blocking","area":"Integrations","instruction":"Add at least 5 integration-related functional requirements with failure/retry behavior."}
   ]
 }

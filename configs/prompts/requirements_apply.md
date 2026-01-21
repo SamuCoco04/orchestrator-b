@@ -19,7 +19,8 @@ Then return a SINGLE JSON object (no markdown, no commentary):
 {
   "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]},
   "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]},
-  "ADDRESSED_ACTIONS_JSON": {"addressed_actions":[]}
+  "ADDRESSED_ACTIONS_JSON": {"addressed_actions":[]},
+  "APPLY_REPORT_JSON": {"applied_actions":[],"unresolved_actions":[]}
 }
 
 Format contract:
@@ -29,6 +30,8 @@ Format contract:
 - CHANGELOG_JSON.splits must be objects with {from, into}.
 - CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
 - ADDRESSED_ACTIONS_JSON.addressed_actions must be an array of strings describing how you satisfied required_actions.
+- APPLY_REPORT_JSON.applied_actions must include all required_actions with action_id, status=done, and evidence referencing actual requirement IDs.
+- APPLY_REPORT_JSON.unresolved_actions must be empty if all blocking actions are addressed.
 - Output ONE JSON object only (no markdown).
 - Must include top-level key FINAL_REQUIREMENTS_JSON with keys: requirements, assumptions, constraints.
 - Never output a single requirement object.

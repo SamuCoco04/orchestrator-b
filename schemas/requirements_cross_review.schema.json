@@ -2,34 +2,21 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "required": [
+    "blocking_issues",
     "missing_areas",
-    "duplication_suspects",
-    "too_generic",
-    "domain_missing",
+    "weak_requirements",
     "required_actions"
   ],
   "properties": {
+    "blocking_issues": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
     "missing_areas": {
       "type": "array",
       "items": {"type": "string"}
     },
-    "duplication_suspects": {
-      "type": "array",
-      "items": {"type": "string"}
-    },
-    "too_generic": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["id", "reason"],
-        "properties": {
-          "id": {"type": "string"},
-          "reason": {"type": "string"}
-        },
-        "additionalProperties": false
-      }
-    },
-    "domain_missing": {
+    "weak_requirements": {
       "type": "array",
       "items": {"type": "string"}
     },
@@ -38,21 +25,17 @@
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["action"],
+        "required": ["id", "type", "severity", "instruction"],
         "properties": {
-          "action": {
-            "type": "string",
-            "enum": ["add_requirements", "strengthen_specificity", "dedupe_requirements"]
-          },
-          "count": {"type": ["integer", "null"], "minimum": 0},
-          "areas": {
+          "id": {"type": "string"},
+          "type": {"type": "string"},
+          "severity": {"type": "string", "enum": ["blocking", "non_blocking"]},
+          "targets": {
             "type": "array",
             "items": {"type": "string"}
           },
-          "ids": {
-            "type": "array",
-            "items": {"type": "string"}
-          }
+          "area": {"type": ["string", "null"]},
+          "instruction": {"type": "string"}
         },
         "additionalProperties": false
       }

@@ -121,6 +121,7 @@ class RequirementsLimits:
     coverage_areas: List[str]
     coverage_keywords: Dict[str, List[str]]
     min_per_area: int | None
+    coverage_prefix_mode: bool
     seed_requirements: List[str]
     requested_artifacts: List[str]
     artifact_token_budgets: Dict[str, int]
@@ -188,6 +189,10 @@ class RequirementsPipeline:
         self._gemini_review_used = False
         self._gemini_final_review_used = False
         self._post_review_add_only_used = False
+        self._final_review_retry_used = False
+        self._coverage_unmapped_count = 0
+        self._single_requirement_fallback: Dict | None = None
+        self._apply_action_retry_used = False
         self._extraction_debug: List[Dict[str, object]] = []
         self._json_parse_repairs: List[Dict[str, object]] = []
         self._list_repair_counts: Dict[str, int] = {
@@ -226,6 +231,10 @@ class RequirementsPipeline:
         self._gemini_review_used = False
         self._gemini_final_review_used = False
         self._post_review_add_only_used = False
+        self._final_review_retry_used = False
+        self._coverage_unmapped_count = 0
+        self._single_requirement_fallback = None
+        self._apply_action_retry_used = False
         self._extraction_debug = []
         self._json_parse_repairs = []
         self._list_repair_counts = {
@@ -459,6 +468,12 @@ class RequirementsPipeline:
                 "\nYou MUST satisfy each required_actions entry from the Gemini review JSON."
                 "\nReport addressed_actions as an array of strings in ADDRESSED_ACTIONS_JSON."
             )
+            if limits.coverage_prefix_mode:
+                areas = ", ".join(limits.coverage_areas)
+                apply_instruction += (
+                    "\nPrefix each requirement with [<Coverage Area>] using one of: "
+                    f"{areas}."
+                )
             self._gemini_review_used = True
         apply_full_prompt = f"{apply_prompt}{apply_instruction}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
         write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
@@ -549,7 +564,13 @@ class RequirementsPipeline:
                 config["expected_keys"],
             )
         changelog = None
+        apply_report = None
         if artifact == "requirements":
+            apply_report = self._extract_apply_report(
+                apply_response.raw_text,
+                artifacts_dir,
+                stage="apply",
+            )
             try:
                 changelog = self._extract_wrapped_json(
                     apply_response.raw_text,
@@ -569,6 +590,29 @@ class RequirementsPipeline:
                 artifacts_dir / "requirements_apply_extracted_normalized.json",
                 final_payload,
             )
+            apply_report_errors: List[str] = []
+            if apply_report is None:
+                apply_report_errors.append("Missing APPLY_REPORT_JSON.")
+            else:
+                apply_report_errors = self._validate_apply_report(
+                    apply_report,
+                    final_payload,
+                    cross_review.get("required_actions", []),
+                )
+            if apply_report_errors:
+                final_payload, apply_report = self._retry_apply_for_actions(
+                    brief=brief,
+                    draft=draft_payload,
+                    cross_review=cross_review,
+                    final_payload=final_payload,
+                    apply_report=apply_report or {},
+                    errors=apply_report_errors,
+                    adapter=chatgpt,
+                    raw_dir=raw_dir,
+                    artifacts_dir=artifacts_dir,
+                    max_tokens=max_tokens,
+                    expected_keys=config["expected_keys"],
+                )
 
         warnings = draft_warnings + final_warnings
         if warnings:
@@ -658,6 +702,7 @@ class RequirementsPipeline:
                 payload=final_payload,
                 adapter=chatgpt,
                 gemini_adapter=gemini,
+                cross_review=cross_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
                 max_tokens=max_tokens,
@@ -712,8 +757,11 @@ class RequirementsPipeline:
                     "gemini_review_used": self._gemini_review_used,
                     "gemini_final_review_used": self._gemini_final_review_used,
                     "post_review_add_only_used": self._post_review_add_only_used,
+                    "final_review_retry_used": self._final_review_retry_used,
+                    "apply_action_retry_used": self._apply_action_retry_used,
                     "min_enforcement_unmet": len(final_payload.get("requirements", []))
                     < limits.req_min,
+                    "coverage_unmapped_count": self._coverage_unmapped_count,
                     "wrapper_repairs_applied": bool(
                         self._apply_format_retry_used or self._json_parse_repairs
                     ),
@@ -839,22 +887,48 @@ class RequirementsPipeline:
             nonlocal last_snippet
             last_snippet = snippet
             if not isinstance(candidate, dict):
+                if isinstance(candidate, list) and expected_keys == {"requirements", "assumptions", "constraints"}:
+                    if all(
+                        isinstance(item, dict) and self._is_requirement_object(item)
+                        for item in candidate
+                    ):
+                        self._requirements_warnings.append(
+                            {
+                                "stage": "extract",
+                                "note": "Requirements list returned without wrapper.",
+                                "path": path,
+                            }
+                        )
+                        return {
+                            "requirements": candidate,
+                            "assumptions": [],
+                            "constraints": [],
+                        }
                 return None
             if self._is_requirement_object(candidate) and label not in candidate:
                 if expected_keys == {"requirements", "assumptions", "constraints"}:
-                    wrapped = {
+                    if context == "requirements_apply":
+                        self._requirements_warnings.append(
+                            {
+                                "stage": "extract",
+                                "note": "Single requirement object returned; triggering format retry.",
+                                "path": path,
+                            }
+                        )
+                        self._single_requirement_fallback = {
+                            "requirements": [candidate],
+                            "assumptions": [],
+                            "constraints": [],
+                        }
+                        raise RequirementsFormatError(
+                            f"{label} missing wrapper; found requirement object. Path: {path}. "
+                            f"Snippet: {snippet}"
+                        )
+                    return {
                         "requirements": [candidate],
                         "assumptions": [],
                         "constraints": [],
                     }
-                    self._requirements_warnings.append(
-                        {
-                            "stage": "extract",
-                            "note": "Single requirement object returned; wrapped into requirements.",
-                            "path": path,
-                        }
-                    )
-                    return wrapped
                 raise RequirementsFormatError(
                     f"{label} missing wrapper; found requirement object. Path: {path}. "
                     f"Snippet: {snippet}"
@@ -993,11 +1067,22 @@ class RequirementsPipeline:
 
         if isinstance(parsed, dict) and "requirements" not in parsed:
             if self._is_requirement_object(parsed):
-                return {
-                    "requirements": [parsed],
-                    "assumptions": [],
-                    "constraints": [],
-                }
+                if expected_keys == {"requirements", "assumptions", "constraints"}:
+                    if context == "requirements_apply":
+                        self._single_requirement_fallback = {
+                            "requirements": [parsed],
+                            "assumptions": [],
+                            "constraints": [],
+                        }
+                        raise RequirementsFormatError(
+                            f"{label} missing wrapper; found requirement object. "
+                            f"Snippet: {snippet_for(last_snippet)}"
+                        )
+                    return {
+                        "requirements": [parsed],
+                        "assumptions": [],
+                        "constraints": [],
+                    }
         if isinstance(parsed, dict):
             missing = expected_keys.difference(parsed.keys())
             if not missing:
@@ -1060,6 +1145,198 @@ class RequirementsPipeline:
             raise ValueError(f"Payload missing keys: {', '.join(sorted(missing))}")
         return payload
 
+    def _extract_apply_report(
+        self, raw_text: str, artifacts_dir: Path, stage: str
+    ) -> Dict | None:
+        try:
+            report = self._extract_wrapped_json_any(
+                raw_text,
+                ["APPLY_REPORT_JSON"],
+                {"applied_actions", "unresolved_actions"},
+            )
+            write_json(artifacts_dir / f"requirements_apply_report_{stage}.json", report)
+            return report
+        except ValueError as exc:
+            self._requirements_warnings.append(
+                {
+                    "stage": stage,
+                    "note": "Missing APPLY_REPORT_JSON.",
+                    "error": str(exc),
+                }
+            )
+            return None
+
+    def _validate_apply_report(
+        self, report: Dict, payload: Dict, required_actions: List[Dict]
+    ) -> List[str]:
+        errors: List[str] = []
+        applied_actions = report.get("applied_actions")
+        unresolved_actions = report.get("unresolved_actions")
+        if not isinstance(applied_actions, list):
+            return ["APPLY_REPORT_JSON.applied_actions must be a list."]
+        if unresolved_actions not in ([], None):
+            errors.append("APPLY_REPORT_JSON.unresolved_actions must be empty.")
+        final_ids = {
+            item.get("id")
+            for item in payload.get("requirements", [])
+            if isinstance(item, dict)
+        }
+        blocking_actions = [
+            action
+            for action in required_actions
+            if isinstance(action, dict) and action.get("severity") == "blocking"
+        ]
+        applied_map = {
+            entry.get("action_id"): entry
+            for entry in applied_actions
+            if isinstance(entry, dict)
+        }
+
+        def evidence_ids(evidence: object) -> List[str]:
+            ids: List[str] = []
+            if isinstance(evidence, dict):
+                for value in evidence.values():
+                    ids.extend(evidence_ids(value))
+            elif isinstance(evidence, list):
+                for value in evidence:
+                    ids.extend(evidence_ids(value))
+            elif isinstance(evidence, str):
+                ids.append(evidence)
+            return ids
+
+        for action in blocking_actions:
+            action_id = action.get("id")
+            if not action_id:
+                continue
+            applied = applied_map.get(action_id)
+            if not applied:
+                errors.append(f"Missing applied_actions entry for {action_id}.")
+                continue
+            if applied.get("status") != "done":
+                errors.append(f"Action {action_id} status must be done.")
+            evidence = applied.get("evidence")
+            ids = [item for item in evidence_ids(evidence) if item in final_ids]
+            if not ids:
+                errors.append(f"Action {action_id} evidence must reference final IDs.")
+        return errors
+
+    def _retry_apply_for_actions(
+        self,
+        brief: str,
+        draft: Dict,
+        cross_review: Dict,
+        final_payload: Dict,
+        apply_report: Dict,
+        errors: List[str],
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+        expected_keys: set[str],
+    ) -> tuple[Dict, Dict]:
+        retry_prompt = read_text(self.prompts_dir / "requirements_apply_retry_actions.md")
+        retry_payload = {
+            "brief": brief,
+            "draft": draft,
+            "cross_review": cross_review,
+            "current": final_payload,
+            "apply_report": apply_report,
+            "errors": errors,
+        }
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_apply_retry_actions_prompt.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_apply_retry_actions_raw.txt", response.raw_text)
+        self._write_usage(
+            raw_dir / "requirements_apply_retry_actions_usage.json", response
+        )
+        self._apply_action_retry_used = True
+        retry_payload_json = self._extract_wrapped_json(
+            response.raw_text,
+            "FINAL_REQUIREMENTS_JSON",
+            expected_keys,
+            context="requirements_apply_retry_actions",
+        )
+        retry_payload_json, _ = self._repair_artifact_payload(
+            "requirements", retry_payload_json, stage="apply_retry_actions"
+        )
+        report = self._extract_apply_report(
+            response.raw_text, artifacts_dir, stage="apply_retry_actions"
+        )
+        if report is None:
+            raise RuntimeError("APPLY_REPORT_JSON missing in apply retry.")
+        report_errors = self._validate_apply_report(
+            report, retry_payload_json, cross_review.get("required_actions", [])
+        )
+        if report_errors:
+            raise RuntimeError(
+                "Apply retry did not satisfy blocking actions: "
+                + "; ".join(report_errors)
+            )
+        write_json(
+            artifacts_dir / "requirements_apply_retry_actions_extracted.json",
+            retry_payload_json,
+        )
+        write_json(
+            artifacts_dir / "requirements_apply_retry_actions_report.json",
+            report,
+        )
+        return retry_payload_json, report
+
+    def _retry_apply_for_final_review(
+        self,
+        brief: str,
+        cross_review: Dict,
+        final_payload: Dict,
+        final_review: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> Dict:
+        retry_prompt = read_text(self.prompts_dir / "requirements_apply_final_retry.md")
+        retry_payload = {
+            "brief": brief,
+            "cross_review": cross_review,
+            "current": final_payload,
+            "final_review": final_review,
+        }
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_apply_final_retry_prompt.txt", full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = adapter.complete(full_prompt)
+        write_text(raw_dir / "requirements_apply_final_retry_raw.txt", response.raw_text)
+        self._write_usage(
+            raw_dir / "requirements_apply_final_retry_usage.json", response
+        )
+        retry_payload_json = self._extract_wrapped_json(
+            response.raw_text,
+            "FINAL_REQUIREMENTS_JSON",
+            {"requirements", "assumptions", "constraints"},
+            context="requirements_apply_final_retry",
+        )
+        retry_payload_json, _ = self._repair_artifact_payload(
+            "requirements", retry_payload_json, stage="apply_final_retry"
+        )
+        report = self._extract_apply_report(
+            response.raw_text, artifacts_dir, stage="apply_final_retry"
+        )
+        if report is not None:
+            report_errors = self._validate_apply_report(
+                report, retry_payload_json, cross_review.get("required_actions", [])
+            )
+            if report_errors:
+                raise RuntimeError(
+                    "Final-review retry did not satisfy blocking actions: "
+                    + "; ".join(report_errors)
+                )
+        write_json(
+            artifacts_dir / "requirements_apply_final_retry_extracted.json",
+            retry_payload_json,
+        )
+        return retry_payload_json
+
     def _validate_requirements_review(
         self, review: Dict, draft_payload: Dict, limits: RequirementsLimits
     ) -> Dict:
@@ -1074,9 +1351,8 @@ class RequirementsPipeline:
 
         gaps = (
             review.get("missing_areas")
-            or review.get("too_generic")
-            or review.get("duplication_suspects")
-            or review.get("domain_missing")
+            or review.get("weak_requirements")
+            or review.get("blocking_issues")
         )
         if gaps and not review.get("required_actions"):
             self._requirements_warnings.append(
@@ -1084,9 +1360,12 @@ class RequirementsPipeline:
             )
             review["required_actions"] = [
                 {
-                    "action": "add_requirements",
-                    "count": 0,
-                    "areas": [],
+                    "id": "A-00",
+                    "type": "coverage_gap",
+                    "severity": "blocking",
+                    "targets": [],
+                    "area": None,
+                    "instruction": "Add missing requirements for uncovered areas.",
                 }
             ]
         return review
@@ -1104,15 +1383,17 @@ class RequirementsPipeline:
                     missing_areas.append(area)
                     add_count += add
         return {
+            "blocking_issues": [],
             "missing_areas": missing_areas,
-            "duplication_suspects": [],
-            "too_generic": [],
-            "domain_missing": [],
+            "weak_requirements": [],
             "required_actions": [
                 {
-                    "action": "add_requirements",
-                    "count": add_count,
-                    "areas": missing_areas,
+                    "id": "A-00",
+                    "type": "coverage_gap",
+                    "severity": "blocking",
+                    "targets": [],
+                    "area": None,
+                    "instruction": "Add missing requirements for uncovered areas.",
                 }
             ],
         }
@@ -1207,6 +1488,7 @@ class RequirementsPipeline:
             "coverage_areas": limits.coverage_areas,
             "coverage_keywords": limits.coverage_keywords,
             "min_per_area": limits.min_per_area,
+            "coverage_prefix_mode": limits.coverage_prefix_mode,
         }
 
     def _coverage_keywords_for_area(self, limits: RequirementsLimits, area: str) -> List[str]:
@@ -1235,16 +1517,10 @@ class RequirementsPipeline:
         if limits.min_per_area is None or not limits.coverage_areas:
             return []
         min_per_area = limits.min_per_area
-        req_items = payload.get("requirements", [])
+        counts = self._coverage_counts(payload, limits)
         missing: List[str] = []
         for area in limits.coverage_areas:
-            keywords = self._coverage_keywords_for_area(limits, area)
-            count = sum(
-                1
-                for item in req_items
-                if isinstance(item, dict)
-                and self._keyword_hits(str(item.get("text", "")), keywords) > 0
-            )
+            count = counts.get(area, 0)
             if count < min_per_area:
                 missing.append(area)
         return missing
@@ -1254,6 +1530,34 @@ class RequirementsPipeline:
         if not limits.coverage_areas:
             return counts
         req_items = payload.get("requirements", [])
+        for area in limits.coverage_areas:
+            counts[area] = 0
+        unmapped = 0
+        if limits.coverage_prefix_mode:
+            for item in req_items:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                match = re.match(r"^\[(.+?)\]\s+", text)
+                if not match:
+                    unmapped += 1
+                    continue
+                area = match.group(1).strip()
+                if area in counts:
+                    counts[area] += 1
+                else:
+                    unmapped += 1
+            if unmapped:
+                counts["UNMAPPED"] = unmapped
+                if self._coverage_unmapped_count == 0:
+                    self._requirements_warnings.append(
+                        {
+                            "stage": "coverage_prefix",
+                            "note": f"{unmapped} requirements missing coverage prefix.",
+                        }
+                    )
+                self._coverage_unmapped_count = unmapped
+            return counts
         for area in limits.coverage_areas:
             keywords = self._coverage_keywords_for_area(limits, area)
             counts[area] = sum(
@@ -1404,6 +1708,13 @@ class RequirementsPipeline:
         out_of_scope_summary = (
             ", ".join(self._out_of_scope_terms) if self._out_of_scope_terms else "none"
         )
+        prefix_instruction = ""
+        if limits.coverage_prefix_mode:
+            areas = ", ".join(limits.coverage_areas)
+            prefix_instruction = (
+                "\nPrefix each new requirement with [<Coverage Area>] "
+                f"using one of: {areas}."
+            )
         full_prompt = (
             f"{retry_prompt}\n\nExisting requirement IDs: {existing_ids_summary}\n"
             f"Existing requirement texts (snippets): {existing_texts_summary}\n"
@@ -1421,6 +1732,8 @@ class RequirementsPipeline:
             f"Forbidden placeholder phrases: {forbidden_phrases}\n\nINPUT:\n"
             f"{json.dumps(retry_payload)}\n"
         )
+        if prefix_instruction:
+            full_prompt = full_prompt.replace("\n\nINPUT:\n", f"{prefix_instruction}\n\nINPUT:\n")
         write_text(raw_dir / f"add_only_retry_{attempt}_prompt.txt", full_prompt)
         write_text(raw_dir / f"add_only_prompt_attempt_{attempt}.txt", full_prompt)
         with self._with_max_output_tokens(max_tokens):
@@ -1613,12 +1926,18 @@ class RequirementsPipeline:
         self._write_usage(
             raw_dir / "requirements_apply_format_retry_usage.json", response
         )
-        extracted = self._extract_wrapped_json(
-            response.raw_text,
-            "FINAL_REQUIREMENTS_JSON",
-            expected_keys,
-            context="requirements_apply_format_retry",
-        )
+        try:
+            extracted = self._extract_wrapped_json(
+                response.raw_text,
+                "FINAL_REQUIREMENTS_JSON",
+                expected_keys,
+                context="requirements_apply_format_retry",
+            )
+        except ValueError:
+            if self._single_requirement_fallback:
+                extracted = self._single_requirement_fallback
+            else:
+                raise
         write_json(
             artifacts_dir / "requirements_apply_format_retry_extracted.json", extracted
         )
@@ -1946,39 +2265,19 @@ class RequirementsPipeline:
         for entry in review.get("missing_areas", []):
             if isinstance(entry, str) and entry.strip():
                 points.append(entry.strip())
-        for entry in review.get("domain_missing", []):
+        for entry in review.get("blocking_issues", []):
             if isinstance(entry, str) and entry.strip():
-                points.append(entry.strip())
-        for entry in review.get("duplication_suspects", []):
+                points.append(f"Blocking issue: {entry.strip()}")
+        for entry in review.get("weak_requirements", []):
             if isinstance(entry, str) and entry.strip():
-                points.append(f"Check duplication: {entry.strip()}")
-        for entry in review.get("too_generic", []):
-            if isinstance(entry, dict):
-                req_id = entry.get("id")
-                reason = entry.get("reason")
-                if req_id and reason:
-                    points.append(f"Refine {req_id}: {reason}")
-                elif req_id:
-                    points.append(f"Refine {req_id}")
+                points.append(f"Weak requirement: {entry.strip()}")
         for action in review.get("required_actions", []):
             if not isinstance(action, dict):
                 continue
-            action_type = action.get("action")
-            if action_type == "add_requirements":
-                areas = action.get("areas", [])
-                count = action.get("count")
-                if areas:
-                    points.append(f"Add requirements for areas: {', '.join(areas)}")
-                if isinstance(count, int) and count > 0:
-                    points.append(f"Add {count} requirements")
-            if action_type == "strengthen_specificity":
-                ids = action.get("ids", [])
-                if ids:
-                    points.append(f"Strengthen specificity: {', '.join(ids)}")
-            if action_type == "dedupe_requirements":
-                ids = action.get("ids", [])
-                if ids:
-                    points.append(f"Dedupe requirements: {', '.join(ids)}")
+            action_id = action.get("id")
+            instruction = action.get("instruction")
+            if action_id and instruction:
+                points.append(f"{action_id}: {instruction}")
         seen = set()
         deduped = []
         for point in points:
@@ -2049,6 +2348,7 @@ class RequirementsPipeline:
         payload: Dict,
         adapter: LLMAdapter,
         gemini_adapter: LLMAdapter,
+        cross_review: Dict,
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
@@ -2070,6 +2370,19 @@ class RequirementsPipeline:
         normalized = self._normalize_final_review(extracted)
         write_json(artifacts_dir / "requirements_final_review_normalized.json", normalized)
         self._gemini_final_review_used = True
+
+        if normalized.get("ok") is False:
+            payload = self._retry_apply_for_final_review(
+                brief=brief,
+                cross_review=cross_review,
+                final_payload=payload,
+                final_review=normalized,
+                adapter=adapter,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=max_tokens,
+            )
+            self._final_review_retry_used = True
 
         missing_n = max(limits.req_min - len(payload.get("requirements", [])), 0)
         missing_areas = normalized.get("missing_areas", [])
@@ -2115,13 +2428,22 @@ class RequirementsPipeline:
             )
         return placeholders
 
-    def _normalize_final_review(self, review: Dict) -> Dict[str, List[str]]:
+    def _normalize_final_review(self, review: Dict) -> Dict[str, object]:
+        ok = review.get("ok")
+        if isinstance(ok, (bool, int)):
+            ok_value = bool(ok)
+        else:
+            ok_value = True
+            self._requirements_warnings.append(
+                {"stage": "final_review", "note": "Missing ok flag; defaulted to true."}
+            )
         def normalize_list(value: object) -> List[str]:
             if not isinstance(value, list):
                 return []
             return [str(item).strip() for item in value if str(item).strip()]
 
         return {
+            "ok": ok_value,
             "missing_areas": normalize_list(review.get("missing_areas")),
             "duplicate_candidates": normalize_list(review.get("duplicate_candidates")),
             "top_ambiguities": normalize_list(review.get("top_ambiguities")),
@@ -2498,6 +2820,9 @@ class RequirementsPipeline:
             gemini_final_review_used = summary.get("gemini_final_review_used")
             post_review_add_only_used = summary.get("post_review_add_only_used")
             min_enforcement_unmet = summary.get("min_enforcement_unmet")
+            final_review_retry_used = summary.get("final_review_retry_used")
+            coverage_unmapped_count = summary.get("coverage_unmapped_count")
+            apply_action_retry_used = summary.get("apply_action_retry_used")
             lines.append(f"- target_min_items: {target_min_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
@@ -2579,6 +2904,16 @@ class RequirementsPipeline:
                 lines.append(
                     f"- post_review_add_only_used: {'yes' if post_review_add_only_used else 'no'}"
                 )
+            if final_review_retry_used is not None:
+                lines.append(
+                    f"- final_review_retry_used: {'yes' if final_review_retry_used else 'no'}"
+                )
+            if apply_action_retry_used is not None:
+                lines.append(
+                    f"- apply_action_retry_used: {'yes' if apply_action_retry_used else 'no'}"
+                )
+            if coverage_unmapped_count is not None:
+                lines.append(f"- coverage_unmapped_count: {coverage_unmapped_count}")
             if min_enforcement_unmet is not None:
                 if min_enforcement_unmet:
                     lines.append("- minimum_enforcement: unmet (retries exhausted)")
@@ -4716,6 +5051,11 @@ class RequirementsPipeline:
             area: list(keywords)
             for area, keywords in self._DEFAULT_COVERAGE_KEYWORDS.items()
         }
+        coverage_prefix_mode_raw = frontmatter.get("coverage_prefix_mode", False)
+        if isinstance(coverage_prefix_mode_raw, str):
+            coverage_prefix_mode = coverage_prefix_mode_raw.strip().lower() in {"1", "true", "yes"}
+        else:
+            coverage_prefix_mode = bool(coverage_prefix_mode_raw)
         coverage_areas_raw = frontmatter.get("coverage_areas")
         coverage_areas = []
         if isinstance(coverage_areas_raw, str):
@@ -4758,6 +5098,7 @@ class RequirementsPipeline:
             coverage_areas=coverage_areas,
             coverage_keywords=coverage_keywords,
             min_per_area=min_per_area_int,
+            coverage_prefix_mode=coverage_prefix_mode,
             seed_requirements=seed_requirements,
             requested_artifacts=requested_list,
             artifact_token_budgets=artifact_token_budgets,
@@ -4777,6 +5118,7 @@ class RequirementsPipeline:
             "roles_expected": limits.roles_expected,
             "coverage_areas": limits.coverage_areas,
             "min_per_area": limits.min_per_area,
+            "coverage_prefix_mode": limits.coverage_prefix_mode,
             "seed_requirements": limits.seed_requirements,
         }
 
