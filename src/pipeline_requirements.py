@@ -893,7 +893,7 @@ class RequirementsPipeline:
         attempts: List[str] = []
         last_snippet = raw_text.strip().replace("\n", " ")
         truncation_detected = self._detect_truncation(raw_text)
-        debug_enabled = self._env("ORCH_DEBUG_EXTRACTION", "0") == "1"
+        debug_enabled = self._env("ORCH_DEBUG_EXTRACT", "0") == "1"
 
         def snippet_for(text: str) -> str:
             cleaned = text.strip().replace("\n", " ")
