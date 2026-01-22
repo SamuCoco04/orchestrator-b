@@ -20,6 +20,8 @@ Format contract:
 - REQUIREMENTS_JSON.requirements MUST be an array of objects with {id, text, priority}.
 - priority must be one of must|should|could.
 - assumptions and constraints must be arrays of strings only.
+- Output MUST be strict JSON only (no prose, no markdown).
+- requirement id values MUST be strings in REQ-001 format (no integers).
 
 Rules:
 - Do NOT reuse rejected requirements (if any).

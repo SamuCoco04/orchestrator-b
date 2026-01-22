@@ -197,6 +197,8 @@ class RequirementsPipeline:
         self._apply_action_retry_used = False
         self._extraction_debug: List[Dict[str, object]] = []
         self._json_parse_repairs: List[Dict[str, object]] = []
+        self._draft_extracted_candidate: Dict | None = None
+        self._draft_extracted_cleaned: Dict | None = None
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -239,6 +241,8 @@ class RequirementsPipeline:
         self._apply_action_retry_used = False
         self._extraction_debug = []
         self._json_parse_repairs = []
+        self._draft_extracted_candidate = None
+        self._draft_extracted_cleaned = None
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -433,6 +437,16 @@ class RequirementsPipeline:
         )
         if artifact == "requirements":
             write_json(artifacts_dir / "requirements_draft_extracted.json", draft_payload)
+            if self._draft_extracted_candidate is not None:
+                write_json(
+                    artifacts_dir / "requirements_draft_extracted_candidate.json",
+                    self._draft_extracted_candidate,
+                )
+            if self._draft_extracted_cleaned is not None:
+                write_json(
+                    artifacts_dir / "requirements_draft_extracted_cleaned.json",
+                    self._draft_extracted_cleaned,
+                )
         draft_payload, draft_warnings = self._repair_artifact_payload(
             artifact, draft_payload, stage="draft"
         )
@@ -997,6 +1011,11 @@ class RequirementsPipeline:
                         f"{label} wrapper missing keys: {', '.join(sorted(missing_keys))}. "
                         f"Found keys: {keys}. Path: {path}. Snippet: {snippet}"
                     )
+                if (
+                    expected_keys == {"requirements", "assumptions", "constraints"}
+                    and isinstance(wrapper_value, dict)
+                ):
+                    self._normalize_requirement_ids(wrapper_value)
                 return wrapper_value
             return None
 
@@ -1150,6 +1169,24 @@ class RequirementsPipeline:
                 )
                 return parsed
 
+        if expected_keys == {"requirements", "assumptions", "constraints"}:
+            tolerant_candidate = self._tolerant_json_extract(raw_text, attempts)
+            if tolerant_candidate is not None:
+                candidate = handle_candidate(
+                    tolerant_candidate,
+                    "tolerant-extract",
+                    snippet_for(raw_text),
+                )
+                if candidate is not None:
+                    self._record_extraction_debug(
+                        context,
+                        "tolerant-extract",
+                        truncation_detected,
+                        None,
+                        debug_enabled,
+                    )
+                    return candidate
+
         self._record_extraction_debug(
             context,
             "failed",
@@ -1163,6 +1200,51 @@ class RequirementsPipeline:
             f"Attempts: {', '.join(attempts) or 'none'}. "
             f"Snippet: {snippet_for(last_snippet)}"
         )
+
+    def _normalize_requirement_ids(self, payload: Dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        requirements = payload.get("requirements")
+        if not isinstance(requirements, list):
+            return
+        for item in requirements:
+            if not isinstance(item, dict):
+                continue
+            req_id = item.get("id")
+            if isinstance(req_id, int):
+                item["id"] = f"REQ-{req_id:03d}"
+
+    def _tolerant_json_extract(self, raw_text: str, attempts: List[str]) -> Dict | None:
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            attempts.append("tolerant-extract (no-braces)")
+            return None
+        candidate_text = raw_text[start : end + 1]
+        cleaned = (
+            candidate_text.replace("\u201c", "\"")
+            .replace("\u201d", "\"")
+            .replace("\u2019", "'")
+        )
+        attempts.append("tolerant-extract (raw)")
+        try:
+            parsed = json.loads(cleaned)
+            if self._draft_extracted_candidate is None:
+                self._draft_extracted_candidate = parsed if isinstance(parsed, dict) else None
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError as exc:
+            attempts.append(f"tolerant-extract (parse-failed: {exc})")
+        cleaned_commas = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        try:
+            parsed = json.loads(cleaned_commas)
+            if self._draft_extracted_candidate is None:
+                self._draft_extracted_candidate = parsed if isinstance(parsed, dict) else None
+            self._draft_extracted_cleaned = parsed if isinstance(parsed, dict) else None
+            attempts.append("tolerant-extract (cleaned)")
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError as exc:
+            attempts.append(f"tolerant-extract (cleaned-parse-failed: {exc})")
+            return None
 
     def _largest_json_object(self, raw_text: str) -> Dict[str, object] | None:
         decoder = json.JSONDecoder()
