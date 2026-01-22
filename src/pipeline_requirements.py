@@ -429,12 +429,47 @@ class RequirementsPipeline:
         write_text(raw_dir / f"{artifact}_draft_raw.txt", lead_response.raw_text)
         self._write_usage(raw_dir / f"{artifact}_draft_usage.json", lead_response)
 
-        draft_payload = self._extract_wrapped_json(
-            lead_response.raw_text,
-            config["draft_label"],
-            config["expected_keys"],
-            context=f"{artifact}_draft",
-        )
+        try:
+            draft_payload = self._extract_wrapped_json(
+                lead_response.raw_text,
+                config["draft_label"],
+                config["expected_keys"],
+                context=f"{artifact}_draft",
+            )
+        except ValueError as exc:
+            if artifact != "requirements":
+                raise
+            retry_prompt = read_text(self.prompts_dir / "requirements_lead_format_retry.md")
+            retry_payload = {
+                "parse_error": str(exc),
+                "raw_output": lead_response.raw_text,
+            }
+            retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+            write_text(
+                raw_dir / "requirements_draft_format_retry_prompt.txt",
+                retry_full_prompt,
+            )
+            with self._with_max_output_tokens(lead_tokens):
+                retry_response = chatgpt.complete(retry_full_prompt)
+            responses.append(retry_response)
+            write_text(
+                raw_dir / "requirements_draft_format_retry_raw.txt",
+                retry_response.raw_text,
+            )
+            self._write_usage(
+                raw_dir / "requirements_draft_format_retry_usage.json", retry_response
+            )
+            try:
+                draft_payload = self._extract_wrapped_json(
+                    retry_response.raw_text,
+                    config["draft_label"],
+                    config["expected_keys"],
+                    context=f"{artifact}_draft_retry",
+                )
+            except ValueError as retry_exc:
+                raise RuntimeError(
+                    "Requirements draft format retry failed to parse."
+                ) from retry_exc
         if artifact == "requirements":
             write_json(artifacts_dir / "requirements_draft_extracted.json", draft_payload)
             if self._draft_extracted_candidate is not None:

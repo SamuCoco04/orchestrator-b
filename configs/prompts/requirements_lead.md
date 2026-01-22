@@ -22,6 +22,7 @@ Format contract:
 - assumptions and constraints must be arrays of strings only.
 - Output MUST be strict JSON only (no prose, no markdown).
 - requirement id values MUST be strings in REQ-001 format (no integers).
+- NEVER include unescaped double quotes inside requirement text strings. Use single quotes or parentheses instead.
 
 Rules:
 - Do NOT reuse rejected requirements (if any).
