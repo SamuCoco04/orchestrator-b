@@ -17,19 +17,24 @@ class OpenAIAdapter(LLMAdapter):
         self.client = OpenAI(api_key=self.api_key)
 
     def complete(self, prompt: str) -> LLMResponse:
-        max_tokens = int(os.getenv("ORCH_MAX_OUTPUT_TOKENS", "800"))
+        max_tokens_env = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
+        max_tokens = int(max_tokens_env) if max_tokens_env else None
         temperature = float(os.getenv("ORCH_TEMPERATURE", "0.2"))
         attempt = 0
         backoff = 1.0
         while True:
             attempt += 1
             try:
+                request_params = {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": temperature,
+                    "response_format": {"type": "json_object"},
+                }
+                if max_tokens is not None:
+                    request_params["max_tokens"] = max_tokens
                 response = self.client.chat.completions.create(
                     model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    response_format={"type": "json_object"},
+                    **request_params,
                 )
                 content = response.choices[0].message.content
                 if content is None:

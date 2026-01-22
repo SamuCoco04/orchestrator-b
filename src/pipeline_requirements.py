@@ -1497,9 +1497,13 @@ class RequirementsPipeline:
         )
 
     def _validate_apply_report(
-        self, report: Dict, payload: Dict, required_actions: List[str]
+        self, report: Dict | None, payload: Dict, required_actions: List[str]
     ) -> tuple[List[str], List[str], List[Dict[str, str]]]:
         errors: List[str] = []
+        if not report:
+            errors.append("Missing APPLY_REPORT_JSON/ADDRESSED_ACTIONS_JSON.")
+            missing_actions = self._missing_required_actions(required_actions, [])
+            return errors, missing_actions, []
         report = self._normalize_apply_report(report)
         applied_actions = report.get("applied_actions")
         unapplied_actions = report.get("unapplied_actions")
@@ -1534,6 +1538,30 @@ class RequirementsPipeline:
                 + "; ".join(missing_actions)
             )
         return errors, missing_actions, evidence_issues
+
+    def _missing_required_actions(
+        self, required_actions: List[str], applied_actions: List[Dict] | List[str]
+    ) -> List[str]:
+        if not required_actions:
+            return []
+        required = [
+            action.strip()
+            for action in required_actions
+            if isinstance(action, str) and action.strip()
+        ]
+        if not required:
+            return []
+        applied_set: set[str] = set()
+        if isinstance(applied_actions, list):
+            for entry in applied_actions:
+                if isinstance(entry, str):
+                    if entry.strip():
+                        applied_set.add(entry.strip())
+                elif isinstance(entry, dict):
+                    action = entry.get("action")
+                    if isinstance(action, str) and action.strip():
+                        applied_set.add(action.strip())
+        return [action for action in required if action not in applied_set]
 
     def _validate_apply_report_evidence(
         self, applied_actions: List[Dict], payload: Dict

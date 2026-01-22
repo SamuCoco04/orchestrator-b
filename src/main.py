@@ -47,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--brief", required=True)
     parser.add_argument("--gate-cmd", action="append", default=[], help="Quality gate command")
     parser.add_argument("--inputs-from-run", help="Load inputs from a previous run ID")
-    parser.add_argument("--max-output-tokens", type=int, default=800)
+    parser.add_argument("--max-output-tokens", type=int, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)
     return parser
 
@@ -80,7 +80,10 @@ def main() -> None:
     for path in [inputs_dir, raw_dir, artifacts_dir, quality_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
-    os.environ["ORCH_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
+    if args.max_output_tokens is not None:
+        os.environ["ORCH_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
+    else:
+        os.environ.pop("ORCH_MAX_OUTPUT_TOKENS", None)
     os.environ["ORCH_TEMPERATURE"] = str(args.temperature)
 
     if args.mode == "live":
