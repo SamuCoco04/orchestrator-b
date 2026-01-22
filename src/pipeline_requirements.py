@@ -1587,8 +1587,47 @@ class RequirementsPipeline:
                 issues.append({"action": action, "evidence": evidence})
         return issues
 
-    def _remap_apply_report_ids(self, report: Dict, id_map: Dict[str, str]) -> Dict:
-        if not id_map:
+    def _remap_apply_report_ids(self, report: Dict | None, id_map: object) -> Dict | None:
+        if not isinstance(report, dict):
+            return report
+        mapping: Dict[str, str] = {}
+        if isinstance(id_map, dict):
+            mapping = {
+                str(old_id): str(new_id)
+                for old_id, new_id in id_map.items()
+                if isinstance(old_id, str) and isinstance(new_id, str)
+            }
+        elif isinstance(id_map, list):
+            for entry in id_map:
+                if isinstance(entry, dict):
+                    old_id = entry.get("old") or entry.get("from")
+                    new_id = entry.get("new") or entry.get("to")
+                    if isinstance(old_id, str) and isinstance(new_id, str):
+                        mapping[old_id] = new_id
+                elif (
+                    isinstance(entry, (list, tuple))
+                    and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)
+                ):
+                    mapping[entry[0]] = entry[1]
+            if mapping:
+                self._requirements_warnings.append(
+                    {
+                        "stage": "id_map",
+                        "note": "Converted list id_map to dict.",
+                        "count": len(mapping),
+                    }
+                )
+        if not mapping:
+            if id_map is not None:
+                self._requirements_warnings.append(
+                    {
+                        "stage": "id_map",
+                        "note": "Unusable id_map; apply report not remapped.",
+                        "type": str(type(id_map)),
+                    }
+                )
             return report
         updated = dict(report)
         applied_actions = updated.get("applied_actions")
@@ -1600,7 +1639,7 @@ class RequirementsPipeline:
                     continue
                 evidence = entry.get("evidence")
                 if isinstance(evidence, str):
-                    for old_id, new_id in id_map.items():
+                    for old_id, new_id in mapping.items():
                         if old_id in evidence:
                             evidence = evidence.replace(old_id, new_id)
                     entry = dict(entry)
@@ -1610,7 +1649,7 @@ class RequirementsPipeline:
         unapplied_actions = updated.get("unapplied_actions")
         if isinstance(unapplied_actions, list):
             updated["unapplied_actions"] = [
-                id_map.get(action, action) if isinstance(action, str) else action
+                mapping.get(action, action) if isinstance(action, str) else action
                 for action in unapplied_actions
             ]
         return updated
@@ -3141,14 +3180,14 @@ class RequirementsPipeline:
 
     def _normalize_requirement_ids(
         self, payload: Dict, changelog: Dict | None = None
-    ) -> tuple[Dict, bool, List[Dict[str, str]], Dict | None]:
+    ) -> tuple[Dict, bool, Dict[str, str], Dict | None]:
         if not isinstance(payload, dict):
-            return payload, False, [], changelog
+            return payload, False, {}, changelog
         items = payload.get("requirements", [])
         if not isinstance(items, list):
-            return payload, False, [], changelog
+            return payload, False, {}, changelog
         normalized = False
-        id_map: List[Dict[str, str]] = []
+        id_map: Dict[str, str] = {}
         normalized_items: List[Dict] = []
         sequence = 1
         for item in items:
@@ -3158,13 +3197,16 @@ class RequirementsPipeline:
             new_id = f"REQ-{sequence:03d}"
             sequence += 1
             if current_id != new_id:
-                id_map.append({"from": str(current_id), "to": new_id})
+                id_map[str(current_id)] = new_id
                 normalized = True
             item["id"] = new_id
             normalized_items.append(item)
         payload["requirements"] = normalized_items
         if id_map and changelog is not None:
-            changelog = self._rewrite_changelog_ids(changelog, id_map)
+            changelog = self._rewrite_changelog_ids(
+                changelog,
+                [{"from": old_id, "to": new_id} for old_id, new_id in id_map.items()],
+            )
         return payload, normalized, id_map, changelog
 
     def _rewrite_changelog_ids(self, changelog: Dict, id_map: List[Dict[str, str]]) -> Dict:
