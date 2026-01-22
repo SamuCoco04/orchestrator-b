@@ -1250,19 +1250,6 @@ class RequirementsPipeline:
             f"Snippet: {snippet_for(last_snippet)}"
         )
 
-    def _normalize_requirement_ids(self, payload: Dict) -> None:
-        if not isinstance(payload, dict):
-            return
-        requirements = payload.get("requirements")
-        if not isinstance(requirements, list):
-            return
-        for item in requirements:
-            if not isinstance(item, dict):
-                continue
-            req_id = item.get("id")
-            if isinstance(req_id, int):
-                item["id"] = f"REQ-{req_id:03d}"
-
     def _tolerant_json_extract(self, raw_text: str, attempts: List[str]) -> Dict | None:
         start = raw_text.find("{")
         end = raw_text.rfind("}")
@@ -3125,8 +3112,10 @@ class RequirementsPipeline:
         return merged
 
     def _normalize_requirement_ids(
-        self, payload: Dict, changelog: Dict | None
+        self, payload: Dict, changelog: Dict | None = None
     ) -> tuple[Dict, bool, List[Dict[str, str]], Dict | None]:
+        if not isinstance(payload, dict):
+            return payload, False, [], changelog
         items = payload.get("requirements", [])
         if not isinstance(items, list):
             return payload, False, [], changelog
