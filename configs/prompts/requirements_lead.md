@@ -11,7 +11,7 @@ Targets from brief:
 - seed_requirements:
 {{SEED_REQUIREMENTS}}
 
-Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape:
+Return a SINGLE JSON object only (no markdown, no commentary) with this wrapper shape:
 {
   "REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}
 }
@@ -21,8 +21,10 @@ Format contract:
 - priority must be one of must|should|could.
 - assumptions and constraints must be arrays of strings only.
 - Output MUST be strict JSON only (no prose, no markdown).
+- Output MUST be minified (single line; no pretty formatting or newlines).
 - requirement id values MUST be strings in REQ-001 format (no integers).
 - NEVER include unescaped double quotes inside requirement text strings. Use single quotes or parentheses instead.
+- Arrays MUST separate elements with commas; never emit adjacent objects without commas.
 
 Rules:
 - Do NOT reuse rejected requirements (if any).

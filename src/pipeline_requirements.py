@@ -199,6 +199,8 @@ class RequirementsPipeline:
         self._json_parse_repairs: List[Dict[str, object]] = []
         self._draft_extracted_candidate: Dict | None = None
         self._draft_extracted_cleaned: Dict | None = None
+        self._draft_candidate_before_repair_text: str | None = None
+        self._draft_candidate_after_repair_text: str | None = None
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -243,6 +245,8 @@ class RequirementsPipeline:
         self._json_parse_repairs = []
         self._draft_extracted_candidate = None
         self._draft_extracted_cleaned = None
+        self._draft_candidate_before_repair_text = None
+        self._draft_candidate_after_repair_text = None
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -481,6 +485,16 @@ class RequirementsPipeline:
                 write_json(
                     artifacts_dir / "requirements_draft_extracted_cleaned.json",
                     self._draft_extracted_cleaned,
+                )
+            if self._draft_candidate_before_repair_text is not None:
+                write_text(
+                    artifacts_dir / "requirements_draft_candidate_before_repair.json",
+                    self._draft_candidate_before_repair_text,
+                )
+            if self._draft_candidate_after_repair_text is not None:
+                write_text(
+                    artifacts_dir / "requirements_draft_candidate_after_repair.json",
+                    self._draft_candidate_after_repair_text,
                 )
         draft_payload, draft_warnings = self._repair_artifact_payload(
             artifact, draft_payload, stage="draft"
@@ -1269,6 +1283,30 @@ class RequirementsPipeline:
             return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError as exc:
             attempts.append(f"tolerant-extract (parse-failed: {exc})")
+            if "Expecting ',' delimiter" in str(exc):
+                repaired_text, repaired = self._insert_missing_commas_in_arrays(cleaned)
+                if repaired:
+                    self._draft_candidate_before_repair_text = cleaned
+                    self._draft_candidate_after_repair_text = repaired_text
+                    self._requirements_warnings.append(
+                        {
+                            "repair": "insert_missing_commas",
+                            "path": "tolerant-extract",
+                            "note": "Inserted commas between adjacent objects inside arrays.",
+                        }
+                    )
+                    attempts.append("tolerant-extract (inserted-missing-commas)")
+                    try:
+                        parsed = json.loads(repaired_text)
+                        if self._draft_extracted_candidate is None:
+                            self._draft_extracted_candidate = (
+                                parsed if isinstance(parsed, dict) else None
+                            )
+                        return parsed if isinstance(parsed, dict) else None
+                    except json.JSONDecodeError as repair_exc:
+                        attempts.append(
+                            f"tolerant-extract (inserted-missing-commas-parse-failed: {repair_exc})"
+                        )
         cleaned_commas = re.sub(r",\s*([}\]])", r"\1", cleaned)
         try:
             parsed = json.loads(cleaned_commas)
@@ -1280,6 +1318,50 @@ class RequirementsPipeline:
         except json.JSONDecodeError as exc:
             attempts.append(f"tolerant-extract (cleaned-parse-failed: {exc})")
             return None
+
+    def _insert_missing_commas_in_arrays(self, text: str) -> tuple[str, bool]:
+        output: List[str] = []
+        in_string = False
+        escape = False
+        array_depth = 0
+        changed = False
+        length = len(text)
+        idx = 0
+        while idx < length:
+            ch = text[idx]
+            if escape:
+                output.append(ch)
+                escape = False
+                idx += 1
+                continue
+            if ch == "\\":
+                output.append(ch)
+                escape = True
+                idx += 1
+                continue
+            if ch == "\"":
+                in_string = not in_string
+                output.append(ch)
+                idx += 1
+                continue
+            if not in_string:
+                if ch == "[":
+                    array_depth += 1
+                elif ch == "]":
+                    array_depth = max(0, array_depth - 1)
+            if not in_string and ch == "}" and array_depth > 0:
+                output.append(ch)
+                lookahead = idx + 1
+                while lookahead < length and text[lookahead].isspace():
+                    lookahead += 1
+                if lookahead < length and text[lookahead] == "{":
+                    output.append(",")
+                    changed = True
+                idx += 1
+                continue
+            output.append(ch)
+            idx += 1
+        return "".join(output), changed
 
     def _largest_json_object(self, raw_text: str) -> Dict[str, object] | None:
         decoder = json.JSONDecoder()
@@ -4046,6 +4128,8 @@ class RequirementsPipeline:
     def _write_requirements_warnings(self, path: Path) -> None:
         if self._requirements_warnings:
             write_json(path, {"warnings": self._requirements_warnings})
+            if path.name != "requirements_warnings.json":
+                write_json(path.parent / "requirements_warnings.json", {"warnings": self._requirements_warnings})
 
     def _delta_retry_artifact(
         self,
