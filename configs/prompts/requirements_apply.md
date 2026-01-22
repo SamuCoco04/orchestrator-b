@@ -10,28 +10,25 @@ Targets from brief:
 - min_per_area={{MIN_PER_AREA}}
 
 Input includes: brief, draft requirements, and Gemini cross-review JSON.
-You MUST implement every item in required_actions. If required_actions includes add_requirements with a count, you MUST add exactly that many requirements.
-Ensure requirements are atomic and testable.
+You MUST implement every item in required_actions. Ensure requirements are atomic and testable.
 
-Before the JSON, include a short "APPLIED_CHANGES" list (plain text, 3-8 bullets) describing what you changed.
-
-Then return a SINGLE JSON object (no markdown, no commentary):
+Return a SINGLE JSON object (no markdown, no commentary) with ONLY these top-level keys:
 {
   "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]},
-  "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]},
-  "ADDRESSED_ACTIONS_JSON": {"addressed_actions":[]},
-  "APPLY_REPORT_JSON": {"applied_actions":[],"unresolved_actions":[]}
+  "APPLY_REPORT_JSON": {
+    "applied_actions": [{"action":"<exact string from required_actions>","evidence":"<short>"}],
+    "unapplied_actions": ["<exact action string>"]
+  }
 }
 
 Format contract:
 - FINAL_REQUIREMENTS_JSON.requirements MUST be an array of objects with {id, text, priority}.
 - priority must be one of must|should|could.
 - assumptions and constraints must be arrays of strings only.
-- CHANGELOG_JSON.splits must be objects with {from, into}.
-- CHANGELOG_JSON.added/replacements/removed must be arrays of requirement ID strings.
-- ADDRESSED_ACTIONS_JSON.addressed_actions must be an array of strings describing how you satisfied required_actions.
-- APPLY_REPORT_JSON.applied_actions must include all required_actions with action_id, status=done, and evidence referencing actual requirement IDs.
-- APPLY_REPORT_JSON.unresolved_actions must be empty if all blocking actions are addressed.
+- APPLY_REPORT_JSON.applied_actions must include ALL required_actions with short evidence.
+- APPLY_REPORT_JSON.unapplied_actions must be empty when all required_actions are satisfied.
+- APPLY_REPORT_JSON must always be present (even if arrays are empty).
+- Each applied_actions[].evidence MUST mention at least one requirement ID that exists in FINAL_REQUIREMENTS_JSON.requirements[].id.
 - Output ONE JSON object only (no markdown).
 - Must include top-level key FINAL_REQUIREMENTS_JSON with keys: requirements, assumptions, constraints.
 - Never output a single requirement object.
@@ -40,4 +37,13 @@ Format contract:
 Rules:
 - Apply Gemini critique to remove ambiguity, add missing detail, and cover edge cases.
 - If below minimum, generate NEW requirements aligned to the brief.
+- Do NOT rename existing requirement IDs; only add new requirements with new IDs.
 - No markdown, no extra keys.
+
+Example APPLY_REPORT_JSON:
+{
+  "applied_actions": [
+    {"action":"Add missing coverage for notifications","evidence":"Added REQ-042 and REQ-043 to cover notification delivery and failure handling."}
+  ],
+  "unapplied_actions": []
+}

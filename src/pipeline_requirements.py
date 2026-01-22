@@ -618,14 +618,27 @@ class RequirementsPipeline:
                 artifacts_dir / "requirements_apply_extracted_normalized.json",
                 final_payload,
             )
+            required_actions = cross_review.get("required_actions", [])
+            blocking_issues = cross_review.get("blocking_issues", [])
             apply_report_errors: List[str] = []
-            if apply_report is not None:
-                apply_report_errors = self._validate_apply_report(
+            missing_actions: List[str] = []
+            evidence_issues: List[Dict[str, str]] = []
+            if apply_report is None and required_actions:
+                apply_report_errors = [
+                    "Missing APPLY_REPORT_JSON or ADDRESSED_ACTIONS_JSON."
+                ]
+                missing_actions = list(required_actions)
+            elif apply_report is not None:
+                (
+                    apply_report_errors,
+                    missing_actions,
+                    evidence_issues,
+                ) = self._validate_apply_report(
                     apply_report,
                     final_payload,
-                    cross_review.get("required_actions", []),
+                    required_actions,
                 )
-            if apply_report_errors:
+            if blocking_issues and (missing_actions or evidence_issues):
                 final_payload, apply_report = self._retry_apply_for_actions(
                     brief=brief,
                     draft=draft_payload,
@@ -633,11 +646,21 @@ class RequirementsPipeline:
                     final_payload=final_payload,
                     apply_report=apply_report or {},
                     errors=apply_report_errors,
+                    missing_actions=missing_actions,
+                    evidence_issues=evidence_issues,
                     adapter=chatgpt,
                     raw_dir=raw_dir,
                     artifacts_dir=artifacts_dir,
                     max_tokens=apply_tokens,
                     expected_keys=config["expected_keys"],
+                )
+            elif apply_report_errors:
+                self._requirements_warnings.append(
+                    {
+                        "stage": "apply",
+                        "note": "Apply report missing or incomplete; enforcement skipped.",
+                        "errors": apply_report_errors,
+                    }
                 )
 
         warnings = draft_warnings + final_warnings
@@ -746,6 +769,10 @@ class RequirementsPipeline:
                 write_json(artifacts_dir / "requirements_id_map.json", {"id_map": id_map})
             if changelog is not None:
                 write_json(artifacts_dir / "requirements_changelog.json", changelog)
+            if apply_report is not None:
+                if id_normalized:
+                    apply_report = self._remap_apply_report_ids(apply_report, id_map)
+                write_json(artifacts_dir / "requirements_apply_report.json", apply_report)
             coverage_counts = self._coverage_counts(final_payload, limits)
             summary.update(
                 {
@@ -1176,30 +1203,64 @@ class RequirementsPipeline:
     def _extract_apply_report(
         self, raw_text: str, artifacts_dir: Path, stage: str
     ) -> Dict | None:
+        labels = ["APPLY_REPORT_JSON", "ADDRESSED_ACTIONS_JSON"]
+        last_error: ValueError | None = None
+        for expected_keys in (
+            {"applied_actions", "unapplied_actions"},
+            {"applied_actions", "unresolved_actions"},
+        ):
+            try:
+                report = self._extract_wrapped_json_any(raw_text, labels, expected_keys)
+                report = self._normalize_apply_report(report)
+                write_json(artifacts_dir / f"requirements_apply_report_{stage}.json", report)
+                return report
+            except ValueError as exc:
+                last_error = exc
         try:
-            report = self._extract_wrapped_json_any(
+            fallback = self._extract_wrapped_json_any(
                 raw_text,
-                ["APPLY_REPORT_JSON"],
-                {"applied_actions", "unresolved_actions"},
+                labels,
+                {"addressed_actions"},
             )
+            report = self._normalize_apply_report(fallback)
             write_json(artifacts_dir / f"requirements_apply_report_{stage}.json", report)
             return report
         except ValueError as exc:
-            self._record_apply_report_missing(
-                artifacts_dir=artifacts_dir,
-                stage=stage,
-                artifact="requirements",
-                raw_text=raw_text,
-                reason=str(exc),
-            )
-            self._requirements_warnings.append(
-                {
-                    "stage": stage,
-                    "note": "Missing APPLY_REPORT_JSON.",
-                    "error": str(exc),
-                }
-            )
-            return None
+            last_error = exc
+        self._record_apply_report_missing(
+            artifacts_dir=artifacts_dir,
+            stage=stage,
+            artifact="requirements",
+            raw_text=raw_text,
+            reason=str(last_error) if last_error else "Missing apply report.",
+        )
+        self._requirements_warnings.append(
+            {
+                "stage": stage,
+                "note": "Missing APPLY_REPORT_JSON or ADDRESSED_ACTIONS_JSON.",
+                "error": str(last_error) if last_error else "Missing apply report.",
+            }
+        )
+        return None
+
+    def _normalize_apply_report(self, report: Dict) -> Dict:
+        normalized = dict(report)
+        if "unresolved_actions" in report and "unapplied_actions" not in report:
+            normalized["unapplied_actions"] = report.get("unresolved_actions")
+        applied_actions = normalized.get("applied_actions")
+        if applied_actions is None and "addressed_actions" in report:
+            normalized["applied_actions"] = [
+                {"action": action, "evidence": ""}
+                for action in report.get("addressed_actions", [])
+                if isinstance(action, str)
+            ]
+        elif isinstance(applied_actions, list):
+            normalized["applied_actions"] = [
+                item if isinstance(item, dict) else {"action": str(item), "evidence": ""}
+                for item in applied_actions
+                if isinstance(item, (dict, str))
+            ]
+        return normalized
 
     def _record_apply_report_missing(
         self,
@@ -1222,59 +1283,123 @@ class RequirementsPipeline:
             },
         )
 
+    def _write_enforcement_failed(
+        self,
+        artifacts_dir: Path,
+        stage: str,
+        missing_actions: List[str],
+        evidence_issues: List[Dict[str, str]],
+        raw_text: str,
+    ) -> None:
+        snippet = raw_text.strip().replace("\n", " ")
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        offending = None
+        if evidence_issues:
+            offending = {
+                "action": evidence_issues[0].get("action"),
+                "evidence_snippet": (evidence_issues[0].get("evidence") or "")[:200],
+            }
+        write_json(
+            artifacts_dir / "requirements_enforcement_failed.json",
+            {
+                "stage": stage,
+                "missing_actions": missing_actions,
+                "offending_action": offending,
+                "snippet": snippet,
+            },
+        )
+
     def _validate_apply_report(
-        self, report: Dict, payload: Dict, required_actions: List[Dict]
-    ) -> List[str]:
+        self, report: Dict, payload: Dict, required_actions: List[str]
+    ) -> tuple[List[str], List[str], List[Dict[str, str]]]:
         errors: List[str] = []
+        report = self._normalize_apply_report(report)
         applied_actions = report.get("applied_actions")
-        unresolved_actions = report.get("unresolved_actions")
+        unapplied_actions = report.get("unapplied_actions")
         if not isinstance(applied_actions, list):
-            return ["APPLY_REPORT_JSON.applied_actions must be a list."]
-        if unresolved_actions not in ([], None):
-            errors.append("APPLY_REPORT_JSON.unresolved_actions must be empty.")
-        final_ids = {
-            item.get("id")
+            return [
+                "APPLY_REPORT_JSON/ADDRESSED_ACTIONS_JSON.applied_actions must be a list."
+            ], list(required_actions), []
+        if unapplied_actions not in ([], None):
+            if not isinstance(unapplied_actions, list):
+                errors.append(
+                    "APPLY_REPORT_JSON/ADDRESSED_ACTIONS_JSON.unapplied_actions must be a list."
+                )
+            elif unapplied_actions:
+                errors.append(
+                    "APPLY_REPORT_JSON/ADDRESSED_ACTIONS_JSON.unapplied_actions must be empty."
+                )
+        for entry in applied_actions:
+            if not isinstance(entry, dict) or not isinstance(entry.get("action"), str):
+                errors.append(
+                    "APPLY_REPORT_JSON/ADDRESSED_ACTIONS_JSON.applied_actions entries must include action strings."
+                )
+                break
+        evidence_issues = self._validate_apply_report_evidence(applied_actions, payload)
+        if evidence_issues:
+            errors.append(
+                "APPLY_REPORT_JSON.applied_actions evidence must cite existing requirement IDs."
+            )
+        missing_actions = self._missing_required_actions(required_actions, applied_actions)
+        if missing_actions:
+            errors.append(
+                "Missing applied_actions entries for required_actions: "
+                + "; ".join(missing_actions)
+            )
+        return errors, missing_actions, evidence_issues
+
+    def _validate_apply_report_evidence(
+        self, applied_actions: List[Dict], payload: Dict
+    ) -> List[Dict[str, str]]:
+        if not isinstance(applied_actions, list):
+            return []
+        requirement_ids = {
+            str(item.get("id"))
             for item in payload.get("requirements", [])
-            if isinstance(item, dict)
+            if isinstance(item, dict) and item.get("id")
         }
-        blocking_actions = [
-            action
-            for action in required_actions
-            if isinstance(action, dict) and action.get("severity") == "blocking"
-        ]
-        applied_map = {
-            entry.get("action_id"): entry
-            for entry in applied_actions
-            if isinstance(entry, dict)
-        }
-
-        def evidence_ids(evidence: object) -> List[str]:
-            ids: List[str] = []
-            if isinstance(evidence, dict):
-                for value in evidence.values():
-                    ids.extend(evidence_ids(value))
-            elif isinstance(evidence, list):
-                for value in evidence:
-                    ids.extend(evidence_ids(value))
-            elif isinstance(evidence, str):
-                ids.append(evidence)
-            return ids
-
-        for action in blocking_actions:
-            action_id = action.get("id")
-            if not action_id:
+        if not requirement_ids:
+            return []
+        issues: List[Dict[str, str]] = []
+        for entry in applied_actions:
+            if not isinstance(entry, dict):
                 continue
-            applied = applied_map.get(action_id)
-            if not applied:
-                errors.append(f"Missing applied_actions entry for {action_id}.")
+            action = entry.get("action")
+            evidence = entry.get("evidence")
+            if not isinstance(action, str) or not isinstance(evidence, str):
                 continue
-            if applied.get("status") != "done":
-                errors.append(f"Action {action_id} status must be done.")
-            evidence = applied.get("evidence")
-            ids = [item for item in evidence_ids(evidence) if item in final_ids]
-            if not ids:
-                errors.append(f"Action {action_id} evidence must reference final IDs.")
-        return errors
+            if not any(req_id in evidence for req_id in requirement_ids):
+                issues.append({"action": action, "evidence": evidence})
+        return issues
+
+    def _remap_apply_report_ids(self, report: Dict, id_map: Dict[str, str]) -> Dict:
+        if not id_map:
+            return report
+        updated = dict(report)
+        applied_actions = updated.get("applied_actions")
+        if isinstance(applied_actions, list):
+            remapped_actions = []
+            for entry in applied_actions:
+                if not isinstance(entry, dict):
+                    remapped_actions.append(entry)
+                    continue
+                evidence = entry.get("evidence")
+                if isinstance(evidence, str):
+                    for old_id, new_id in id_map.items():
+                        if old_id in evidence:
+                            evidence = evidence.replace(old_id, new_id)
+                    entry = dict(entry)
+                    entry["evidence"] = evidence
+                remapped_actions.append(entry)
+            updated["applied_actions"] = remapped_actions
+        unapplied_actions = updated.get("unapplied_actions")
+        if isinstance(unapplied_actions, list):
+            updated["unapplied_actions"] = [
+                id_map.get(action, action) if isinstance(action, str) else action
+                for action in unapplied_actions
+            ]
+        return updated
 
     def _retry_apply_for_actions(
         self,
@@ -1284,6 +1409,8 @@ class RequirementsPipeline:
         final_payload: Dict,
         apply_report: Dict,
         errors: List[str],
+        missing_actions: List[str],
+        evidence_issues: List[Dict[str, str]],
         adapter: LLMAdapter,
         raw_dir: Path,
         artifacts_dir: Path,
@@ -1298,6 +1425,8 @@ class RequirementsPipeline:
             "current": final_payload,
             "apply_report": apply_report,
             "errors": errors,
+            "missing_actions": missing_actions,
+            "evidence_issues": evidence_issues,
         }
         full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
         write_text(raw_dir / "requirements_apply_retry_actions_prompt.txt", full_prompt)
@@ -1326,16 +1455,41 @@ class RequirementsPipeline:
                 stage="apply_retry_actions",
                 artifact="requirements",
                 raw_text=response.raw_text,
-                reason="APPLY_REPORT_JSON missing in apply retry.",
+                reason="Missing APPLY_REPORT_JSON or ADDRESSED_ACTIONS_JSON in apply retry.",
             )
-            return retry_payload_json, {}
-        report_errors = self._validate_apply_report(
+            self._write_enforcement_failed(
+                artifacts_dir=artifacts_dir,
+                stage="apply_retry_actions",
+                missing_actions=missing_actions,
+                evidence_issues=evidence_issues,
+                raw_text=response.raw_text,
+            )
+            raise RuntimeError(
+                "Apply retry missing action report (APPLY_REPORT_JSON or ADDRESSED_ACTIONS_JSON)."
+            )
+        (
+            report_errors,
+            missing_actions,
+            evidence_issues,
+        ) = self._validate_apply_report(
             report, retry_payload_json, cross_review.get("required_actions", [])
         )
-        if report_errors:
+        if report_errors or missing_actions or evidence_issues:
+            self._write_enforcement_failed(
+                artifacts_dir=artifacts_dir,
+                stage="apply_retry_actions",
+                missing_actions=missing_actions,
+                evidence_issues=evidence_issues,
+                raw_text=response.raw_text,
+            )
+            evidence_snippet = ""
+            if evidence_issues:
+                evidence_snippet = f" Evidence: {evidence_issues[0].get('evidence', '')[:200]}"
+            error_text = "; ".join(report_errors) if report_errors else "missing actions"
+            missing_text = ", ".join(missing_actions)
             raise RuntimeError(
-                "Apply retry did not satisfy blocking actions: "
-                + "; ".join(report_errors)
+                "Apply retry did not satisfy required actions: "
+                f"{error_text}. Missing actions: {missing_text}.{evidence_snippet}"
             )
         write_json(
             artifacts_dir / "requirements_apply_retry_actions_extracted.json",
@@ -1386,13 +1540,13 @@ class RequirementsPipeline:
             response.raw_text, artifacts_dir, stage="apply_final_retry"
         )
         if report is not None:
-            report_errors = self._validate_apply_report(
+            report_errors, missing_actions, evidence_issues = self._validate_apply_report(
                 report, retry_payload_json, cross_review.get("required_actions", [])
             )
-            if report_errors:
+            if report_errors or missing_actions or evidence_issues:
                 raise RuntimeError(
                     "Final-review retry did not satisfy blocking actions: "
-                    + "; ".join(report_errors)
+                    + "; ".join(report_errors or ["missing actions"])
                 )
         write_json(
             artifacts_dir / "requirements_apply_final_retry_extracted.json",

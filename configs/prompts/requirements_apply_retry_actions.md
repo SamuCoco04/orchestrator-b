@@ -8,6 +8,17 @@ Rules:
 Return JSON with this shape:
 {
   "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]},
-  "CHANGELOG_JSON": {"splits":[],"replacements":[],"added":[],"removed":[]},
-  "APPLY_REPORT_JSON": {"applied_actions":[],"unresolved_actions":[]}
+  "APPLY_REPORT_JSON": {"applied_actions":[],"unapplied_actions":[]}
+}
+
+Notes:
+- APPLY_REPORT_JSON is preferred, but ADDRESSED_ACTIONS_JSON is accepted as a fallback (parser supports both).
+- Each applied_actions[].evidence MUST mention at least one requirement ID present in FINAL_REQUIREMENTS_JSON.requirements[].id.
+
+Example APPLY_REPORT_JSON:
+{
+  "applied_actions": [
+    {"action":"Add missing coverage for notifications","evidence":"Added REQ-042 and REQ-043 to cover notification delivery and failure handling."}
+  ],
+  "unapplied_actions": []
 }
