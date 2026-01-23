@@ -13,7 +13,6 @@ def _make_limits(coverage_prefix_mode: bool = False) -> RequirementsLimits:
         add_only_batch_size=15,
         add_only_max_rounds=2,
         add_only_min_new_per_area=None,
-        add_only_max_per_call=15,
         assumptions_min=3,
         constraints_min=3,
         min_student_reqs=0,
@@ -71,3 +70,31 @@ def test_single_requirement_object_format_error() -> None:
             {"requirements", "assumptions", "constraints"},
             context="requirements_apply",
         )
+
+
+def test_extract_add_only_items_shapes() -> None:
+    pipeline = _make_pipeline()
+    samples = [
+        (
+            '{"REQUIREMENTS_ADD_ONLY_JSON":{"requirements":[{"id":"REQ-001","text":"Foo","priority":"must"}]}}',
+            "wrapper:REQUIREMENTS_ADD_ONLY_JSON",
+        ),
+        (
+            '{"REQUIREMENTS_JSON":{"requirements":[{"id":"REQ-002","text":"Bar","priority":"should"}]}}',
+            "wrapper:REQUIREMENTS_JSON",
+        ),
+        (
+            '{"requirements":[{"id":"REQ-003","text":"Baz","priority":"must"}]}',
+            "requirements_object",
+        ),
+        (
+            '[{"id":"REQ-004","text":"Qux","priority":"should"}]',
+            "bare_list",
+        ),
+    ]
+    for raw, expected_shape in samples:
+        items, shape, warning = pipeline._extract_add_only_items(raw)
+        assert warning is None
+        assert shape == expected_shape
+        assert len(items) == 1
+        assert items[0]["text"] in {"Foo", "Bar", "Baz", "Qux"}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from contextlib import contextmanager
@@ -115,7 +116,6 @@ class RequirementsLimits:
     add_only_batch_size: int
     add_only_max_rounds: int
     add_only_min_new_per_area: int | None
-    add_only_max_per_call: int
     assumptions_min: int
     constraints_min: int
     min_student_reqs: int
@@ -374,7 +374,7 @@ class RequirementsPipeline:
             return value
         return default_budget
 
-    def _stage_max_tokens(
+    def _stage_budget(
         self, limits: RequirementsLimits, artifact: str, stage: str, default_budget: int
     ) -> int:
         if stage == "lead":
@@ -384,9 +384,17 @@ class RequirementsPipeline:
         else:
             value = default_budget
         try:
-            max_value = int(value)
+            return int(value)
         except (TypeError, ValueError):
-            max_value = default_budget
+            return default_budget
+
+    def _stage_max_tokens(
+        self, limits: RequirementsLimits, artifact: str, stage: str, default_budget: int
+    ) -> int:
+        max_value = self._stage_budget(limits, artifact, stage, default_budget)
+        return self._apply_cli_cap(max_value)
+
+    def _apply_cli_cap(self, max_value: int) -> int:
         cap_raw = self._env("ORCH_MAX_OUTPUT_TOKENS", "")
         cap_value: int | None = None
         if isinstance(cap_raw, str) and cap_raw.strip():
@@ -422,6 +430,8 @@ class RequirementsPipeline:
     ) -> tuple[Dict, List[Dict], int, List[str], List[LLMResponse], Dict]:
         config = self._artifact_configs()[artifact]
         base_budget = self._artifact_token_budget(artifact, limits)
+        lead_budget = self._stage_budget(limits, artifact, "lead", base_budget)
+        apply_budget = self._stage_budget(limits, artifact, "apply", base_budget)
         lead_tokens = self._stage_max_tokens(limits, artifact, "lead", base_budget)
         apply_tokens = self._stage_max_tokens(limits, artifact, "apply", base_budget)
         responses: List[LLMResponse] = []
@@ -520,7 +530,8 @@ class RequirementsPipeline:
             cross_payload = {"brief": brief, "artifact": draft_payload}
         cross_full_prompt = f"{cross_review_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
         write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
-        cross_response = gemini.complete(cross_full_prompt)
+        with self._with_max_output_tokens(apply_tokens):
+            cross_response = gemini.complete(cross_full_prompt)
         responses.append(cross_response)
         write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
         self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
@@ -862,6 +873,8 @@ class RequirementsPipeline:
                     cli_cap = None
             summary.update(
                 {
+                    "lead_budget_max_output_tokens": lead_budget,
+                    "apply_budget_max_output_tokens": apply_budget,
                     "lead_max_output_tokens": lead_tokens,
                     "apply_max_output_tokens": apply_tokens,
                     "initial_count": count_before_add_only,
@@ -911,6 +924,8 @@ class RequirementsPipeline:
                     "add_only_max_output_tokens": apply_tokens,
                     "format_retry_max_output_tokens": apply_tokens,
                     "assumptions_constraints_max_output_tokens": apply_tokens,
+                    "effective_add_only_max_output_tokens": apply_tokens,
+                    "effective_format_fix_max_output_tokens": apply_tokens,
                 }
             )
             if self._requirements_filtered_out:
@@ -1980,7 +1995,6 @@ class RequirementsPipeline:
             "add_only_batch_size": limits.add_only_batch_size,
             "add_only_max_rounds": limits.add_only_max_rounds,
             "add_only_min_new_per_area": limits.add_only_min_new_per_area,
-            "add_only_max_per_call": limits.add_only_max_per_call,
             "min_assumptions": limits.assumptions_min,
             "min_constraints": limits.constraints_min,
             "min_student_reqs": limits.min_student_reqs,
@@ -2173,6 +2187,13 @@ class RequirementsPipeline:
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         ]
+        requested_payload = {
+            "request_n": generate_count,
+            "missing_areas": missing_coverage,
+            "counts": coverage_counts,
+            "effective_tokens": max_tokens,
+        }
+        write_json(artifacts_dir / f"add_only_round_{attempt}_requested.json", requested_payload)
         retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
         retry_payload = {
             "brief": brief,
@@ -2250,6 +2271,14 @@ class RequirementsPipeline:
             raw_dir=raw_dir,
             artifacts_dir=artifacts_dir,
             max_tokens=max_tokens,
+        )
+        write_json(
+            artifacts_dir / f"add_only_round_{attempt}_extracted.json",
+            additions,
+        )
+        write_json(
+            artifacts_dir / f"add_only_round_{attempt}_merge_report.json",
+            merge_report,
         )
         write_json(artifacts_dir / f"requirements_add_only_retry_{attempt}.json", additions)
         write_json(artifacts_dir / f"add_only_attempt_{attempt}.json", additions)
@@ -2333,16 +2362,8 @@ class RequirementsPipeline:
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
         max_retries = 2
-        def normalize_add_only_text(text: str) -> str:
-            normalized = text.strip()
-            if limits.coverage_prefix_mode:
-                match = re.match(r"^\[(.+?)\]\s+", normalized)
-                if match:
-                    normalized = normalized[match.end() :]
-            return self._normalize_exact_text(normalized)
-
         existing_texts = {
-            normalize_add_only_text(str(item.get("text", "")))
+            self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         }
@@ -2411,36 +2432,39 @@ class RequirementsPipeline:
             returned_count = len(items)
             accepted: List[Dict] = []
             rejected_reasons: List[str] = []
+            format_failure = False
+            new_texts: set[str] = set()
+            if returned_count != generate_count:
+                rejected_reasons.append("incorrect_count")
+                format_failure = True
             for item in items:
                 if not isinstance(item, dict):
                     rejected_reasons.append("invalid_item_type")
+                    format_failure = True
                     continue
                 text = str(item.get("text", "")).strip()
                 if not text:
                     rejected_reasons.append("missing_text")
+                    format_failure = True
                     continue
                 if limits.coverage_prefix_mode:
                     match = re.match(r"^\[(.+?)\]\s+", text)
                     if not match or match.group(1).strip() not in limits.coverage_areas:
                         rejected_reasons.append("invalid_prefix")
+                        format_failure = True
                         continue
-                normalized_text = normalize_add_only_text(text)
-                if normalized_text in existing_texts:
+                normalized_text = self._normalize_exact_text(text)
+                if normalized_text in existing_texts or normalized_text in new_texts:
                     rejected_reasons.append("duplicate_text")
+                    format_failure = True
                     continue
-                existing_texts.add(normalized_text)
+                new_texts.add(normalized_text)
                 accepted.append(item)
-            if len(accepted) > generate_count:
-                accepted = accepted[:generate_count]
             accepted_count = len(accepted)
-            remaining_missing_after_merge = max(
-                limits.req_min - (len(payload.get("requirements", [])) + accepted_count), 0
-            )
             report = {
-                "expected_N": generate_count,
+                "requested_count": generate_count,
                 "returned_count": returned_count,
                 "accepted_count": accepted_count,
-                "remaining_missing_after_merge": remaining_missing_after_merge,
                 "rejected_count": len(rejected_reasons),
                 "rejected_reasons": rejected_reasons,
                 "shape": shape,
@@ -2450,15 +2474,16 @@ class RequirementsPipeline:
                 / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
                 report,
             )
-            if accepted_count > 0:
+            if not format_failure and accepted_count == generate_count:
+                existing_texts.update(new_texts)
                 additions = {"requirements": accepted, "assumptions": [], "constraints": []}
                 return additions, report
         snippet = response.raw_text.strip().replace("\n", " ")
         if len(snippet) > 200:
             snippet = snippet[:200] + "..."
         raise RuntimeError(
-            "Add-only attempts produced zero usable items after retries. "
-            f"Expected up to {generate_count}, returned {returned_count}. "
+            "Add-only count enforcement failed. "
+            f"Expected {generate_count}, returned {returned_count}. "
             f"Shape: {shape}. Snippet: {snippet}"
         )
 
@@ -2878,20 +2903,18 @@ class RequirementsPipeline:
         requested_counts: List[int] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
-        chunk_size = limits.add_only_batch_size
-        max_attempts = limits.add_only_max_rounds
+        chunk_size = max(1, limits.add_only_batch_size)
+        start_count = len(payload.get("requirements", []))
+        start_missing = max(limits.req_min - start_count, 0)
+        if start_missing <= 0:
+            return payload, missing_coverage, attempts, balance_results, requested_counts
+        max_attempts = min(math.ceil(start_missing / chunk_size) + 2, 12)
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
             missing_count = max(limits.req_min - current_count, 0)
             if missing_count <= 0:
-                if limits.final_target_items is None or current_count >= limits.final_target_items:
-                    return payload, missing_coverage, attempts, balance_results, requested_counts
-                remaining = max(limits.final_target_items - current_count, 0)
-                generate_count = min(chunk_size, remaining, limits.add_only_max_per_call)
-            else:
-                generate_count = min(missing_count, limits.add_only_max_per_call)
-            if generate_count <= 0:
                 return payload, missing_coverage, attempts, balance_results, requested_counts
+            generate_count = min(missing_count, chunk_size)
             attempts += 1
             requested_counts.append(generate_count)
             (
@@ -2920,20 +2943,12 @@ class RequirementsPipeline:
                     "missing_count": missing_count,
                     "missing_coverage": missing_coverage,
                     "balance_results": balance_results,
+                    "max_rounds": max_attempts,
                 }
             )
             raise RuntimeError(
-                f"Requirements minimum unmet after add-only rounds. Missing {missing_count}."
-            )
-        elif limits.final_target_items and current_count < limits.final_target_items:
-            self._requirements_warnings.append(
-                {
-                    "stage": "add_only",
-                    "note": "Final target not reached after add-only rounds.",
-                    "current_count": current_count,
-                    "final_target_items": limits.final_target_items,
-                    "missing_coverage": missing_coverage,
-                }
+                "Requirements minimum unmet after add-only rounds. "
+                f"Missing {missing_count} after {max_attempts} rounds."
             )
         return payload, missing_coverage, attempts, balance_results, requested_counts
 
@@ -2958,7 +2973,8 @@ class RequirementsPipeline:
         }
         full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(review_payload)}\n"
         write_text(raw_dir / "requirements_final_review_prompt.txt", full_prompt)
-        response = gemini_adapter.complete(full_prompt)
+        with self._with_max_output_tokens(max_tokens):
+            response = gemini_adapter.complete(full_prompt)
         write_text(raw_dir / "requirements_final_review_raw.txt", response.raw_text)
         self._write_usage(raw_dir / "requirements_final_review_usage.json", response)
         extracted = self._safe_extract_json(response.raw_text)
@@ -2988,7 +3004,7 @@ class RequirementsPipeline:
         if limits.req_max is not None:
             remaining = max(limits.req_max - len(payload.get("requirements", [])), 0)
             generate_count = min(generate_count, remaining)
-        generate_count = min(generate_count, limits.add_only_max_per_call)
+        generate_count = min(generate_count, max(1, limits.add_only_batch_size))
         if generate_count <= 0:
             self._requirements_warnings.append(
                 {
@@ -3393,11 +3409,15 @@ class RequirementsPipeline:
             actual_count = summary.get("actual_count")
             assumptions_count = summary.get("assumptions_count")
             constraints_count = summary.get("constraints_count")
+            lead_budget_tokens = summary.get("lead_budget_max_output_tokens")
+            apply_budget_tokens = summary.get("apply_budget_max_output_tokens")
             lead_max_tokens = summary.get("lead_max_output_tokens")
             apply_max_tokens = summary.get("apply_max_output_tokens")
             cli_max_tokens = summary.get("cli_max_output_tokens")
             add_only_max_tokens = summary.get("add_only_max_output_tokens")
             format_retry_max_tokens = summary.get("format_retry_max_output_tokens")
+            effective_add_only_tokens = summary.get("effective_add_only_max_output_tokens")
+            effective_format_fix_tokens = summary.get("effective_format_fix_max_output_tokens")
             assumptions_constraints_max_tokens = summary.get(
                 "assumptions_constraints_max_output_tokens"
             )
@@ -3440,6 +3460,10 @@ class RequirementsPipeline:
                 lines.append(f"- final_target_items: {final_target_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
+            if lead_budget_tokens is not None:
+                lines.append(f"- lead_budget_max_output_tokens: {lead_budget_tokens}")
+            if apply_budget_tokens is not None:
+                lines.append(f"- apply_budget_max_output_tokens: {apply_budget_tokens}")
             if lead_max_tokens is not None:
                 lines.append(f"- lead_max_output_tokens: {lead_max_tokens}")
             if apply_max_tokens is not None:
@@ -3450,6 +3474,12 @@ class RequirementsPipeline:
                 lines.append(f"- add_only_max_output_tokens: {add_only_max_tokens}")
             if format_retry_max_tokens is not None:
                 lines.append(f"- format_retry_max_output_tokens: {format_retry_max_tokens}")
+            if effective_add_only_tokens is not None:
+                lines.append(f"- effective_add_only_max_output_tokens: {effective_add_only_tokens}")
+            if effective_format_fix_tokens is not None:
+                lines.append(
+                    f"- effective_format_fix_max_output_tokens: {effective_format_fix_tokens}"
+                )
             if assumptions_constraints_max_tokens is not None:
                 lines.append(
                     f"- assumptions_constraints_max_output_tokens: {assumptions_constraints_max_tokens}"
@@ -3594,6 +3624,8 @@ class RequirementsPipeline:
     ) -> tuple[Dict, Dict, bool]:
         failures: List[str] = []
         repairs_applied = False
+        base_budget = self._artifact_token_budget("requirements", limits)
+        apply_tokens = self._stage_max_tokens(limits, "requirements", "apply", base_budget)
 
         def write_normalized_if_repaired(
             final_payload: Dict, changelog_payload: Dict
@@ -3624,7 +3656,8 @@ class RequirementsPipeline:
             full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}{instruction}\n"
             prompt_path = raw_dir / "turnr4_apply_prompt.txt"
             write_text(prompt_path, full_prompt)
-            response = adapter.complete(full_prompt)
+            with self._with_max_output_tokens(apply_tokens):
+                response = adapter.complete(full_prompt)
             write_text(raw_dir / "turnr4_apply_raw.txt", response.raw_text)
             self._write_usage(raw_dir / "turnr4_apply_usage.json", response)
 
@@ -3686,7 +3719,8 @@ class RequirementsPipeline:
                 )
                 retry_prompt_path = raw_dir / "turnr4_apply_changelog_retry_prompt.txt"
                 write_text(retry_prompt_path, retry_full_prompt)
-                retry_response = adapter.complete(retry_full_prompt)
+                with self._with_max_output_tokens(apply_tokens):
+                    retry_response = adapter.complete(retry_full_prompt)
                 retry_raw_path = raw_dir / "turnr4_apply_changelog_retry_raw.txt"
                 write_text(retry_raw_path, retry_response.raw_text)
                 self._write_usage(
@@ -4316,7 +4350,10 @@ class RequirementsPipeline:
         retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
         retry_prompt_path = raw_dir / f"{prefix}_prompt.txt"
         write_text(retry_prompt_path, retry_full_prompt)
-        retry_response = adapter.complete(retry_full_prompt)
+        base_budget = self._artifact_token_budget("requirements", limits)
+        apply_tokens = self._stage_max_tokens(limits, "requirements", "apply", base_budget)
+        with self._with_max_output_tokens(apply_tokens):
+            retry_response = adapter.complete(retry_full_prompt)
         write_text(raw_dir / f"{prefix}_raw.txt", retry_response.raw_text)
         self._write_usage(raw_dir / f"{prefix}_usage.json", retry_response)
         try:
@@ -4348,13 +4385,17 @@ class RequirementsPipeline:
         artifacts_dir: Path,
         payload: Dict,
         retry_key: str,
+        limits: RequirementsLimits,
     ) -> Dict:
         self._delta_retry_counts[retry_key] = self._delta_retry_counts.get(retry_key, 0) + 1
         prompt = read_text(self.prompts_dir / prompt_name)
         full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}\n"
         retry_prefix = f"turn_apply_delta_{retry_key}"
         write_text(raw_dir / f"{retry_prefix}_prompt.txt", full_prompt)
-        response = adapter.complete(full_prompt)
+        base_budget = self._artifact_token_budget(retry_key, limits)
+        apply_tokens = self._stage_max_tokens(limits, retry_key, "apply", base_budget)
+        with self._with_max_output_tokens(apply_tokens):
+            response = adapter.complete(full_prompt)
         write_text(raw_dir / f"{retry_prefix}_raw.txt", response.raw_text)
         self._write_usage(raw_dir / f"{retry_prefix}_usage.json", response)
         try:
@@ -4408,7 +4449,10 @@ class RequirementsPipeline:
         retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{brief}\n"
         retry_prompt_path = raw_dir / f"turnr1_{section_name}_retry_prompt.txt"
         write_text(retry_prompt_path, retry_full_prompt)
-        retry_response = adapter.complete(retry_full_prompt)
+        base_budget = self._artifact_token_budget(section_name, limits)
+        lead_tokens = self._stage_max_tokens(limits, section_name, "lead", base_budget)
+        with self._with_max_output_tokens(lead_tokens):
+            retry_response = adapter.complete(retry_full_prompt)
         write_text(
             raw_dir / f"turnr1_{section_name}_retry_raw.txt", retry_response.raw_text
         )
@@ -4741,7 +4785,10 @@ class RequirementsPipeline:
         )
         acceptance_prompt_path = raw_dir / "turnr6_acceptance_prompt.txt"
         write_text(acceptance_prompt_path, acceptance_full_prompt)
-        acceptance_response = chatgpt.complete(acceptance_full_prompt)
+        acceptance_budget = self._artifact_configs()["acceptance_criteria"]["default_budget"]
+        acceptance_tokens = self._apply_cli_cap(acceptance_budget)
+        with self._with_max_output_tokens(acceptance_tokens):
+            acceptance_response = chatgpt.complete(acceptance_full_prompt)
         write_text(raw_dir / "turnr6_acceptance_raw.txt", acceptance_response.raw_text)
         self._write_usage(raw_dir / "turnr6_acceptance_usage.json", acceptance_response)
 
@@ -4769,7 +4816,8 @@ class RequirementsPipeline:
         cross_full_prompt = f"{cross_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
         cross_prompt_path = raw_dir / "turnr7_acceptance_cross_prompt.txt"
         write_text(cross_prompt_path, cross_full_prompt)
-        cross_response = gemini.complete(cross_full_prompt)
+        with self._with_max_output_tokens(acceptance_tokens):
+            cross_response = gemini.complete(cross_full_prompt)
         write_text(raw_dir / "turnr7_acceptance_cross_raw.txt", cross_response.raw_text)
         self._write_usage(raw_dir / "turnr7_acceptance_cross_usage.json", cross_response)
 
@@ -4788,7 +4836,8 @@ class RequirementsPipeline:
         finalize_full_prompt = f"{finalize_prompt}\n\nINPUT:\n{json.dumps(finalize_payload)}\n"
         finalize_prompt_path = raw_dir / "turnr8_acceptance_finalize_prompt.txt"
         write_text(finalize_prompt_path, finalize_full_prompt)
-        finalize_response = chatgpt.complete(finalize_full_prompt)
+        with self._with_max_output_tokens(acceptance_tokens):
+            finalize_response = chatgpt.complete(finalize_full_prompt)
         write_text(raw_dir / "turnr8_acceptance_finalize_raw.txt", finalize_response.raw_text)
         self._write_usage(raw_dir / "turnr8_acceptance_finalize_usage.json", finalize_response)
 
@@ -4867,13 +4916,27 @@ class RequirementsPipeline:
             "workflows", limits
         ):
             return {}
+        business_rules_tokens = self._stage_max_tokens(
+            limits,
+            "business_rules",
+            "apply",
+            self._artifact_token_budget("business_rules", limits),
+        )
+        workflows_tokens = self._stage_max_tokens(
+            limits,
+            "workflows",
+            "apply",
+            self._artifact_token_budget("workflows", limits),
+        )
+        combined_tokens = max(business_rules_tokens, workflows_tokens)
         prompt = self._render_prompt(
             read_text(self.prompts_dir / "requirements_apply_stage_b.md"), limits
         )
         payload = {"brief": brief, "requirements": final_requirements}
         full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}\n"
         write_text(raw_dir / "turn_apply_stage_b_prompt.txt", full_prompt)
-        response = adapter.complete(full_prompt)
+        with self._with_max_output_tokens(combined_tokens):
+            response = adapter.complete(full_prompt)
         write_text(raw_dir / "turn_apply_stage_b_raw.txt", response.raw_text)
         self._write_usage(raw_dir / "turn_apply_stage_b_usage.json", response)
 
@@ -4940,6 +5003,7 @@ class RequirementsPipeline:
                     artifacts_dir=artifacts_dir,
                     payload=workflows,
                     retry_key="workflows",
+                    limits=limits,
                 )
                 self._section_warnings.setdefault("workflows", []).append(str(exc))
             results["workflows"] = workflows
@@ -4979,13 +5043,27 @@ class RequirementsPipeline:
             "mvp_scope", limits
         ):
             return {}
+        domain_model_tokens = self._stage_max_tokens(
+            limits,
+            "domain_model",
+            "apply",
+            self._artifact_token_budget("domain_model", limits),
+        )
+        mvp_scope_tokens = self._stage_max_tokens(
+            limits,
+            "mvp_scope",
+            "apply",
+            self._artifact_token_budget("mvp_scope", limits),
+        )
+        combined_tokens = max(domain_model_tokens, mvp_scope_tokens)
         prompt = self._render_prompt(
             read_text(self.prompts_dir / "requirements_apply_stage_c.md"), limits
         )
         payload = {"brief": brief, "requirements": final_requirements}
         full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(payload)}\n"
         write_text(raw_dir / "turn_apply_stage_c_prompt.txt", full_prompt)
-        response = adapter.complete(full_prompt)
+        with self._with_max_output_tokens(combined_tokens):
+            response = adapter.complete(full_prompt)
         write_text(raw_dir / "turn_apply_stage_c_raw.txt", response.raw_text)
         self._write_usage(raw_dir / "turn_apply_stage_c_usage.json", response)
 
@@ -5026,6 +5104,7 @@ class RequirementsPipeline:
                     artifacts_dir=artifacts_dir,
                     payload=repaired,
                     retry_key="domain_model",
+                    limits=limits,
                 )
                 self._section_warnings.setdefault("domain_model", []).append(str(exc))
             results["domain_model"] = repaired
@@ -5179,7 +5258,10 @@ class RequirementsPipeline:
         retry_full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
         retry_prompt_path = raw_dir / "turnr1_coverage_retry_prompt.txt"
         write_text(retry_prompt_path, retry_full_prompt)
-        retry_response = adapter.complete(retry_full_prompt)
+        base_budget = self._artifact_token_budget("requirements", limits)
+        lead_tokens = self._stage_max_tokens(limits, "requirements", "lead", base_budget)
+        with self._with_max_output_tokens(lead_tokens):
+            retry_response = adapter.complete(retry_full_prompt)
         retry_raw_path = raw_dir / "turnr1_coverage_retry_raw.txt"
         write_text(retry_raw_path, retry_response.raw_text)
         self._write_usage(raw_dir / "turnr1_coverage_retry_usage.json", retry_response)
@@ -5710,13 +5792,9 @@ class RequirementsPipeline:
         except (TypeError, ValueError):
             final_target_items = None
         try:
-            add_only_batch_size = int(add_only_batch_raw)
+            add_only_batch_size = max(1, int(add_only_batch_raw))
         except (TypeError, ValueError):
             add_only_batch_size = 15
-        add_only_max_per_call_raw = frontmatter.get(
-            "MAX_ADD_ONLY_PER_CALL",
-            frontmatter.get("add_only_max_per_call", add_only_batch_size),
-        )
         try:
             add_only_max_rounds = int(add_only_rounds_raw)
         except (TypeError, ValueError):
@@ -5729,10 +5807,6 @@ class RequirementsPipeline:
             )
         except (TypeError, ValueError):
             add_only_min_new_per_area = None
-        try:
-            add_only_max_per_call = max(1, int(add_only_max_per_call_raw))
-        except (TypeError, ValueError):
-            add_only_max_per_call = max(1, add_only_batch_size)
 
         coverage_keywords: Dict[str, List[str]] = {
             area: list(keywords)
@@ -5779,7 +5853,6 @@ class RequirementsPipeline:
             add_only_batch_size=add_only_batch_size,
             add_only_max_rounds=add_only_max_rounds,
             add_only_min_new_per_area=add_only_min_new_per_area,
-            add_only_max_per_call=add_only_max_per_call,
             assumptions_min=assumptions_min,
             constraints_min=constraints_min,
             min_student_reqs=min_student_reqs,
@@ -5804,7 +5877,6 @@ class RequirementsPipeline:
             "requirements_max": limits.req_max,
             "assumptions_min": limits.assumptions_min,
             "constraints_min": limits.constraints_min,
-            "add_only_max_per_call": limits.add_only_max_per_call,
             "min_student_reqs": limits.min_student_reqs,
             "min_coordinator_reqs": limits.min_coordinator_reqs,
             "min_admin_reqs": limits.min_admin_reqs,
