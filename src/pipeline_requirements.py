@@ -2240,25 +2240,15 @@ class RequirementsPipeline:
         )
         if prefix_instruction:
             full_prompt = full_prompt.replace("\n\nINPUT:\n", f"{prefix_instruction}\n\nINPUT:\n")
-        write_text(raw_dir / f"add_only_retry_{attempt}_prompt.txt", full_prompt)
-        write_text(raw_dir / f"add_only_prompt_attempt_{attempt}.txt", full_prompt)
-        with self._with_max_output_tokens(max_tokens):
-            response = adapter.complete(full_prompt)
-        write_text(raw_dir / f"add_only_attempt_{attempt}_raw.txt", response.raw_text)
-        write_text(
-            raw_dir / f"requirements_add_only_attempt_{attempt}_raw.txt",
-            response.raw_text,
-        )
-        self._write_usage(raw_dir / f"requirements_add_only_retry_{attempt}_usage.json", response)
-        additions = self._parse_add_only_response(
-            response.raw_text,
+        additions, merge_report = self._parse_add_only_response(
             attempt=attempt,
             generate_count=generate_count,
+            full_prompt=full_prompt,
+            retry_payload=retry_payload,
             brief=brief,
             limits=limits,
             payload=payload,
             adapter=adapter,
-            gemini_review=gemini_review,
             raw_dir=raw_dir,
             artifacts_dir=artifacts_dir,
             max_tokens=max_tokens,
@@ -2301,7 +2291,7 @@ class RequirementsPipeline:
             attempt_warnings.extend(
                 [{"stage": "quality_gate", "warning": warning} for warning in quality_warnings]
             )
-        payload = self._merge_requirements_additions(payload, additions)
+        payload = self._merge_requirements_additions(payload, additions, dedupe_mode="exact_text")
         payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
         if filtered_out:
             self._requirements_filtered_out.extend(filtered_out)
@@ -2332,85 +2322,154 @@ class RequirementsPipeline:
 
     def _parse_add_only_response(
         self,
-        raw_text: str,
         attempt: int,
         generate_count: int,
+        full_prompt: str,
+        retry_payload: Dict,
         brief: str,
         limits: RequirementsLimits,
         payload: Dict,
         adapter: LLMAdapter,
-        gemini_review: Dict,
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
-    ) -> Dict:
-        try:
-            return self._extract_wrapped_json_any(
-                raw_text,
-                ["REQUIREMENTS_JSON"],
-                {"requirements", "assumptions", "constraints"},
-            )
-        except ValueError as exc:
-            self._add_only_parse_failures += 1
-            retry_count = max(5, generate_count // 2)
-            retry_payload = {
-                "brief": brief,
-                "current_requirements": payload,
-                "targets": self._requirements_targets_payload(limits),
-                "missing_count": max(limits.req_min - len(payload.get("requirements", [])), 0),
-                "generate_count": retry_count,
-                "missing_coverage_areas": self._missing_coverage_areas(payload, limits),
-                "coverage_counts": self._coverage_counts(payload, limits),
-                "existing_ids": [
-                    item.get("id")
-                    for item in payload.get("requirements", [])
-                    if isinstance(item, dict)
-                ],
-                "existing_texts": [
-                    str(item.get("text", ""))[:120]
-                    for item in payload.get("requirements", [])
-                    if isinstance(item, dict)
-                ],
-                "existing_fingerprints": [
-                    self._semantic_fingerprint(str(item.get("text", "")))
-                    for item in payload.get("requirements", [])
-                    if isinstance(item, dict)
-                ],
-                "gemini_review": gemini_review,
+    ) -> tuple[Dict, Dict]:
+        max_retries = 2
+        existing_texts = {
+            self._normalize_exact_text(str(item.get("text", "")))
+            for item in payload.get("requirements", [])
+            if isinstance(item, dict)
+        }
+        missing_coverage = self._missing_coverage_areas(payload, limits)
+        coverage_counts = self._coverage_counts(payload, limits)
+        for retry_index in range(1, max_retries + 2):
+            strict = retry_index > 1
+            strict_note = ""
+            if strict:
+                strict_note = (
+                    "\nCOUNT_STRICT: Output exactly generate_count items. "
+                    "If you output fewer or more, you fail. No prose."
+                )
+            if limits.coverage_prefix_mode:
+                strict_note += (
+                    "\nEvery requirement MUST start with [<Coverage Area>] "
+                    "using only the provided coverage_areas."
+                )
+            requested_payload = {
+                "expected_N": generate_count,
+                "existing_ids_count": len(
+                    [
+                        item.get("id")
+                        for item in payload.get("requirements", [])
+                        if isinstance(item, dict)
+                    ]
+                ),
+                "missing_areas": missing_coverage,
+                "coverage_counts": coverage_counts,
             }
-            retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
-            retry_full_prompt = (
-                f"{retry_prompt}\n\nGenerate EXACTLY {retry_count} new requirements. "
-                "Use short, testable requirements.\n\nINPUT:\n"
-                f"{json.dumps(retry_payload)}\n"
+            write_json(
+                artifacts_dir
+                / f"add_only_round_{attempt}_attempt_{retry_index}_requested.json",
+                requested_payload,
             )
-            write_text(raw_dir / f"add_only_attempt_{attempt}_retry_prompt.txt", retry_full_prompt)
+            prompt = f"{full_prompt}{strict_note}"
+            write_text(
+                raw_dir / f"add_only_round_{attempt}_attempt_{retry_index}_prompt.txt",
+                prompt,
+            )
             with self._with_max_output_tokens(max_tokens):
-                retry_response = adapter.complete(retry_full_prompt)
+                response = adapter.complete(prompt)
             write_text(
-                raw_dir / f"add_only_attempt_{attempt}_retry_raw.txt",
-                retry_response.raw_text,
-            )
-            write_text(
-                raw_dir / f"requirements_add_only_attempt_{attempt}_retry_raw.txt",
-                retry_response.raw_text,
+                raw_dir / f"add_only_round_{attempt}_attempt_{retry_index}_raw.txt",
+                response.raw_text,
             )
             self._write_usage(
-                raw_dir / f"requirements_add_only_retry_{attempt}_retry_usage.json",
-                retry_response,
+                raw_dir / f"add_only_round_{attempt}_attempt_{retry_index}_usage.json",
+                response,
             )
-            try:
-                return self._extract_wrapped_json_any(
-                    retry_response.raw_text,
-                    ["REQUIREMENTS_JSON"],
-                    {"requirements", "assumptions", "constraints"},
+            items, shape, warning = self._extract_add_only_items(response.raw_text)
+            if warning:
+                self._requirements_warnings.append(
+                    {
+                        "stage": "add_only",
+                        "note": warning,
+                        "attempt": attempt,
+                        "retry": retry_index,
+                    }
                 )
-            except ValueError as retry_exc:
-                self._add_only_parse_failures += 1
-                raise RuntimeError(
-                    "Add-only failed due to truncation/parse errors after retry. "
-                    f"Attempt {attempt}."
-                ) from retry_exc
+            write_json(
+                artifacts_dir
+                / f"add_only_round_{attempt}_attempt_{retry_index}_extracted.json",
+                items,
+            )
+            returned_count = len(items)
+            accepted: List[Dict] = []
+            rejected_reasons: List[str] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    rejected_reasons.append("invalid_item_type")
+                    continue
+                text = str(item.get("text", "")).strip()
+                if not text:
+                    rejected_reasons.append("missing_text")
+                    continue
+                if limits.coverage_prefix_mode:
+                    match = re.match(r"^\[(.+?)\]\s+", text)
+                    if not match or match.group(1).strip() not in limits.coverage_areas:
+                        rejected_reasons.append("invalid_prefix")
+                        continue
+                normalized_text = self._normalize_exact_text(text)
+                if normalized_text in existing_texts:
+                    rejected_reasons.append("duplicate_text")
+                    continue
+                existing_texts.add(normalized_text)
+                accepted.append(item)
+            accepted_count = len(accepted)
+            report = {
+                "expected_N": generate_count,
+                "returned_count": returned_count,
+                "accepted_count": accepted_count,
+                "rejected_count": len(rejected_reasons),
+                "rejected_reasons": rejected_reasons,
+                "shape": shape,
+            }
+            write_json(
+                artifacts_dir
+                / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
+                report,
+            )
+            if returned_count == generate_count and accepted_count == generate_count:
+                additions = {"requirements": accepted, "assumptions": [], "constraints": []}
+                return additions, report
+        snippet = response.raw_text.strip().replace("\n", " ")
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "..."
+        raise RuntimeError(
+            "Add-only count strict enforcement failed. "
+            f"Expected {generate_count}, returned {returned_count}. "
+            f"Shape: {shape}. Snippet: {snippet}"
+        )
+
+    def _extract_add_only_items(self, raw_text: str) -> tuple[List[Dict], str, str | None]:
+        try:
+            parsed = extract_json(raw_text)
+        except ValueError as exc:
+            return [], "parse_failed", f"parse_failed: {exc}"
+        if isinstance(parsed, dict):
+            for label in ["REQUIREMENTS_ADD_ONLY_JSON", "REQUIREMENTS_JSON"]:
+                if label in parsed and isinstance(parsed[label], dict):
+                    payload = parsed[label]
+                    reqs = payload.get("requirements", [])
+                    if isinstance(reqs, list):
+                        return reqs, f"wrapper:{label}", None
+            if "requirements" in parsed and isinstance(parsed.get("requirements"), list):
+                return parsed["requirements"], "requirements_object", None
+        if isinstance(parsed, list):
+            return parsed, "bare_list", None
+        snippet = raw_text.strip().replace("\n", " ")
+        if len(snippet) > 200:
+            snippet = snippet[:200] + "..."
+        return [], "unexpected_type", f"unexpected_type: {snippet}"
 
     def _format_retry_requirements(
         self,
@@ -3154,7 +3213,9 @@ class RequirementsPipeline:
         payload["requirements"] = updated
         return payload
 
-    def _merge_requirements_additions(self, base: Dict, additions: Dict) -> Dict:
+    def _merge_requirements_additions(
+        self, base: Dict, additions: Dict, dedupe_mode: str = "full"
+    ) -> Dict:
         merged = {
             "requirements": list(base.get("requirements", [])),
             "assumptions": list(base.get("assumptions", [])),
@@ -3170,17 +3231,20 @@ class RequirementsPipeline:
             for item in merged["requirements"]
             if isinstance(item, dict)
         }
-        existing_fingerprints = {
-            self._semantic_fingerprint(str(item.get("text", "")).strip())
-            for item in merged["requirements"]
-            if isinstance(item, dict)
-        }
+        existing_fingerprints = set()
+        if dedupe_mode == "full":
+            existing_fingerprints = {
+                self._semantic_fingerprint(str(item.get("text", "")).strip())
+                for item in merged["requirements"]
+                if isinstance(item, dict)
+            }
         for item in additions.get("requirements", []):
             if isinstance(item, dict):
                 item_id = item.get("id")
                 item_text = str(item.get("text", "")).strip()
                 normalized_text = item_text.lower()
                 fingerprint = self._semantic_fingerprint(item_text)
+                normalized_exact = self._normalize_exact_text(item_text)
                 if isinstance(item_id, str) and item_id in existing_ids:
                     self._requirements_duplicates_debug.append(
                         {
@@ -3190,7 +3254,7 @@ class RequirementsPipeline:
                         }
                     )
                     continue
-                if normalized_text and normalized_text in existing_texts:
+                if normalized_exact and normalized_exact in existing_texts:
                     self._requirements_duplicates_debug.append(
                         {
                             "reason": "duplicate_text",
@@ -3199,7 +3263,7 @@ class RequirementsPipeline:
                         }
                     )
                     continue
-                if fingerprint and fingerprint in existing_fingerprints:
+                if dedupe_mode == "full" and fingerprint and fingerprint in existing_fingerprints:
                     self._requirements_duplicates_debug.append(
                         {
                             "reason": "duplicate_semantic",
@@ -3210,9 +3274,9 @@ class RequirementsPipeline:
                     continue
                 if isinstance(item_id, str):
                     existing_ids.add(item_id)
-                if normalized_text:
-                    existing_texts.add(normalized_text)
-                if fingerprint:
+                if normalized_exact:
+                    existing_texts.add(normalized_exact)
+                if dedupe_mode == "full" and fingerprint:
                     existing_fingerprints.add(fingerprint)
                 merged["requirements"].append(item)
         for item in additions.get("assumptions", []):
@@ -3222,6 +3286,10 @@ class RequirementsPipeline:
             if isinstance(item, str):
                 merged["constraints"].append(item)
         return merged
+
+    def _normalize_exact_text(self, text: str) -> str:
+        normalized = re.sub(r"\s+", " ", text.strip().lower())
+        return normalized
 
     def _normalize_requirement_ids(
         self, payload: Dict, changelog: Dict | None = None
