@@ -19,6 +19,7 @@ Rules:
 - Avoid duplicating any existing IDs or texts provided in the input.
 - Satisfy Gemini required_actions by adding requirements that address the requested areas.
 - If missing coverage areas are listed, explicitly mention them in new requirements.
+- If coverage_prefix_mode is true, each new requirement MUST start with "[<Coverage Area>] " using only the provided coverage_areas.
 - If missing balance targets are listed, ensure new requirements close those gaps.
 - Each new requirement must include: actor + domain object + action + observable outcome.
 - Avoid placeholders such as: "as described in the brief", "define and enforce behavior", "user-friendly interface", "provide guidelines".

@@ -37,6 +37,7 @@ Format contract:
 Rules:
 - Apply Gemini critique to remove ambiguity, add missing detail, and cover edge cases.
 - If below minimum, generate NEW requirements aligned to the brief.
+- If coverage_prefix_mode is true, each requirement MUST start with "[<Coverage Area>] " using only the provided coverage_areas.
 - Do NOT rename existing requirement IDs; only add new requirements with new IDs.
 - No markdown, no extra keys.
 

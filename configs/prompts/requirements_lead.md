@@ -31,5 +31,6 @@ Rules:
 - If below minimum, generate NEW high-value requirements aligned to the brief.
 - requirements must meet the target range if max is provided.
 - If coverage_areas provided, ensure each area appears in requirement text (include the area name).
+- If coverage_prefix_mode is true, each requirement MUST start with "[<Coverage Area>] " using only the provided coverage_areas.
 - If seed_requirements provided, ensure each seed is captured or paraphrased in requirements.
 - No markdown, no extra keys.
