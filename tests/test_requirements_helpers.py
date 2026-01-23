@@ -9,6 +9,10 @@ def _make_limits(coverage_prefix_mode: bool = False) -> RequirementsLimits:
     return RequirementsLimits(
         req_min=1,
         req_max=None,
+        final_target_items=None,
+        add_only_batch_size=15,
+        add_only_max_rounds=2,
+        add_only_min_new_per_area=None,
         assumptions_min=3,
         constraints_min=3,
         min_student_reqs=0,

@@ -80,6 +80,7 @@ def main() -> None:
     for path in [inputs_dir, raw_dir, artifacts_dir, quality_dir]:
         path.mkdir(parents=True, exist_ok=True)
 
+    original_max_tokens = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
     if args.max_output_tokens is not None:
         os.environ["ORCH_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
     else:
@@ -98,15 +99,21 @@ def main() -> None:
 
     write_text(inputs_dir / "brief.md", brief_path.read_text(encoding="utf-8"))
 
-    if args.pipeline == "requirements":
-        pipeline = RequirementsPipeline(args.mode, base_dir)
-        pipeline.run(brief_path, run_dir, artifact=args.artifact)
-    elif args.pipeline == "architecture":
-        pipeline = ArchitecturePipeline(args.mode, base_dir)
-        pipeline.run(brief_path, run_dir)
-    else:
-        pipeline = CodePipeline(args.mode, base_dir)
-        pipeline.run(run_dir, args.gate_cmd, brief_path, args.inputs_from_run)
+    try:
+        if args.pipeline == "requirements":
+            pipeline = RequirementsPipeline(args.mode, base_dir)
+            pipeline.run(brief_path, run_dir, artifact=args.artifact)
+        elif args.pipeline == "architecture":
+            pipeline = ArchitecturePipeline(args.mode, base_dir)
+            pipeline.run(brief_path, run_dir)
+        else:
+            pipeline = CodePipeline(args.mode, base_dir)
+            pipeline.run(run_dir, args.gate_cmd, brief_path, args.inputs_from_run)
+    finally:
+        if original_max_tokens is None:
+            os.environ.pop("ORCH_MAX_OUTPUT_TOKENS", None)
+        else:
+            os.environ["ORCH_MAX_OUTPUT_TOKENS"] = original_max_tokens
 
 
 if __name__ == "__main__":

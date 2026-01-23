@@ -111,6 +111,10 @@ def _extract_first_json_object_static(text: str) -> str | None:
 class RequirementsLimits:
     req_min: int
     req_max: int | None
+    final_target_items: int | None
+    add_only_batch_size: int
+    add_only_max_rounds: int
+    add_only_min_new_per_area: int | None
     assumptions_min: int
     constraints_min: int
     min_student_reqs: int
@@ -503,7 +507,7 @@ class RequirementsPipeline:
             write_json(artifacts_dir / "requirements_draft_normalized.json", draft_payload)
 
         if artifact == "requirements":
-            cross_template = read_text(self.prompts_dir / "requirements_gemini_cross_review.md")
+            cross_template = read_text(self.prompts_dir / "requirements_cross_review.md")
             cross_review_prompt = self._render_prompt(cross_template, limits)
             cross_payload = {
                 "brief": brief,
@@ -521,6 +525,17 @@ class RequirementsPipeline:
         self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
         cross_review = self._safe_extract_json(cross_response.raw_text)
         if artifact == "requirements":
+            try:
+                cross_review = extract_json(cross_response.raw_text)
+            except ValueError as exc:
+                snippet = cross_response.raw_text.strip().replace("\n", " ")
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "..."
+                raise RuntimeError(
+                    "Requirements cross-review extraction failed. "
+                    f"See raw/{artifact}_cross_review_raw.txt. Error: {exc}. "
+                    f"Snippet: {snippet}"
+                ) from exc
             write_json(
                 artifacts_dir / "requirements_cross_review_extracted.json", cross_review
             )
@@ -837,12 +852,20 @@ class RequirementsPipeline:
                     apply_report = self._remap_apply_report_ids(apply_report, id_map)
                 write_json(artifacts_dir / "requirements_apply_report.json", apply_report)
             coverage_counts = self._coverage_counts(final_payload, limits)
+            cli_cap_raw = self._env("ORCH_MAX_OUTPUT_TOKENS", "")
+            cli_cap = None
+            if isinstance(cli_cap_raw, str) and cli_cap_raw.strip():
+                try:
+                    cli_cap = int(cli_cap_raw)
+                except (TypeError, ValueError):
+                    cli_cap = None
             summary.update(
                 {
                     "lead_max_output_tokens": lead_tokens,
                     "apply_max_output_tokens": apply_tokens,
                     "initial_count": count_before_add_only,
                     "target_min_items": limits.req_min,
+                    "final_target_items": limits.final_target_items,
                     "actual_count": len(final_payload.get("requirements", [])),
                     "assumptions_count": len(final_payload.get("assumptions", [])),
                     "constraints_count": len(final_payload.get("constraints", [])),
@@ -853,7 +876,7 @@ class RequirementsPipeline:
                     "missing_after_add_only": missing_after_add_only,
                     "count_before_add_only": count_before_add_only,
                     "count_after_add_only": count_after_add_only,
-                    "add_only_chunk_size": None,
+                    "add_only_chunk_size": limits.add_only_batch_size,
                     "add_only_requested": add_only_requested,
                     "add_only_parse_failures": self._add_only_parse_failures,
                     "expand_generic_attempts": expand_generic_attempts,
@@ -883,6 +906,10 @@ class RequirementsPipeline:
                     "wrapper_repairs_applied": bool(
                         self._apply_format_retry_used or self._json_parse_repairs
                     ),
+                    "cli_max_output_tokens": cli_cap,
+                    "add_only_max_output_tokens": apply_tokens,
+                    "format_retry_max_output_tokens": apply_tokens,
+                    "assumptions_constraints_max_output_tokens": apply_tokens,
                 }
             )
             if self._requirements_filtered_out:
@@ -1948,6 +1975,10 @@ class RequirementsPipeline:
         return {
             "target_min_items": limits.req_min,
             "target_max_items": limits.req_max,
+            "final_target_items": limits.final_target_items,
+            "add_only_batch_size": limits.add_only_batch_size,
+            "add_only_max_rounds": limits.add_only_max_rounds,
+            "add_only_min_new_per_area": limits.add_only_min_new_per_area,
             "min_assumptions": limits.assumptions_min,
             "min_constraints": limits.constraints_min,
             "min_student_reqs": limits.min_student_reqs,
@@ -1959,6 +1990,10 @@ class RequirementsPipeline:
             "coverage_keywords": limits.coverage_keywords,
             "min_per_area": limits.min_per_area,
             "coverage_prefix_mode": limits.coverage_prefix_mode,
+            "final_target_items": limits.final_target_items,
+            "add_only_batch_size": limits.add_only_batch_size,
+            "add_only_max_rounds": limits.add_only_max_rounds,
+            "add_only_min_new_per_area": limits.add_only_min_new_per_area,
         }
 
     def _coverage_keywords_for_area(self, limits: RequirementsLimits, area: str) -> List[str]:
@@ -2150,6 +2185,7 @@ class RequirementsPipeline:
             "missing_coverage_areas": missing_coverage,
             "coverage_counts": coverage_counts,
             "coverage_targets": coverage_targets,
+            "min_new_per_area": limits.add_only_min_new_per_area,
             "missing_balance_targets": missing_balance_targets,
             "balance_results": balance_results,
             "out_of_scope": self._out_of_scope_terms,
@@ -2771,14 +2807,18 @@ class RequirementsPipeline:
         requested_counts: List[int] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
-        chunk_size = None
-        max_attempts = 2
+        chunk_size = limits.add_only_batch_size
+        max_attempts = limits.add_only_max_rounds
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
             missing_count = max(limits.req_min - current_count, 0)
             if missing_count <= 0:
-                return payload, missing_coverage, attempts, balance_results, requested_counts
-            generate_count = missing_count
+                if limits.final_target_items is None or current_count >= limits.final_target_items:
+                    return payload, missing_coverage, attempts, balance_results, requested_counts
+                remaining = max(limits.final_target_items - current_count, 0)
+                generate_count = min(chunk_size, remaining)
+            else:
+                generate_count = missing_count
             attempts += 1
             requested_counts.append(generate_count)
             (
@@ -2807,6 +2847,19 @@ class RequirementsPipeline:
                     "missing_count": missing_count,
                     "missing_coverage": missing_coverage,
                     "balance_results": balance_results,
+                }
+            )
+            raise RuntimeError(
+                f"Requirements minimum unmet after add-only rounds. Missing {missing_count}."
+            )
+        elif limits.final_target_items and current_count < limits.final_target_items:
+            self._requirements_warnings.append(
+                {
+                    "stage": "add_only",
+                    "note": "Final target not reached after add-only rounds.",
+                    "current_count": current_count,
+                    "final_target_items": limits.final_target_items,
+                    "missing_coverage": missing_coverage,
                 }
             )
         return payload, missing_coverage, attempts, balance_results, requested_counts
@@ -2935,16 +2988,8 @@ class RequirementsPipeline:
         missing_constraints = max(limits.constraints_min - len(current_constraints), 0)
         if missing_assumptions <= 0 and missing_constraints <= 0:
             return payload, 0, 0
-        prompt = (
-            "Add ONLY assumptions and constraints to meet the missing counts. "
-            "Do NOT add or rewrite requirements. "
-            "Return a SINGLE JSON object with wrapper:\n"
-            '{\n  "REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]}\n}\n'
-            "Rules:\n"
-            "- Generate EXACTLY missing_assumptions assumptions and EXACTLY missing_constraints constraints.\n"
-            "- Each assumption/constraint must be concise and testable.\n"
-            "- Do not repeat existing entries.\n"
-            "- No markdown, no extra keys.\n"
+        prompt = read_text(
+            self.prompts_dir / "requirements_assumptions_constraints_micro.md"
         )
         payload_input = {
             "brief": brief,
@@ -3260,12 +3305,19 @@ class RequirementsPipeline:
         ]
         if artifact == "requirements" and summary:
             target_min_items = summary.get("target_min_items")
+            final_target_items = summary.get("final_target_items")
             initial_count = summary.get("initial_count")
             actual_count = summary.get("actual_count")
             assumptions_count = summary.get("assumptions_count")
             constraints_count = summary.get("constraints_count")
             lead_max_tokens = summary.get("lead_max_output_tokens")
             apply_max_tokens = summary.get("apply_max_output_tokens")
+            cli_max_tokens = summary.get("cli_max_output_tokens")
+            add_only_max_tokens = summary.get("add_only_max_output_tokens")
+            format_retry_max_tokens = summary.get("format_retry_max_output_tokens")
+            assumptions_constraints_max_tokens = summary.get(
+                "assumptions_constraints_max_output_tokens"
+            )
             missing_coverage = summary.get("missing_coverage_areas", [])
             add_only_attempts = summary.get("add_only_attempts")
             total_add_only_attempts = summary.get("total_add_only_attempts")
@@ -3301,12 +3353,24 @@ class RequirementsPipeline:
             coverage_unmapped_count = summary.get("coverage_unmapped_count")
             apply_action_retry_used = summary.get("apply_action_retry_used")
             lines.append(f"- target_min_items: {target_min_items}")
+            if final_target_items is not None:
+                lines.append(f"- final_target_items: {final_target_items}")
             lines.append(f"- initial_count: {initial_count}")
             lines.append(f"- final_count: {actual_count}")
             if lead_max_tokens is not None:
                 lines.append(f"- lead_max_output_tokens: {lead_max_tokens}")
             if apply_max_tokens is not None:
                 lines.append(f"- apply_max_output_tokens: {apply_max_tokens}")
+            if cli_max_tokens is not None:
+                lines.append(f"- cli_max_output_tokens: {cli_max_tokens}")
+            if add_only_max_tokens is not None:
+                lines.append(f"- add_only_max_output_tokens: {add_only_max_tokens}")
+            if format_retry_max_tokens is not None:
+                lines.append(f"- format_retry_max_output_tokens: {format_retry_max_tokens}")
+            if assumptions_constraints_max_tokens is not None:
+                lines.append(
+                    f"- assumptions_constraints_max_output_tokens: {assumptions_constraints_max_tokens}"
+                )
             if assumptions_count is not None:
                 lines.append(f"- assumptions_count: {assumptions_count}")
             if constraints_count is not None:
@@ -5532,6 +5596,16 @@ class RequirementsPipeline:
         min_coordinator_reqs_raw = targets.get("min_coordinator_reqs", 15)
         min_admin_reqs_raw = targets.get("min_admin_reqs", 8)
         min_domain_keyword_hits_raw = targets.get("min_domain_keyword_hits", 40)
+        final_target_raw = frontmatter.get(
+            "final_target_items",
+            targets.get("final_target_items", targets.get("target_final_items")),
+        )
+        add_only_batch_raw = frontmatter.get("add_only_batch_size", 15)
+        add_only_rounds_raw = frontmatter.get("add_only_max_rounds", 6)
+        add_only_min_new_per_area_raw = frontmatter.get(
+            "add_only_min_new_per_area",
+            targets.get("add_only_min_new_per_area"),
+        )
         try:
             min_student_reqs = int(min_student_reqs_raw)
         except (TypeError, ValueError):
@@ -5548,6 +5622,26 @@ class RequirementsPipeline:
             min_domain_keyword_hits = int(min_domain_keyword_hits_raw)
         except (TypeError, ValueError):
             min_domain_keyword_hits = 40
+        try:
+            final_target_items = int(final_target_raw) if final_target_raw is not None else None
+        except (TypeError, ValueError):
+            final_target_items = None
+        try:
+            add_only_batch_size = int(add_only_batch_raw)
+        except (TypeError, ValueError):
+            add_only_batch_size = 15
+        try:
+            add_only_max_rounds = int(add_only_rounds_raw)
+        except (TypeError, ValueError):
+            add_only_max_rounds = 6
+        try:
+            add_only_min_new_per_area = (
+                int(add_only_min_new_per_area_raw)
+                if add_only_min_new_per_area_raw is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            add_only_min_new_per_area = None
 
         coverage_keywords: Dict[str, List[str]] = {
             area: list(keywords)
@@ -5590,6 +5684,10 @@ class RequirementsPipeline:
         return RequirementsLimits(
             req_min=req_min,
             req_max=req_max_int,
+            final_target_items=final_target_items,
+            add_only_batch_size=add_only_batch_size,
+            add_only_max_rounds=add_only_max_rounds,
+            add_only_min_new_per_area=add_only_min_new_per_area,
             assumptions_min=assumptions_min,
             constraints_min=constraints_min,
             min_student_reqs=min_student_reqs,
