@@ -115,6 +115,7 @@ class RequirementsLimits:
     add_only_batch_size: int
     add_only_max_rounds: int
     add_only_min_new_per_area: int | None
+    add_only_max_per_call: int
     assumptions_min: int
     constraints_min: int
     min_student_reqs: int
@@ -1979,6 +1980,7 @@ class RequirementsPipeline:
             "add_only_batch_size": limits.add_only_batch_size,
             "add_only_max_rounds": limits.add_only_max_rounds,
             "add_only_min_new_per_area": limits.add_only_min_new_per_area,
+            "add_only_max_per_call": limits.add_only_max_per_call,
             "min_assumptions": limits.assumptions_min,
             "min_constraints": limits.constraints_min,
             "min_student_reqs": limits.min_student_reqs,
@@ -1990,10 +1992,6 @@ class RequirementsPipeline:
             "coverage_keywords": limits.coverage_keywords,
             "min_per_area": limits.min_per_area,
             "coverage_prefix_mode": limits.coverage_prefix_mode,
-            "final_target_items": limits.final_target_items,
-            "add_only_batch_size": limits.add_only_batch_size,
-            "add_only_max_rounds": limits.add_only_max_rounds,
-            "add_only_min_new_per_area": limits.add_only_min_new_per_area,
         }
 
     def _coverage_keywords_for_area(self, limits: RequirementsLimits, area: str) -> List[str]:
@@ -2335,8 +2333,16 @@ class RequirementsPipeline:
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
         max_retries = 2
+        def normalize_add_only_text(text: str) -> str:
+            normalized = text.strip()
+            if limits.coverage_prefix_mode:
+                match = re.match(r"^\[(.+?)\]\s+", normalized)
+                if match:
+                    normalized = normalized[match.end() :]
+            return self._normalize_exact_text(normalized)
+
         existing_texts = {
-            self._normalize_exact_text(str(item.get("text", "")))
+            normalize_add_only_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         }
@@ -2418,17 +2424,23 @@ class RequirementsPipeline:
                     if not match or match.group(1).strip() not in limits.coverage_areas:
                         rejected_reasons.append("invalid_prefix")
                         continue
-                normalized_text = self._normalize_exact_text(text)
+                normalized_text = normalize_add_only_text(text)
                 if normalized_text in existing_texts:
                     rejected_reasons.append("duplicate_text")
                     continue
                 existing_texts.add(normalized_text)
                 accepted.append(item)
+            if len(accepted) > generate_count:
+                accepted = accepted[:generate_count]
             accepted_count = len(accepted)
+            remaining_missing_after_merge = max(
+                limits.req_min - (len(payload.get("requirements", [])) + accepted_count), 0
+            )
             report = {
                 "expected_N": generate_count,
                 "returned_count": returned_count,
                 "accepted_count": accepted_count,
+                "remaining_missing_after_merge": remaining_missing_after_merge,
                 "rejected_count": len(rejected_reasons),
                 "rejected_reasons": rejected_reasons,
                 "shape": shape,
@@ -2438,15 +2450,15 @@ class RequirementsPipeline:
                 / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
                 report,
             )
-            if returned_count == generate_count and accepted_count == generate_count:
+            if accepted_count > 0:
                 additions = {"requirements": accepted, "assumptions": [], "constraints": []}
                 return additions, report
         snippet = response.raw_text.strip().replace("\n", " ")
         if len(snippet) > 200:
             snippet = snippet[:200] + "..."
         raise RuntimeError(
-            "Add-only count strict enforcement failed. "
-            f"Expected {generate_count}, returned {returned_count}. "
+            "Add-only attempts produced zero usable items after retries. "
+            f"Expected up to {generate_count}, returned {returned_count}. "
             f"Shape: {shape}. Snippet: {snippet}"
         )
 
@@ -2875,9 +2887,11 @@ class RequirementsPipeline:
                 if limits.final_target_items is None or current_count >= limits.final_target_items:
                     return payload, missing_coverage, attempts, balance_results, requested_counts
                 remaining = max(limits.final_target_items - current_count, 0)
-                generate_count = min(chunk_size, remaining)
+                generate_count = min(chunk_size, remaining, limits.add_only_max_per_call)
             else:
-                generate_count = missing_count
+                generate_count = min(missing_count, limits.add_only_max_per_call)
+            if generate_count <= 0:
+                return payload, missing_coverage, attempts, balance_results, requested_counts
             attempts += 1
             requested_counts.append(generate_count)
             (
@@ -2974,6 +2988,7 @@ class RequirementsPipeline:
         if limits.req_max is not None:
             remaining = max(limits.req_max - len(payload.get("requirements", [])), 0)
             generate_count = min(generate_count, remaining)
+        generate_count = min(generate_count, limits.add_only_max_per_call)
         if generate_count <= 0:
             self._requirements_warnings.append(
                 {
@@ -5698,6 +5713,10 @@ class RequirementsPipeline:
             add_only_batch_size = int(add_only_batch_raw)
         except (TypeError, ValueError):
             add_only_batch_size = 15
+        add_only_max_per_call_raw = frontmatter.get(
+            "MAX_ADD_ONLY_PER_CALL",
+            frontmatter.get("add_only_max_per_call", add_only_batch_size),
+        )
         try:
             add_only_max_rounds = int(add_only_rounds_raw)
         except (TypeError, ValueError):
@@ -5710,6 +5729,10 @@ class RequirementsPipeline:
             )
         except (TypeError, ValueError):
             add_only_min_new_per_area = None
+        try:
+            add_only_max_per_call = max(1, int(add_only_max_per_call_raw))
+        except (TypeError, ValueError):
+            add_only_max_per_call = max(1, add_only_batch_size)
 
         coverage_keywords: Dict[str, List[str]] = {
             area: list(keywords)
@@ -5756,6 +5779,7 @@ class RequirementsPipeline:
             add_only_batch_size=add_only_batch_size,
             add_only_max_rounds=add_only_max_rounds,
             add_only_min_new_per_area=add_only_min_new_per_area,
+            add_only_max_per_call=add_only_max_per_call,
             assumptions_min=assumptions_min,
             constraints_min=constraints_min,
             min_student_reqs=min_student_reqs,
@@ -5780,6 +5804,7 @@ class RequirementsPipeline:
             "requirements_max": limits.req_max,
             "assumptions_min": limits.assumptions_min,
             "constraints_min": limits.constraints_min,
+            "add_only_max_per_call": limits.add_only_max_per_call,
             "min_student_reqs": limits.min_student_reqs,
             "min_coordinator_reqs": limits.min_coordinator_reqs,
             "min_admin_reqs": limits.min_admin_reqs,
