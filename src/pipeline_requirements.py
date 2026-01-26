@@ -18,7 +18,7 @@ from src.adapters.mock_adapter import MockAdapter
 from src.adapters.openai_adapter import OpenAIAdapter
 from src.artifacts.adr_writer import write_adr
 from src.artifacts.writers import write_requirements
-from src.gates.parsers import extract_json
+from src.gates.parsers import extract_json, extract_json_tolerant
 from src.utils.io import read_text, write_json, write_text
 
 
@@ -558,6 +558,7 @@ class RequirementsPipeline:
                     {"error": cross_review_error},
                 )
         cross_review: Dict = {}
+        cross_review_parse_error: str | None = None
         if cross_response is not None:
             responses.append(cross_response)
             write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
@@ -565,33 +566,48 @@ class RequirementsPipeline:
             cross_review = self._safe_extract_json(cross_response.raw_text)
             if artifact == "requirements":
                 try:
-                    cross_review = extract_json(cross_response.raw_text)
+                    cross_review = extract_json_tolerant(cross_response.raw_text)
                 except ValueError as exc:
-                    snippet = cross_response.raw_text.strip().replace("\n", " ")
-                    if len(snippet) > 200:
-                        snippet = snippet[:200] + "..."
-                    raise RuntimeError(
-                        "Requirements cross-review extraction failed. "
-                        f"See raw/{artifact}_cross_review_raw.txt. Error: {exc}. "
-                        f"Snippet: {snippet}"
-                    ) from exc
-                write_json(
-                    artifacts_dir / "requirements_cross_review_extracted.json", cross_review
-                )
-                cross_review = self._validate_requirements_review(
-                    cross_review, draft_payload, limits
-                )
-                write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
-                write_json(
-                    artifacts_dir / "requirements_cross_review_normalized.json", cross_review
-                )
-                self._gemini_review_present = True
+                    cross_review_parse_error = str(exc)
+                    cross_review = {
+                        "blocking_issues": [],
+                        "required_actions": [],
+                        "weak_requirements": [],
+                        "missing_areas": [],
+                    }
+                    write_json(
+                        artifacts_dir / "requirements_cross_review_failed.json",
+                        {
+                            "error": cross_review_parse_error,
+                            "note": "Continuing without cross-review enforcement.",
+                        },
+                    )
+                else:
+                    write_json(
+                        artifacts_dir / "requirements_cross_review_extracted.json", cross_review
+                    )
+                    cross_review = self._validate_requirements_review(
+                        cross_review, draft_payload, limits
+                    )
+                    write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
+                    write_json(
+                        artifacts_dir / "requirements_cross_review_normalized.json", cross_review
+                    )
+                    self._gemini_review_present = True
         if artifact == "requirements" and cross_review_error:
             self._requirements_warnings.append(
                 {
                     "stage": "cross_review",
                     "note": "Gemini cross-review failed; continuing without enforcement.",
                     "error": cross_review_error,
+                }
+            )
+        if artifact == "requirements" and cross_review_parse_error:
+            self._requirements_warnings.append(
+                {
+                    "stage": "cross_review",
+                    "note": "Cross-review JSON parse failed; continuing without enforcement.",
+                    "error": cross_review_parse_error,
                 }
             )
 
@@ -608,7 +624,7 @@ class RequirementsPipeline:
             if cross_response is not None:
                 apply_payload["gemini_review_text"] = cross_response.raw_text
         apply_instruction = ""
-        if artifact == "requirements" and cross_review_error is None:
+        if artifact == "requirements" and cross_review_error is None and cross_review_parse_error is None:
             missing_points = self._gemini_missing_points(cross_review)
             missing_points_list = (
                 "\n".join(f"- {point}" for point in missing_points) if missing_points else "- none"
@@ -910,6 +926,7 @@ class RequirementsPipeline:
             summary.update(
                 {
                     "gemini_cross_review_error": cross_review_error,
+                    "cross_review_parse_error": cross_review_parse_error,
                     "lead_budget_max_output_tokens": lead_budget,
                     "apply_budget_max_output_tokens": apply_budget,
                     "lead_effective_max_output_tokens": lead_tokens,
@@ -3511,6 +3528,7 @@ class RequirementsPipeline:
             coverage_unmapped_count = summary.get("coverage_unmapped_count")
             apply_action_retry_used = summary.get("apply_action_retry_used")
             gemini_cross_review_error = summary.get("gemini_cross_review_error")
+            cross_review_parse_error = summary.get("cross_review_parse_error")
             lines.append(f"- target_min_items: {target_min_items}")
             if final_target_items is not None:
                 lines.append(f"- final_target_items: {final_target_items}")
@@ -3626,6 +3644,8 @@ class RequirementsPipeline:
                 )
             if gemini_cross_review_error:
                 lines.append(f"- gemini_cross_review_error: {gemini_cross_review_error}")
+            if cross_review_parse_error:
+                lines.append(f"- cross_review_parse_error: {cross_review_parse_error}")
             if gemini_final_review_used is not None:
                 lines.append(
                     f"- gemini_final_review_used: {'yes' if gemini_final_review_used else 'no'}"
