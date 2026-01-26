@@ -546,34 +546,54 @@ class RequirementsPipeline:
             cross_payload = {"brief": brief, "artifact": draft_payload}
         cross_full_prompt = f"{cross_review_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
         write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
-        cross_response = self._complete(gemini, cross_full_prompt, apply_tokens)
-        responses.append(cross_response)
-        write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
-        self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
-        cross_review = self._safe_extract_json(cross_response.raw_text)
-        if artifact == "requirements":
-            try:
-                cross_review = extract_json(cross_response.raw_text)
-            except ValueError as exc:
-                snippet = cross_response.raw_text.strip().replace("\n", " ")
-                if len(snippet) > 200:
-                    snippet = snippet[:200] + "..."
-                raise RuntimeError(
-                    "Requirements cross-review extraction failed. "
-                    f"See raw/{artifact}_cross_review_raw.txt. Error: {exc}. "
-                    f"Snippet: {snippet}"
-                ) from exc
-            write_json(
-                artifacts_dir / "requirements_cross_review_extracted.json", cross_review
+        cross_review_error: str | None = None
+        cross_response: LLMResponse | None = None
+        try:
+            cross_response = self._complete(gemini, cross_full_prompt, apply_tokens)
+        except RuntimeError as exc:
+            cross_review_error = str(exc)
+            if artifact == "requirements":
+                write_json(
+                    artifacts_dir / "requirements_cross_review_failed.json",
+                    {"error": cross_review_error},
+                )
+        cross_review: Dict = {}
+        if cross_response is not None:
+            responses.append(cross_response)
+            write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
+            self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
+            cross_review = self._safe_extract_json(cross_response.raw_text)
+            if artifact == "requirements":
+                try:
+                    cross_review = extract_json(cross_response.raw_text)
+                except ValueError as exc:
+                    snippet = cross_response.raw_text.strip().replace("\n", " ")
+                    if len(snippet) > 200:
+                        snippet = snippet[:200] + "..."
+                    raise RuntimeError(
+                        "Requirements cross-review extraction failed. "
+                        f"See raw/{artifact}_cross_review_raw.txt. Error: {exc}. "
+                        f"Snippet: {snippet}"
+                    ) from exc
+                write_json(
+                    artifacts_dir / "requirements_cross_review_extracted.json", cross_review
+                )
+                cross_review = self._validate_requirements_review(
+                    cross_review, draft_payload, limits
+                )
+                write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
+                write_json(
+                    artifacts_dir / "requirements_cross_review_normalized.json", cross_review
+                )
+                self._gemini_review_present = True
+        if artifact == "requirements" and cross_review_error:
+            self._requirements_warnings.append(
+                {
+                    "stage": "cross_review",
+                    "note": "Gemini cross-review failed; continuing without enforcement.",
+                    "error": cross_review_error,
+                }
             )
-            cross_review = self._validate_requirements_review(
-                cross_review, draft_payload, limits
-            )
-            write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
-            write_json(
-                artifacts_dir / "requirements_cross_review_normalized.json", cross_review
-            )
-            self._gemini_review_present = True
 
         apply_template = read_text(self.prompts_dir / config["apply_prompt"])
         apply_prompt = self._render_prompt(apply_template, limits)
@@ -585,9 +605,10 @@ class RequirementsPipeline:
         if artifact == "requirements":
             apply_payload["targets"] = self._requirements_targets_payload(limits)
             apply_payload["gemini_review"] = cross_review
-            apply_payload["gemini_review_text"] = cross_response.raw_text
+            if cross_response is not None:
+                apply_payload["gemini_review_text"] = cross_response.raw_text
         apply_instruction = ""
-        if artifact == "requirements":
+        if artifact == "requirements" and cross_review_error is None:
             missing_points = self._gemini_missing_points(cross_review)
             missing_points_list = (
                 "\n".join(f"- {point}" for point in missing_points) if missing_points else "- none"
@@ -888,6 +909,7 @@ class RequirementsPipeline:
                     cli_cap = None
             summary.update(
                 {
+                    "gemini_cross_review_error": cross_review_error,
                     "lead_budget_max_output_tokens": lead_budget,
                     "apply_budget_max_output_tokens": apply_budget,
                     "lead_effective_max_output_tokens": lead_tokens,
@@ -3488,6 +3510,7 @@ class RequirementsPipeline:
             final_review_retry_used = summary.get("final_review_retry_used")
             coverage_unmapped_count = summary.get("coverage_unmapped_count")
             apply_action_retry_used = summary.get("apply_action_retry_used")
+            gemini_cross_review_error = summary.get("gemini_cross_review_error")
             lines.append(f"- target_min_items: {target_min_items}")
             if final_target_items is not None:
                 lines.append(f"- final_target_items: {final_target_items}")
@@ -3601,6 +3624,8 @@ class RequirementsPipeline:
                 lines.append(
                     f"- gemini_review_used: {'yes' if gemini_review_used else 'no'}"
                 )
+            if gemini_cross_review_error:
+                lines.append(f"- gemini_cross_review_error: {gemini_cross_review_error}")
             if gemini_final_review_used is not None:
                 lines.append(
                     f"- gemini_final_review_used: {'yes' if gemini_final_review_used else 'no'}"

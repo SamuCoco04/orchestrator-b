@@ -46,11 +46,22 @@ class GeminiAdapter(LLMAdapter):
                     generation_config = None
                     if max_tokens is not None:
                         generation_config = {"max_output_tokens": max_tokens}
-                    response = self.client.models.generate_content(
-                        model=model,
-                        contents=prompt,
-                        generation_config=generation_config,
-                    )
+                    try:
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            generation_config=generation_config,
+                        )
+                    except TypeError as exc:
+                        message = str(exc)
+                        if "generation_config" in message and "unexpected keyword" in message:
+                            response = self.client.models.generate_content(
+                                model=model,
+                                contents=prompt,
+                                config=generation_config,
+                            )
+                        else:
+                            raise
                     text = getattr(response, "text", None)
                     if not text:
                         raise RuntimeError("Gemini returned empty content.")
