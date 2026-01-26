@@ -11,7 +11,7 @@ from .llm_base import LLMAdapter, LLMResponse
 class MockAdapter(LLMAdapter):
     scenario: str = "default"
 
-    def complete(self, prompt: str) -> LLMResponse:
+    def complete(self, prompt: str, max_tokens: int | None = None) -> LLMResponse:
         payload = self._build_payload(prompt)
         if isinstance(payload, str):
             return LLMResponse(raw_text=payload)

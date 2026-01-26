@@ -7,7 +7,7 @@ from typing import List
 
 from google import genai
 
-from .llm_base import LLMAdapter
+from .llm_base import LLMAdapter, LLMResponse
 
 
 class GeminiAdapter(LLMAdapter):
@@ -32,16 +32,24 @@ class GeminiAdapter(LLMAdapter):
         msg = str(err).lower()
         return any(s in msg for s in ["503", "unavailable", "429", "too many", "timeout", "temporarily"])
 
-    def generate(self, prompt: str) -> str:
+    def complete(self, prompt: str, max_tokens: int | None = None) -> LLMResponse:
+        response_text = self.generate(prompt, max_tokens=max_tokens)
+        return LLMResponse(raw_text=response_text)
+
+    def generate(self, prompt: str, max_tokens: int | None = None) -> str:
         last_err: Exception | None = None
 
         for model in self.model_candidates:
             for attempt in range(1, self.max_attempts + 1):
                 try:
                     print(f"[gemini] model={model} attempt={attempt}/{self.max_attempts}")
+                    generation_config = None
+                    if max_tokens is not None:
+                        generation_config = {"max_output_tokens": max_tokens}
                     response = self.client.models.generate_content(
                         model=model,
                         contents=prompt,
+                        generation_config=generation_config,
                     )
                     text = getattr(response, "text", None)
                     if not text:

@@ -16,9 +16,11 @@ class OpenAIAdapter(LLMAdapter):
             raise RuntimeError("OPENAI_API_KEY is not set.")
         self.client = OpenAI(api_key=self.api_key)
 
-    def complete(self, prompt: str) -> LLMResponse:
+    def complete(self, prompt: str, max_tokens: int | None = None) -> LLMResponse:
         max_tokens_env = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
-        max_tokens = int(max_tokens_env) if max_tokens_env else None
+        env_max = int(max_tokens_env) if max_tokens_env else None
+        if max_tokens is None:
+            max_tokens = env_max
         temperature = float(os.getenv("ORCH_TEMPERATURE", "0.2"))
         attempt = 0
         backoff = 1.0

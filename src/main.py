@@ -83,8 +83,6 @@ def main() -> None:
     original_max_tokens = os.getenv("ORCH_MAX_OUTPUT_TOKENS")
     if args.max_output_tokens is not None:
         os.environ["ORCH_MAX_OUTPUT_TOKENS"] = str(args.max_output_tokens)
-    else:
-        os.environ.pop("ORCH_MAX_OUTPUT_TOKENS", None)
     os.environ["ORCH_TEMPERATURE"] = str(args.temperature)
 
     if args.mode == "live":
