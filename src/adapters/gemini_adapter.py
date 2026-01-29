@@ -43,25 +43,29 @@ class GeminiAdapter(LLMAdapter):
             for attempt in range(1, self.max_attempts + 1):
                 try:
                     print(f"[gemini] model={model} attempt={attempt}/{self.max_attempts}")
-                    generation_config = None
-                    if max_tokens is not None:
-                        generation_config = {"max_output_tokens": max_tokens}
+                    generation_config = (
+                        {"max_output_tokens": max_tokens} if max_tokens is not None else None
+                    )
                     try:
-                        response = self.client.models.generate_content(
-                            model=model,
-                            contents=prompt,
-                            generation_config=generation_config,
-                        )
-                    except TypeError as exc:
-                        message = str(exc)
-                        if "generation_config" in message and "unexpected keyword" in message:
+                        if generation_config is None:
+                            response = self.client.models.generate_content(
+                                model=model,
+                                contents=prompt,
+                            )
+                        else:
                             response = self.client.models.generate_content(
                                 model=model,
                                 contents=prompt,
                                 config=generation_config,
                             )
-                        else:
+                    except TypeError:
+                        if generation_config is None:
                             raise
+                        response = self.client.models.generate_content(
+                            model=model,
+                            contents=prompt,
+                            generation_config=generation_config,
+                        )
                     text = getattr(response, "text", None)
                     if not text:
                         raise RuntimeError("Gemini returned empty content.")

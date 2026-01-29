@@ -54,6 +54,11 @@ You can also adjust generation controls:
 python -m src.main --pipeline requirements --mode live --brief brief.md --max-output-tokens 800 --temperature 0.2
 ```
 
+## Smoke check
+
+```bash
+python -m compileall src
+```
 
 ## Brief frontmatter targets
 

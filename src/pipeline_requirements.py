@@ -847,6 +847,7 @@ class RequirementsPipeline:
                 add_only_attempts,
                 balance_results,
                 add_only_requested,
+                add_only_round_counts,
             ) = self._add_only_requirements_loop(
                 brief=brief,
                 limits=limits,
@@ -950,6 +951,7 @@ class RequirementsPipeline:
                     "count_after_add_only": count_after_add_only,
                     "add_only_chunk_size": self._add_only_batch_size_used,
                     "add_only_requested": add_only_requested,
+                    "add_only_round_counts": add_only_round_counts,
                     "add_only_parse_failures": self._add_only_parse_failures,
                     "expand_generic_attempts": expand_generic_attempts,
                     "id_normalized": id_normalized,
@@ -2203,7 +2205,7 @@ class RequirementsPipeline:
         generate_count: int,
         missing_count_before: int | None = None,
         batch_size: int | None = None,
-    ) -> tuple[Dict, List[str], Dict[str, object]]:
+    ) -> tuple[Dict, List[str], Dict[str, object], Dict[str, object]]:
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
         coverage_counts = self._coverage_counts(payload, limits)
@@ -2399,6 +2401,10 @@ class RequirementsPipeline:
             attempt_warnings.extend(
                 [{"stage": "quality_gate_post_merge", "warning": warning} for warning in quality_warnings]
             )
+        write_json(
+            artifacts_dir / f"requirements_after_round_{attempt}.json",
+            payload,
+        )
         missing_coverage = self._missing_coverage_areas(payload, limits)
         balance_results = self._balance_check(payload, limits)
         self._requirements_balance_results = balance_results
@@ -2414,7 +2420,7 @@ class RequirementsPipeline:
             artifacts_dir / f"requirements_add_only_warnings_{attempt}.json",
             {"warnings": attempt_warnings},
         )
-        return payload, missing_coverage, balance_results
+        return payload, missing_coverage, balance_results, merge_report
 
     def _parse_add_only_response(
         self,
@@ -2430,7 +2436,7 @@ class RequirementsPipeline:
         artifacts_dir: Path,
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
-        max_retries = 2
+        max_retries = 1
         existing_texts = {
             self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
@@ -2456,6 +2462,8 @@ class RequirementsPipeline:
                     "\nEvery requirement MUST start with [<Coverage Area>] "
                     "using only the provided coverage_areas."
                 )
+                if strict:
+                    strict_note += "\nPREFIX_STRICT: Invalid prefixes will be rejected."
                 if invalid_prefix_samples:
                     sample_list = "; ".join(invalid_prefix_samples[:3])
                     strict_note += f"\nInvalid prefix examples to avoid: {sample_list}"
@@ -2508,7 +2516,8 @@ class RequirementsPipeline:
                 / f"add_only_round_{attempt}_attempt_{retry_index}_extracted.json",
                 items,
             )
-            returned_count = len(items)
+            parsed_count = len(items)
+            returned_count = parsed_count
             if returned_count == 0:
                 snippet = response.raw_text.strip().replace("\n", " ")
                 if len(snippet) > 200:
@@ -2522,6 +2531,7 @@ class RequirementsPipeline:
             rejected_reasons: List[str] = []
             format_failure = False
             new_texts: set[str] = set()
+            valid_prefix_count = 0
             for item in items:
                 if not isinstance(item, dict):
                     rejected_reasons.append("invalid_item_type")
@@ -2540,18 +2550,23 @@ class RequirementsPipeline:
                             format_failure = True
                         invalid_prefix_samples.append(text[:160])
                         continue
+                    valid_prefix_count += 1
                 normalized_text = self._normalize_exact_text(text)
                 if normalized_text in existing_texts or normalized_text in new_texts:
                     rejected_reasons.append("duplicate_text")
                     continue
                 new_texts.add(normalized_text)
                 accepted.append(item)
+            if not limits.coverage_prefix_mode:
+                valid_prefix_count = len(accepted)
             accepted_count = len(accepted)
             if returned_count != generate_count:
                 rejected_reasons.append("incorrect_count")
             report = {
                 "requested_count": generate_count,
+                "parsed_count": parsed_count,
                 "returned_count": returned_count,
+                "valid_prefix_count": valid_prefix_count,
                 "accepted_count": accepted_count,
                 "rejected_count": len(rejected_reasons),
                 "rejected_reasons": rejected_reasons,
@@ -2601,7 +2616,9 @@ class RequirementsPipeline:
         if not last_report:
             last_report = {
                 "requested_count": generate_count,
+                "parsed_count": 0,
                 "returned_count": 0,
+                "valid_prefix_count": 0,
                 "accepted_count": 0,
                 "rejected_count": 0,
                 "rejected_reasons": ["no_valid_response"],
@@ -2618,11 +2635,14 @@ class RequirementsPipeline:
             return [], "parse_failed", f"parse_failed: {exc}"
         if isinstance(parsed, dict):
             for label in ["REQUIREMENTS_ADD_ONLY_JSON", "REQUIREMENTS_JSON"]:
-                if label in parsed and isinstance(parsed[label], dict):
-                    payload = parsed[label]
-                    reqs = payload.get("requirements", [])
-                    if isinstance(reqs, list):
-                        return reqs, f"wrapper:{label}", None
+                if label in parsed:
+                    wrapper = parsed[label]
+                    if isinstance(wrapper, dict):
+                        reqs = wrapper.get("requirements", [])
+                        if isinstance(reqs, list):
+                            return reqs, f"wrapper:{label}", None
+                    if isinstance(wrapper, list):
+                        return wrapper, f"wrapper:{label}", None
             if "requirements" in parsed and isinstance(parsed.get("requirements"), list):
                 return parsed["requirements"], "requirements_object", None
         if isinstance(parsed, list):
@@ -3026,30 +3046,33 @@ class RequirementsPipeline:
         raw_dir: Path,
         artifacts_dir: Path,
         max_tokens: int,
-    ) -> tuple[Dict, List[str], int, Dict[str, object], List[int]]:
+    ) -> tuple[Dict, List[str], int, Dict[str, object], List[int], List[Dict[str, object]]]:
         attempts = 0
         requested_counts: List[int] = []
+        round_counts: List[Dict[str, object]] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
         start_count = len(payload.get("requirements", []))
         start_missing = max(limits.req_min - start_count, 0)
         if start_missing <= 0:
-            return payload, missing_coverage, attempts, balance_results, requested_counts
-        max_attempts = 20
+            return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
+        max_attempts = 10
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
-            missing_count = max(limits.req_min - current_count, 0)
-            if missing_count <= 0:
-                return payload, missing_coverage, attempts, balance_results, requested_counts
-            batch_size = min(6, missing_count)
+            missing_n = max(limits.req_min - current_count, 0)
+            if missing_n <= 0:
+                return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
+            batch_size = min(25, missing_n)
             self._add_only_batch_size_used = batch_size
             generate_count = batch_size
             attempts += 1
             requested_counts.append(generate_count)
+            before_count = current_count
             (
                 payload,
                 missing_coverage,
                 balance_results,
+                merge_report,
             ) = self._run_add_only_attempt(
                 brief=brief,
                 limits=limits,
@@ -3061,17 +3084,31 @@ class RequirementsPipeline:
                 max_tokens=max_tokens,
                 attempt=attempts,
                 generate_count=generate_count,
-                missing_count_before=missing_count,
+                missing_count_before=missing_n,
                 batch_size=batch_size,
             )
+            after_count = len(payload.get("requirements", []))
+            round_counts.append(
+                {
+                    "round": attempts,
+                    "before_count": before_count,
+                    "after_count": after_count,
+                    "missing_before": max(limits.req_min - before_count, 0),
+                    "missing_after": max(limits.req_min - after_count, 0),
+                    "requested_count": generate_count,
+                    "parsed_count": merge_report.get("parsed_count"),
+                    "accepted_count": merge_report.get("accepted_count"),
+                    "rejected_count": merge_report.get("rejected_count"),
+                }
+            )
         current_count = len(payload.get("requirements", []))
-        missing_count = max(limits.req_min - current_count, 0)
-        if missing_count > 0:
+        missing_n = max(limits.req_min - current_count, 0)
+        if missing_n > 0:
             self._requirements_warnings.append(
                 {
                     "stage": "add_only",
                     "note": "Targets unmet after add-only attempts.",
-                    "missing_count": missing_count,
+                    "missing_count": missing_n,
                     "missing_coverage": missing_coverage,
                     "balance_results": balance_results,
                     "max_rounds": max_attempts,
@@ -3079,9 +3116,9 @@ class RequirementsPipeline:
             )
             raise RuntimeError(
                 "Requirements minimum unmet after add-only rounds. "
-                f"Missing {missing_count} after {max_attempts} rounds."
+                f"Missing {missing_n} after {max_attempts} rounds."
             )
-        return payload, missing_coverage, attempts, balance_results, requested_counts
+        return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
 
     def _run_final_review_add_only(
         self,
@@ -3143,7 +3180,7 @@ class RequirementsPipeline:
                 }
             )
             return payload, False
-        payload, _, _ = self._run_add_only_attempt(
+        payload, _, _, _ = self._run_add_only_attempt(
             brief=brief,
             limits=limits,
             payload=payload,
@@ -3572,6 +3609,7 @@ class RequirementsPipeline:
             add_only_chunk_size = summary.get("add_only_chunk_size")
             add_only_requested = summary.get("add_only_requested", [])
             add_only_parse_failures = summary.get("add_only_parse_failures")
+            add_only_round_counts = summary.get("add_only_round_counts")
             expand_generic_attempts = summary.get("expand_generic_attempts")
             id_normalized = summary.get("id_normalized")
             review_actions_applied = summary.get("review_actions_applied")
@@ -3673,6 +3711,27 @@ class RequirementsPipeline:
                 )
             if add_only_parse_failures is not None:
                 lines.append(f"- add_only_parse_failures: {add_only_parse_failures}")
+            if isinstance(add_only_round_counts, list) and add_only_round_counts:
+                lines.append("- add_only_round_counts:")
+                for entry in add_only_round_counts:
+                    if not isinstance(entry, dict):
+                        continue
+                    round_id = entry.get("round")
+                    before_count = entry.get("before_count")
+                    after_count = entry.get("after_count")
+                    missing_before = entry.get("missing_before")
+                    missing_after = entry.get("missing_after")
+                    requested_count = entry.get("requested_count")
+                    parsed_count = entry.get("parsed_count")
+                    accepted_count = entry.get("accepted_count")
+                    rejected_count = entry.get("rejected_count")
+                    lines.append(
+                        "  - "
+                        f"round {round_id}: before={before_count} after={after_count} "
+                        f"missing_before={missing_before} missing_after={missing_after} "
+                        f"requested={requested_count} parsed={parsed_count} "
+                        f"accepted={accepted_count} rejected={rejected_count}"
+                    )
             lines.append(f"- expand_generic_attempts: {expand_generic_attempts}")
             lines.append(f"- id_normalized: {'yes' if id_normalized else 'no'}")
             lines.append(f"- review_actions_applied: {'yes' if review_actions_applied else 'no'}")
