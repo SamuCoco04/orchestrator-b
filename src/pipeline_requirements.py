@@ -202,6 +202,7 @@ class RequirementsPipeline:
         self._format_fix_completion_tokens: List[int] = []
         self._lead_completion_tokens: int | None = None
         self._apply_completion_tokens: int | None = None
+        self._add_only_batch_size_used = 12
         self._single_requirement_fallback: Dict | None = None
         self._apply_action_retry_used = False
         self._extraction_debug: List[Dict[str, object]] = []
@@ -580,6 +581,7 @@ class RequirementsPipeline:
                         {
                             "error": cross_review_parse_error,
                             "note": "Continuing without cross-review enforcement.",
+                            "raw_snippet": cross_response.raw_text[:500],
                         },
                     )
                 else:
@@ -946,7 +948,7 @@ class RequirementsPipeline:
                     "missing_after_add_only": missing_after_add_only,
                     "count_before_add_only": count_before_add_only,
                     "count_after_add_only": count_after_add_only,
-                    "add_only_chunk_size": limits.add_only_batch_size,
+                    "add_only_chunk_size": self._add_only_batch_size_used,
                     "add_only_requested": add_only_requested,
                     "add_only_parse_failures": self._add_only_parse_failures,
                     "expand_generic_attempts": expand_generic_attempts,
@@ -2199,6 +2201,8 @@ class RequirementsPipeline:
         max_tokens: int,
         attempt: int,
         generate_count: int,
+        missing_count_before: int | None = None,
+        batch_size: int | None = None,
     ) -> tuple[Dict, List[str], Dict[str, object]]:
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
@@ -2245,9 +2249,11 @@ class RequirementsPipeline:
             if isinstance(item, dict)
         ]
         requested_payload = {
-            "request_n": generate_count,
+            "requested_count": generate_count,
+            "batch_size": batch_size,
+            "missing_count_before": missing_count_before,
             "missing_areas": missing_coverage,
-            "counts": coverage_counts,
+            "per_area_counts": coverage_counts,
             "effective_tokens": max_tokens,
         }
         write_json(artifacts_dir / f"add_only_round_{attempt}_requested.json", requested_payload)
@@ -2375,7 +2381,12 @@ class RequirementsPipeline:
             attempt_warnings.extend(
                 [{"stage": "quality_gate", "warning": warning} for warning in quality_warnings]
             )
-        payload = self._merge_requirements_additions(payload, additions, dedupe_mode="exact_text")
+        payload = self._merge_requirements_additions(
+            payload,
+            additions,
+            dedupe_mode="exact_text",
+            ignore_ids=True,
+        )
         payload, filtered_out, quality_warnings = self._apply_quality_gate(payload, limits)
         if filtered_out:
             self._requirements_filtered_out.extend(filtered_out)
@@ -2514,13 +2525,13 @@ class RequirementsPipeline:
                     match = re.match(r"^\[(.+?)\]\s+", text)
                     if not match or match.group(1).strip() not in limits.coverage_areas:
                         rejected_reasons.append("invalid_prefix")
-                        format_failure = True
+                        if retry_index <= max_retries:
+                            format_failure = True
                         invalid_prefix_samples.append(text[:160])
                         continue
                 normalized_text = self._normalize_exact_text(text)
                 if normalized_text in existing_texts or normalized_text in new_texts:
                     rejected_reasons.append("duplicate_text")
-                    format_failure = True
                     continue
                 new_texts.add(normalized_text)
                 accepted.append(item)
@@ -2538,7 +2549,7 @@ class RequirementsPipeline:
                 / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
                 report,
             )
-            if not format_failure and accepted_count == generate_count:
+            if not format_failure:
                 existing_texts.update(new_texts)
                 additions = {"requirements": accepted, "assumptions": [], "constraints": []}
                 return additions, report
@@ -2971,19 +2982,19 @@ class RequirementsPipeline:
         requested_counts: List[int] = []
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
-        chunk_size = max(1, limits.add_only_batch_size)
         start_count = len(payload.get("requirements", []))
         start_missing = max(limits.req_min - start_count, 0)
         if start_missing <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts
-        computed_rounds = min(math.ceil(start_missing / chunk_size) + 2, 12)
-        max_attempts = min(limits.add_only_max_rounds, computed_rounds)
+        max_attempts = 20
         while attempts < max_attempts:
             current_count = len(payload.get("requirements", []))
             missing_count = max(limits.req_min - current_count, 0)
             if missing_count <= 0:
                 return payload, missing_coverage, attempts, balance_results, requested_counts
-            generate_count = min(missing_count, chunk_size)
+            batch_size = min(12, missing_count)
+            self._add_only_batch_size_used = batch_size
+            generate_count = batch_size
             attempts += 1
             requested_counts.append(generate_count)
             (
@@ -3001,6 +3012,8 @@ class RequirementsPipeline:
                 max_tokens=max_tokens,
                 attempt=attempts,
                 generate_count=generate_count,
+                missing_count_before=missing_count,
+                batch_size=batch_size,
             )
         current_count = len(payload.get("requirements", []))
         missing_count = max(limits.req_min - current_count, 0)
@@ -3072,7 +3085,7 @@ class RequirementsPipeline:
         if limits.req_max is not None:
             remaining = max(limits.req_max - len(payload.get("requirements", [])), 0)
             generate_count = min(generate_count, remaining)
-        generate_count = min(generate_count, max(1, limits.add_only_batch_size))
+        generate_count = min(generate_count, 12)
         if generate_count <= 0:
             self._requirements_warnings.append(
                 {
@@ -3311,7 +3324,11 @@ class RequirementsPipeline:
         return payload
 
     def _merge_requirements_additions(
-        self, base: Dict, additions: Dict, dedupe_mode: str = "full"
+        self,
+        base: Dict,
+        additions: Dict,
+        dedupe_mode: str = "full",
+        ignore_ids: bool = False,
     ) -> Dict:
         merged = {
             "requirements": list(base.get("requirements", [])),
@@ -3342,7 +3359,7 @@ class RequirementsPipeline:
                 normalized_text = item_text.lower()
                 fingerprint = self._semantic_fingerprint(item_text)
                 normalized_exact = self._normalize_exact_text(item_text)
-                if isinstance(item_id, str) and item_id in existing_ids:
+                if not ignore_ids and isinstance(item_id, str) and item_id in existing_ids:
                     self._requirements_duplicates_debug.append(
                         {
                             "reason": "duplicate_id",
@@ -3369,12 +3386,15 @@ class RequirementsPipeline:
                         }
                     )
                     continue
-                if isinstance(item_id, str):
+                if isinstance(item_id, str) and not ignore_ids:
                     existing_ids.add(item_id)
                 if normalized_exact:
                     existing_texts.add(normalized_exact)
                 if dedupe_mode == "full" and fingerprint:
                     existing_fingerprints.add(fingerprint)
+                if ignore_ids:
+                    item = dict(item)
+                    item["id"] = None
                 merged["requirements"].append(item)
         for item in additions.get("assumptions", []):
             if isinstance(item, str):
