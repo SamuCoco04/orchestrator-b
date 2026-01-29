@@ -2251,6 +2251,7 @@ class RequirementsPipeline:
         requested_payload = {
             "requested_count": generate_count,
             "batch_size": batch_size,
+            "missing_count": missing_count_before,
             "missing_count_before": missing_count_before,
             "missing_areas": missing_coverage,
             "per_area_counts": coverage_counts,
@@ -2438,6 +2439,10 @@ class RequirementsPipeline:
         missing_coverage = self._missing_coverage_areas(payload, limits)
         coverage_counts = self._coverage_counts(payload, limits)
         invalid_prefix_samples: List[str] = []
+        consecutive_low_count = 0
+        consecutive_format_fail = 0
+        min_acceptable = max(1, math.ceil(generate_count * 0.5))
+        last_report: Dict[str, object] = {}
         for retry_index in range(1, max_retries + 2):
             strict = retry_index > 1
             strict_note = ""
@@ -2504,13 +2509,19 @@ class RequirementsPipeline:
                 items,
             )
             returned_count = len(items)
+            if returned_count == 0:
+                snippet = response.raw_text.strip().replace("\n", " ")
+                if len(snippet) > 200:
+                    snippet = snippet[:200] + "..."
+                raise RuntimeError(
+                    "Add-only returned zero items. "
+                    f"Expected {generate_count}. effective_max_tokens={max_tokens}. "
+                    f"Shape: {shape}. Snippet: {snippet}"
+                )
             accepted: List[Dict] = []
             rejected_reasons: List[str] = []
             format_failure = False
             new_texts: set[str] = set()
-            if returned_count != generate_count:
-                rejected_reasons.append("incorrect_count")
-                format_failure = True
             for item in items:
                 if not isinstance(item, dict):
                     rejected_reasons.append("invalid_item_type")
@@ -2536,6 +2547,8 @@ class RequirementsPipeline:
                 new_texts.add(normalized_text)
                 accepted.append(item)
             accepted_count = len(accepted)
+            if returned_count != generate_count:
+                rejected_reasons.append("incorrect_count")
             report = {
                 "requested_count": generate_count,
                 "returned_count": returned_count,
@@ -2543,24 +2556,60 @@ class RequirementsPipeline:
                 "rejected_count": len(rejected_reasons),
                 "rejected_reasons": rejected_reasons,
                 "shape": shape,
+                "min_acceptable": min_acceptable,
             }
+            last_report = report
             write_json(
                 artifacts_dir
                 / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
                 report,
             )
+            if format_failure:
+                consecutive_format_fail += 1
+                consecutive_low_count = 0
+                if consecutive_format_fail >= 2:
+                    snippet = response.raw_text.strip().replace("\n", " ")
+                    if len(snippet) > 200:
+                        snippet = snippet[:200] + "..."
+                    raise RuntimeError(
+                        "Add-only format invalid for consecutive retries. "
+                        f"Expected {generate_count}. effective_max_tokens={max_tokens}. "
+                        f"Shape: {shape}. Snippet: {snippet}"
+                    )
+                continue
+            consecutive_format_fail = 0
+            if accepted_count < min_acceptable:
+                if returned_count < min_acceptable:
+                    consecutive_low_count += 1
+                    if consecutive_low_count >= 2:
+                        snippet = response.raw_text.strip().replace("\n", " ")
+                        if len(snippet) > 200:
+                            snippet = snippet[:200] + "..."
+                        raise RuntimeError(
+                            "Add-only returned too few items for consecutive retries. "
+                            f"Expected {generate_count}, got {accepted_count}. "
+                            f"effective_max_tokens={max_tokens}. Shape: {shape}. Snippet: {snippet}"
+                        )
+                else:
+                    consecutive_low_count = 0
+                continue
+            consecutive_low_count = 0
             if not format_failure:
                 existing_texts.update(new_texts)
                 additions = {"requirements": accepted, "assumptions": [], "constraints": []}
                 return additions, report
-        snippet = response.raw_text.strip().replace("\n", " ")
-        if len(snippet) > 200:
-            snippet = snippet[:200] + "..."
-        raise RuntimeError(
-            "Add-only count enforcement failed. "
-            f"Expected {generate_count}, returned {returned_count}. "
-            f"effective_max_tokens={max_tokens}. Shape: {shape}. Snippet: {snippet}"
-        )
+        if not last_report:
+            last_report = {
+                "requested_count": generate_count,
+                "returned_count": 0,
+                "accepted_count": 0,
+                "rejected_count": 0,
+                "rejected_reasons": ["no_valid_response"],
+                "shape": "unknown",
+                "min_acceptable": min_acceptable,
+            }
+        additions = {"requirements": [], "assumptions": [], "constraints": []}
+        return additions, last_report
 
     def _extract_add_only_items(self, raw_text: str) -> tuple[List[Dict], str, str | None]:
         try:
@@ -2992,7 +3041,7 @@ class RequirementsPipeline:
             missing_count = max(limits.req_min - current_count, 0)
             if missing_count <= 0:
                 return payload, missing_coverage, attempts, balance_results, requested_counts
-            batch_size = min(12, missing_count)
+            batch_size = min(6, missing_count)
             self._add_only_batch_size_used = batch_size
             generate_count = batch_size
             attempts += 1
