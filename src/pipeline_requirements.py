@@ -12,7 +12,7 @@ from typing import Dict, List, Tuple
 import yaml
 from jsonschema import ValidationError, validate
 
-from src.adapters.gemini_adapter import GeminiAdapter
+from src.adapters.gemini_adapter import GeminiAdapter, GeminiUnavailableError
 from src.adapters.llm_base import LLMAdapter, LLMResponse
 from src.adapters.mock_adapter import MockAdapter
 from src.adapters.openai_adapter import OpenAIAdapter
@@ -211,6 +211,9 @@ class RequirementsPipeline:
         self._draft_extracted_cleaned: Dict | None = None
         self._draft_candidate_before_repair_text: str | None = None
         self._draft_candidate_after_repair_text: str | None = None
+        self._gemini_selected_model: str | None = None
+        self._gemini_cross_review_skipped = False
+        self._gemini_error_summary: str | None = None
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -257,6 +260,9 @@ class RequirementsPipeline:
         self._draft_extracted_cleaned = None
         self._draft_candidate_before_repair_text = None
         self._draft_candidate_after_repair_text = None
+        self._gemini_selected_model = None
+        self._gemini_cross_review_skipped = False
+        self._gemini_error_summary = None
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -548,16 +554,38 @@ class RequirementsPipeline:
         cross_full_prompt = f"{cross_review_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
         write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
         cross_review_error: str | None = None
+        cross_review_skipped = False
         cross_response: LLMResponse | None = None
         try:
             cross_response = self._complete(gemini, cross_full_prompt, apply_tokens)
-        except RuntimeError as exc:
+        except (GeminiUnavailableError, RuntimeError) as exc:
             cross_review_error = str(exc)
+            cross_review_skipped = True
+            self._gemini_cross_review_skipped = True
+            self._gemini_error_summary = cross_review_error
+            diagnostics = {}
+            if hasattr(gemini, "get_diagnostics"):
+                try:
+                    diagnostics = gemini.get_diagnostics()  # type: ignore[attr-defined]
+                except Exception:
+                    diagnostics = {}
             if artifact == "requirements":
                 write_json(
                     artifacts_dir / "requirements_cross_review_failed.json",
-                    {"error": cross_review_error},
+                    {
+                        "error": cross_review_error,
+                        "cross_review_skipped": True,
+                        "diagnostics": diagnostics,
+                    },
                 )
+        if hasattr(gemini, "get_diagnostics"):
+            try:
+                diagnostics = gemini.get_diagnostics()  # type: ignore[attr-defined]
+                selected = diagnostics.get("selected_model")
+                if isinstance(selected, str) and selected:
+                    self._gemini_selected_model = selected
+            except Exception:
+                pass
         cross_review: Dict = {}
         cross_review_parse_error: str | None = None
         if cross_response is not None:
@@ -929,6 +957,9 @@ class RequirementsPipeline:
             summary.update(
                 {
                     "gemini_cross_review_error": cross_review_error,
+                    "gemini_cross_review_skipped": cross_review_skipped,
+                    "gemini_selected_model": self._gemini_selected_model,
+                    "gemini_error_summary": self._gemini_error_summary,
                     "cross_review_parse_error": cross_review_parse_error,
                     "lead_budget_max_output_tokens": lead_budget,
                     "apply_budget_max_output_tokens": apply_budget,
@@ -3635,6 +3666,9 @@ class RequirementsPipeline:
             coverage_unmapped_count = summary.get("coverage_unmapped_count")
             apply_action_retry_used = summary.get("apply_action_retry_used")
             gemini_cross_review_error = summary.get("gemini_cross_review_error")
+            gemini_cross_review_skipped = summary.get("gemini_cross_review_skipped")
+            gemini_selected_model = summary.get("gemini_selected_model")
+            gemini_error_summary = summary.get("gemini_error_summary")
             cross_review_parse_error = summary.get("cross_review_parse_error")
             lines.append(f"- target_min_items: {target_min_items}")
             if final_target_items is not None:
@@ -3770,6 +3804,14 @@ class RequirementsPipeline:
                 lines.append(
                     f"- gemini_review_used: {'yes' if gemini_review_used else 'no'}"
                 )
+            if gemini_selected_model:
+                lines.append(f"- gemini_selected_model: {gemini_selected_model}")
+            if gemini_cross_review_skipped is not None:
+                lines.append(
+                    f"- gemini_cross_review_skipped: {'yes' if gemini_cross_review_skipped else 'no'}"
+                )
+            if gemini_error_summary:
+                lines.append(f"- gemini_error_summary: {gemini_error_summary}")
             if gemini_cross_review_error:
                 lines.append(f"- gemini_cross_review_error: {gemini_cross_review_error}")
             if cross_review_parse_error:
@@ -3827,7 +3869,16 @@ class RequirementsPipeline:
         if self.mode == "mock":
             return MockAdapter()
         if provider == "gemini":
-            return GeminiAdapter()
+            adapter = GeminiAdapter()
+            if hasattr(adapter, "get_diagnostics"):
+                try:
+                    diagnostics = adapter.get_diagnostics()  # type: ignore[attr-defined]
+                    selected = diagnostics.get("selected_model")
+                    if isinstance(selected, str):
+                        self._gemini_selected_model = selected
+                except Exception:
+                    pass
+            return adapter
         return OpenAIAdapter()
 
     def _run_apply(
