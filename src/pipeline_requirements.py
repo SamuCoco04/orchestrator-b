@@ -458,6 +458,7 @@ class RequirementsPipeline:
         apply_budget = self._stage_budget(limits, artifact, "apply", base_budget)
         lead_tokens = self._stage_max_tokens(limits, artifact, "lead", base_budget)
         apply_tokens = self._stage_max_tokens(limits, artifact, "apply", base_budget)
+        add_only_tokens = self._stage_max_tokens(limits, artifact, "apply", base_budget)
         responses: List[LLMResponse] = []
         summary: Dict[str, object] = {}
 
@@ -884,7 +885,7 @@ class RequirementsPipeline:
                 gemini_review=cross_review,
                 raw_dir=raw_dir,
                 artifacts_dir=artifacts_dir,
-                max_tokens=apply_tokens,
+                max_tokens=add_only_tokens,
             )
             count_after_add_only = len(final_payload.get("requirements", []))
             missing_before_add_only = max(limits.req_min - count_before_add_only, 0)
@@ -1012,10 +1013,10 @@ class RequirementsPipeline:
                         self._apply_format_retry_used or self._json_parse_repairs
                     ),
                     "cli_max_output_tokens": cli_cap,
-                    "add_only_max_output_tokens": apply_tokens,
+                    "add_only_max_output_tokens": add_only_tokens,
                     "format_retry_max_output_tokens": apply_tokens,
                     "assumptions_constraints_max_output_tokens": apply_tokens,
-                    "effective_add_only_max_output_tokens": apply_tokens,
+                    "effective_add_only_max_output_tokens": add_only_tokens,
                     "effective_format_fix_max_output_tokens": apply_tokens,
                     "lead_completion_tokens": self._lead_completion_tokens,
                     "apply_completion_tokens": self._apply_completion_tokens,
@@ -2134,6 +2135,20 @@ class RequirementsPipeline:
                 missing.append(area)
         return missing
 
+    def _add_only_missing_state(
+        self, payload: Dict, limits: RequirementsLimits
+    ) -> tuple[int, List[str], Dict[str, int]]:
+        per_area_counts = self._coverage_counts(payload, limits)
+        missing_areas = self._missing_coverage_areas(payload, limits)
+        req_missing = max(limits.req_min - len(payload.get("requirements", [])), 0)
+        coverage_missing = 0
+        if limits.min_per_area is not None:
+            for area in limits.coverage_areas:
+                area_count = per_area_counts.get(area, 0)
+                coverage_missing += max(limits.min_per_area - area_count, 0)
+        missing_count = max(req_missing, coverage_missing)
+        return missing_count, missing_areas, per_area_counts
+
     def _coverage_counts(self, payload: Dict, limits: RequirementsLimits) -> Dict[str, int]:
         counts: Dict[str, int] = {}
         if not limits.coverage_areas:
@@ -3082,23 +3097,17 @@ class RequirementsPipeline:
         requested_counts: List[int] = []
         round_counts: List[Dict[str, object]] = []
         balance_results = self._balance_check(payload, limits)
-        missing_coverage = self._missing_coverage_areas(payload, limits)
-        start_count = len(payload.get("requirements", []))
-        start_missing = max(limits.req_min - start_count, 0)
-        if start_missing <= 0:
+        missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
+        if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
         max_attempts = 10
-        while attempts < max_attempts:
-            current_count = len(payload.get("requirements", []))
-            missing_n = max(limits.req_min - current_count, 0)
-            if missing_n <= 0:
-                return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-            batch_size = min(25, missing_n)
+        while attempts < max_attempts and missing_count > 0:
+            batch_size = min(missing_count, 25)
             self._add_only_batch_size_used = batch_size
             generate_count = batch_size
             attempts += 1
             requested_counts.append(generate_count)
-            before_count = current_count
+            before_count = len(payload.get("requirements", []))
             (
                 payload,
                 missing_coverage,
@@ -3115,9 +3124,10 @@ class RequirementsPipeline:
                 max_tokens=max_tokens,
                 attempt=attempts,
                 generate_count=generate_count,
-                missing_count_before=missing_n,
+                missing_count_before=missing_count,
                 batch_size=batch_size,
             )
+            missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
             after_count = len(payload.get("requirements", []))
             round_counts.append(
                 {
@@ -3126,28 +3136,48 @@ class RequirementsPipeline:
                     "after_count": after_count,
                     "missing_before": max(limits.req_min - before_count, 0),
                     "missing_after": max(limits.req_min - after_count, 0),
+                    "missing_count_after": missing_count,
+                    "missing_areas_after": missing_coverage,
+                    "per_area_counts_after": coverage_counts,
                     "requested_count": generate_count,
                     "parsed_count": merge_report.get("parsed_count"),
                     "accepted_count": merge_report.get("accepted_count"),
                     "rejected_count": merge_report.get("rejected_count"),
                 }
             )
-        current_count = len(payload.get("requirements", []))
-        missing_n = max(limits.req_min - current_count, 0)
-        if missing_n > 0:
+
+        missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
+        write_json(
+            artifacts_dir / "add_only_final_coverage_counts.json",
+            {"per_area_counts_after": coverage_counts},
+        )
+        write_json(
+            artifacts_dir / "add_only_final_missing.json",
+            {
+                "missing_count_after": missing_count,
+                "missing_areas_after": missing_coverage,
+                "rounds_executed": attempts,
+            },
+        )
+        if missing_count > 0:
             self._requirements_warnings.append(
                 {
                     "stage": "add_only",
                     "note": "Targets unmet after add-only attempts.",
-                    "missing_count": missing_n,
-                    "missing_coverage": missing_coverage,
+                    "missing_count_after": missing_count,
+                    "missing_areas_after": missing_coverage,
+                    "per_area_counts_after": coverage_counts,
                     "balance_results": balance_results,
                     "max_rounds": max_attempts,
+                    "rounds_executed": attempts,
                 }
             )
             raise RuntimeError(
                 "Requirements minimum unmet after add-only rounds. "
-                f"Missing {missing_n} after {max_attempts} rounds."
+                f"missing_count_after={missing_count}; "
+                f"missing_areas_after={missing_coverage}; "
+                f"per_area_counts_after={coverage_counts}; "
+                f"rounds_executed={attempts}."
             )
         return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
 
