@@ -1,4 +1,4 @@
-Return ONLY valid JSON. No markdown. No prose.
+OUTPUT STRICT JSON ONLY. NO MARKDOWN. NO PROSE.
 
 Targets from brief:
 - requirements_min={{REQ_MIN}}
@@ -29,3 +29,5 @@ Return this exact JSON shape:
     "missing_areas": ["..."]
   }
 }
+
+It must output a single JSON object with exactly these keys: blocking_issues, required_actions, weak_requirements, missing_domain_topics, invented_constraints_flags, coverage_findings.

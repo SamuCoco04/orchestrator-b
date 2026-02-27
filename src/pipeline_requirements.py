@@ -214,6 +214,7 @@ class RequirementsPipeline:
         self._gemini_selected_model: str | None = None
         self._gemini_cross_review_skipped = False
         self._gemini_error_summary: str | None = None
+        self._cross_review_degraded = False
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -263,6 +264,7 @@ class RequirementsPipeline:
         self._gemini_selected_model = None
         self._gemini_cross_review_skipped = False
         self._gemini_error_summary = None
+        self._cross_review_degraded = False
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -618,7 +620,7 @@ class RequirementsPipeline:
                         artifacts_dir / "requirements_cross_review_extracted.json", cross_review
                     )
                     cross_review = self._validate_requirements_review(
-                        cross_review, draft_payload, limits
+                        cross_review, draft_payload, limits, artifacts_dir
                     )
                     write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
                     write_json(
@@ -981,6 +983,7 @@ class RequirementsPipeline:
                     "gemini_cross_review_skipped": cross_review_skipped,
                     "gemini_selected_model": self._gemini_selected_model,
                     "gemini_error_summary": self._gemini_error_summary,
+                    "cross_review_degraded": self._cross_review_degraded,
                     "cross_review_parse_error": cross_review_parse_error,
                     "lead_budget_max_output_tokens": lead_budget,
                     "apply_budget_max_output_tokens": apply_budget,
@@ -1986,58 +1989,154 @@ class RequirementsPipeline:
         )
         return retry_payload_json
 
-    def _normalize_requirements_review_payload(self, review: Dict) -> Dict:
-        normalized = dict(review)
-        coverage_findings = normalized.get("coverage_findings")
-        if not isinstance(coverage_findings, dict):
-            coverage_findings = {
-                "unmapped_count": 0,
-                "missing_areas": normalized.get("missing_areas", []),
+    def _normalize_requirements_review_payload(self, review: object, artifacts_dir: Path) -> Dict:
+        degraded = False
+        detected_type = type(review).__name__
+        detected_keys: List[str] = []
+
+        def _as_string_list(value: object) -> List[str]:
+            if isinstance(value, list):
+                return [
+                    str(item).strip()
+                    for item in value
+                    if isinstance(item, str) and str(item).strip()
+                ]
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+            return []
+
+        normalized: Dict[str, object] = {
+            "blocking_issues": [],
+            "required_actions": [],
+            "weak_requirements": [],
+            "missing_domain_topics": [],
+            "invented_constraints_flags": [],
+            "coverage_findings": {"unmapped_count": 0, "missing_areas": []},
+            "missing_areas": [],
+        }
+
+        review_dict: Dict[str, object] = {}
+        if isinstance(review, dict):
+            review_dict = review
+            detected_keys = [str(key) for key in review.keys() if isinstance(key, str)]
+        elif isinstance(review, list):
+            degraded = True
+            if review and all(isinstance(item, str) for item in review):
+                normalized["blocking_issues"] = _as_string_list(review)
+            else:
+                actions: List[str] = []
+                issues: List[str] = []
+                for entry in review:
+                    if isinstance(entry, dict):
+                        action = entry.get("action")
+                        issue = entry.get("issue")
+                        if isinstance(action, str) and action.strip():
+                            actions.append(action.strip())
+                        if isinstance(issue, str) and issue.strip():
+                            issues.append(issue.strip())
+                        if not action and not issue and entry:
+                            issues.append(str(entry)[:120])
+                    elif isinstance(entry, str) and entry.strip():
+                        issues.append(entry.strip())
+                normalized["required_actions"] = actions
+                normalized["blocking_issues"] = issues
+        elif isinstance(review, str):
+            degraded = True
+            normalized["blocking_issues"] = [review.strip()] if review.strip() else []
+        else:
+            degraded = True
+
+        if review_dict:
+            blocking = _as_string_list(review_dict.get("blocking_issues"))
+            if not blocking:
+                blocking = _as_string_list(review_dict.get("issues"))
+            if not blocking:
+                blocking = _as_string_list(review_dict.get("rationale"))
+            normalized["blocking_issues"] = blocking
+
+            actions = _as_string_list(review_dict.get("required_actions"))
+            if not actions:
+                actions = _as_string_list(review_dict.get("required"))
+            if not actions:
+                actions = _as_string_list(review_dict.get("actions"))
+            normalized["required_actions"] = actions
+
+            normalized["weak_requirements"] = _as_string_list(review_dict.get("weak_requirements"))
+            normalized["missing_domain_topics"] = _as_string_list(
+                review_dict.get("missing_domain_topics")
+            )
+            if not normalized["missing_domain_topics"]:
+                normalized["missing_domain_topics"] = _as_string_list(review_dict.get("missing"))
+            normalized["invented_constraints_flags"] = _as_string_list(
+                review_dict.get("invented_constraints_flags")
+            )
+
+            coverage_findings = review_dict.get("coverage_findings")
+            if not isinstance(coverage_findings, dict):
+                coverage_findings = {
+                    "unmapped_count": 0,
+                    "missing_areas": review_dict.get("missing_areas", []),
+                }
+            missing_areas = _as_string_list(
+                coverage_findings.get("missing_areas", review_dict.get("missing_areas", []))
+            )
+            unmapped = coverage_findings.get("unmapped_count", 0)
+            if not isinstance(unmapped, (int, float)):
+                unmapped = 0
+            normalized["coverage_findings"] = {
+                "unmapped_count": int(unmapped),
+                "missing_areas": missing_areas,
             }
-        missing_areas = coverage_findings.get("missing_areas", normalized.get("missing_areas", []))
-        if not isinstance(missing_areas, list):
-            missing_areas = []
-        coverage_findings["missing_areas"] = [
-            str(item).strip() for item in missing_areas if isinstance(item, str) and str(item).strip()
-        ]
-        unmapped = coverage_findings.get("unmapped_count", 0)
-        if not isinstance(unmapped, (int, float)):
-            unmapped = 0
-        coverage_findings["unmapped_count"] = int(unmapped)
-        normalized["coverage_findings"] = coverage_findings
-        normalized["missing_domain_topics"] = [
-            str(item).strip()
-            for item in normalized.get("missing_domain_topics", [])
-            if isinstance(item, str) and str(item).strip()
-        ]
-        normalized["invented_constraints_flags"] = [
-            str(item).strip()
-            for item in normalized.get("invented_constraints_flags", [])
-            if isinstance(item, str) and str(item).strip()
-        ]
-        normalized["weak_requirements"] = [
-            str(item).strip()
-            for item in normalized.get("weak_requirements", [])
-            if isinstance(item, str) and str(item).strip()
-        ]
-        actions = normalized.get("required_actions", [])
+            normalized["missing_areas"] = list(missing_areas)
+
         normalized_actions: List[str] = []
-        if isinstance(actions, list):
-            for action in actions:
-                if isinstance(action, str) and action.strip():
-                    normalized_actions.append(action.strip())
-                elif isinstance(action, dict):
-                    instruction = action.get("instruction")
-                    if isinstance(instruction, str) and instruction.strip():
-                        normalized_actions.append(instruction.strip())
+        for action in normalized.get("required_actions", []):
+            if isinstance(action, str) and action.strip():
+                normalized_actions.append(action.strip())
+            elif isinstance(action, dict):
+                instruction = action.get("instruction")
+                if isinstance(instruction, str) and instruction.strip():
+                    normalized_actions.append(instruction.strip())
         normalized["required_actions"] = normalized_actions
-        normalized["missing_areas"] = list(coverage_findings.get("missing_areas", []))
+
+        expected = {
+            "blocking_issues",
+            "required_actions",
+            "weak_requirements",
+            "missing_domain_topics",
+            "invented_constraints_flags",
+            "coverage_findings",
+        }
+        if not isinstance(review, dict) or not expected.issubset(set(detected_keys)):
+            degraded = True
+
+        if degraded:
+            self._cross_review_degraded = True
+            snippet = str(review).strip().replace("\n", " ")
+            if len(snippet) > 300:
+                snippet = snippet[:300] + "..."
+            write_json(
+                artifacts_dir / "requirements_cross_review_shape_warning.json",
+                {
+                    "detected_type": detected_type,
+                    "detected_keys": detected_keys,
+                    "first_300_chars_snippet": snippet,
+                },
+            )
+            self._requirements_warnings.append(
+                {
+                    "stage": "cross_review",
+                    "note": "Cross-review payload shape degraded; normalized with fallback.",
+                    "detected_type": detected_type,
+                }
+            )
+
         return normalized
 
     def _validate_requirements_review(
-        self, review: Dict, draft_payload: Dict, limits: RequirementsLimits
+        self, review: object, draft_payload: Dict, limits: RequirementsLimits, artifacts_dir: Path
     ) -> Dict:
-        normalized = self._normalize_requirements_review_payload(review)
+        normalized = self._normalize_requirements_review_payload(review, artifacts_dir)
         schema = self._load_schema("requirements_cross_review.schema.json")
         try:
             validate(instance=normalized, schema=schema)
@@ -3918,6 +4017,7 @@ class RequirementsPipeline:
             gemini_cross_review_skipped = summary.get("gemini_cross_review_skipped")
             gemini_selected_model = summary.get("gemini_selected_model")
             gemini_error_summary = summary.get("gemini_error_summary")
+            cross_review_degraded = summary.get("cross_review_degraded")
             cross_review_parse_error = summary.get("cross_review_parse_error")
             lines.append(f"- target_min_items: {target_min_items}")
             if final_target_items is not None:
@@ -4061,6 +4161,10 @@ class RequirementsPipeline:
                 )
             if gemini_error_summary:
                 lines.append(f"- gemini_error_summary: {gemini_error_summary}")
+            if cross_review_degraded is not None:
+                lines.append(
+                    f"- cross_review_degraded: {'yes' if cross_review_degraded else 'no'}"
+                )
             if gemini_cross_review_error:
                 lines.append(f"- gemini_cross_review_error: {gemini_cross_review_error}")
             if cross_review_parse_error:
