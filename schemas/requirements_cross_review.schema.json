@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "blocking_issues",
+    "required_actions",
+    "weak_requirements",
+    "missing_domain_topics",
+    "invented_constraints_flags",
+    "coverage_findings"
+  ],
+  "properties": {
+    "blocking_issues": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "required_actions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "weak_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "missing_domain_topics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "invented_constraints_flags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "coverage_findings": {
+      "type": "object",
+      "required": [
+        "unmapped_count",
+        "missing_areas"
+      ],
+      "properties": {
+        "unmapped_count": {
+          "type": "number"
+        },
+        "missing_areas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "missing_areas": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}
