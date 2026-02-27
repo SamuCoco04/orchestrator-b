@@ -810,6 +810,8 @@ class RequirementsPipeline:
                     apply_report,
                     final_payload,
                     required_actions,
+                    cross_review.get("weak_requirements", []),
+                    5 if len(cross_review.get("weak_requirements", [])) >= 5 else 0,
                 )
             if blocking_issues and (missing_actions or evidence_issues):
                 final_payload, apply_report = self._retry_apply_for_actions(
@@ -859,6 +861,15 @@ class RequirementsPipeline:
                 self._requirements_filtered_out.extend(filtered_out)
             if quality_warnings:
                 self._requirements_quality_warnings.extend(quality_warnings)
+            final_payload = self._filter_invented_assumptions_constraints(
+                brief=brief,
+                payload=final_payload,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                limits=limits,
+                max_tokens=apply_tokens,
+            )
             count_before_add_only = len(final_payload.get("requirements", []))
             try:
                 validate(instance=final_payload, schema=schema)
@@ -933,6 +944,15 @@ class RequirementsPipeline:
             )
             total_add_only_attempts = add_only_attempts + (
                 1 if self._post_review_add_only_used else 0
+            )
+            final_payload = self._apply_prefix_fix_once(
+                brief=brief,
+                payload=final_payload,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=apply_tokens,
             )
             balance_results = self._balance_check(final_payload, limits)
             self._requirements_balance_results = balance_results
@@ -1571,6 +1591,10 @@ class RequirementsPipeline:
         normalized = dict(report)
         if "unresolved_actions" in report and "unapplied_actions" not in report:
             normalized["unapplied_actions"] = report.get("unresolved_actions")
+        if not isinstance(normalized.get("fixed_weak_requirements"), list):
+            normalized["fixed_weak_requirements"] = []
+        if not isinstance(normalized.get("removed_invented_constraints"), list):
+            normalized["removed_invented_constraints"] = []
         applied_actions = normalized.get("applied_actions")
         if applied_actions is None and "addressed_actions" in report:
             normalized["applied_actions"] = [
@@ -1635,7 +1659,12 @@ class RequirementsPipeline:
         )
 
     def _validate_apply_report(
-        self, report: Dict | None, payload: Dict, required_actions: List[str]
+        self,
+        report: Dict | None,
+        payload: Dict,
+        required_actions: List[str],
+        weak_requirements: List[str] | None = None,
+        enforce_weak_min: int = 0,
     ) -> tuple[List[str], List[str], List[Dict[str, str]]]:
         errors: List[str] = []
         if not report:
@@ -1675,6 +1704,18 @@ class RequirementsPipeline:
                 "Missing applied_actions entries for required_actions: "
                 + "; ".join(missing_actions)
             )
+        if weak_requirements:
+            weak_ids = [item.strip() for item in weak_requirements if isinstance(item, str) and item.strip()]
+            fixed = report.get("fixed_weak_requirements", [])
+            fixed_ids = [item.strip() for item in fixed if isinstance(item, str) and item.strip()]
+            needed = min(len(weak_ids), enforce_weak_min)
+            if needed > 0 and len(set(fixed_ids)) < needed:
+                errors.append(
+                    f"APPLY_REPORT_JSON.fixed_weak_requirements must include at least {needed} IDs."
+                )
+                missing_actions.append(
+                    f"Fix weak requirements: include at least {needed} IDs in fixed_weak_requirements."
+                )
         return errors, missing_actions, evidence_issues
 
     def _missing_required_actions(
@@ -1808,16 +1849,10 @@ class RequirementsPipeline:
         max_tokens: int,
         expected_keys: set[str],
     ) -> tuple[Dict, Dict]:
-        retry_prompt = read_text(self.prompts_dir / "requirements_apply_retry_actions.md")
+        retry_prompt = read_text(self.prompts_dir / "requirements_apply_retry_missing_actions_only.md")
         retry_payload = {
-            "brief": brief,
-            "draft": draft,
-            "cross_review": cross_review,
             "current": final_payload,
-            "apply_report": apply_report,
-            "errors": errors,
             "missing_actions": missing_actions,
-            "evidence_issues": evidence_issues,
         }
         full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
         write_text(raw_dir / "requirements_apply_retry_actions_prompt.txt", full_prompt)
@@ -1862,7 +1897,11 @@ class RequirementsPipeline:
             missing_actions,
             evidence_issues,
         ) = self._validate_apply_report(
-            report, retry_payload_json, cross_review.get("required_actions", [])
+            report,
+            retry_payload_json,
+            cross_review.get("required_actions", []),
+            cross_review.get("weak_requirements", []),
+            5 if len(cross_review.get("weak_requirements", [])) >= 5 else 0,
         )
         if report_errors or missing_actions or evidence_issues:
             self._write_enforcement_failed(
@@ -1930,7 +1969,11 @@ class RequirementsPipeline:
         )
         if report is not None:
             report_errors, missing_actions, evidence_issues = self._validate_apply_report(
-                report, retry_payload_json, cross_review.get("required_actions", [])
+                report,
+                retry_payload_json,
+                cross_review.get("required_actions", []),
+                cross_review.get("weak_requirements", []),
+                5 if len(cross_review.get("weak_requirements", [])) >= 5 else 0,
             )
             if report_errors or missing_actions or evidence_issues:
                 raise RuntimeError(
@@ -1943,12 +1986,61 @@ class RequirementsPipeline:
         )
         return retry_payload_json
 
+    def _normalize_requirements_review_payload(self, review: Dict) -> Dict:
+        normalized = dict(review)
+        coverage_findings = normalized.get("coverage_findings")
+        if not isinstance(coverage_findings, dict):
+            coverage_findings = {
+                "unmapped_count": 0,
+                "missing_areas": normalized.get("missing_areas", []),
+            }
+        missing_areas = coverage_findings.get("missing_areas", normalized.get("missing_areas", []))
+        if not isinstance(missing_areas, list):
+            missing_areas = []
+        coverage_findings["missing_areas"] = [
+            str(item).strip() for item in missing_areas if isinstance(item, str) and str(item).strip()
+        ]
+        unmapped = coverage_findings.get("unmapped_count", 0)
+        if not isinstance(unmapped, (int, float)):
+            unmapped = 0
+        coverage_findings["unmapped_count"] = int(unmapped)
+        normalized["coverage_findings"] = coverage_findings
+        normalized["missing_domain_topics"] = [
+            str(item).strip()
+            for item in normalized.get("missing_domain_topics", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        normalized["invented_constraints_flags"] = [
+            str(item).strip()
+            for item in normalized.get("invented_constraints_flags", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        normalized["weak_requirements"] = [
+            str(item).strip()
+            for item in normalized.get("weak_requirements", [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+        actions = normalized.get("required_actions", [])
+        normalized_actions: List[str] = []
+        if isinstance(actions, list):
+            for action in actions:
+                if isinstance(action, str) and action.strip():
+                    normalized_actions.append(action.strip())
+                elif isinstance(action, dict):
+                    instruction = action.get("instruction")
+                    if isinstance(instruction, str) and instruction.strip():
+                        normalized_actions.append(instruction.strip())
+        normalized["required_actions"] = normalized_actions
+        normalized["missing_areas"] = list(coverage_findings.get("missing_areas", []))
+        return normalized
+
     def _validate_requirements_review(
         self, review: Dict, draft_payload: Dict, limits: RequirementsLimits
     ) -> Dict:
+        normalized = self._normalize_requirements_review_payload(review)
         schema = self._load_schema("requirements_cross_review.schema.json")
         try:
-            validate(instance=review, schema=schema)
+            validate(instance=normalized, schema=schema)
         except ValidationError as exc:
             self._requirements_warnings.append(
                 {"stage": "cross_review", "note": "Review schema invalid.", "error": str(exc)}
@@ -1956,30 +2048,22 @@ class RequirementsPipeline:
             return self._fallback_review(draft_payload, limits)
 
         gaps = (
-            review.get("missing_areas")
-            or review.get("weak_requirements")
-            or review.get("blocking_issues")
+            normalized.get("missing_areas")
+            or normalized.get("weak_requirements")
+            or normalized.get("blocking_issues")
+            or normalized.get("missing_domain_topics")
+            or normalized.get("invented_constraints_flags")
         )
-        if gaps and not review.get("required_actions"):
+        if gaps and not normalized.get("required_actions"):
             self._requirements_warnings.append(
                 {"stage": "cross_review", "note": "Review missing required_actions; adding fallback."}
             )
-            review["required_actions"] = [
-                {
-                    "id": "A-00",
-                    "type": "coverage_gap",
-                    "severity": "blocking",
-                    "targets": [],
-                    "area": None,
-                    "instruction": "Add missing requirements for uncovered areas.",
-                }
-            ]
-        return review
+            normalized["required_actions"] = ["Add missing requirements for uncovered areas."]
+        return normalized
 
     def _fallback_review(self, draft_payload: Dict, limits: RequirementsLimits) -> Dict:
         coverage_counts = self._coverage_counts(draft_payload, limits)
         missing_areas: List[str] = []
-        add_count = 0
         if limits.min_per_area is not None:
             for area in limits.coverage_areas:
                 current = coverage_counts.get(area, 0)
@@ -1987,21 +2071,17 @@ class RequirementsPipeline:
                 add = max(target - current, 0)
                 if add:
                     missing_areas.append(area)
-                    add_count += add
         return {
             "blocking_issues": [],
-            "missing_areas": missing_areas,
+            "required_actions": ["Add missing requirements for uncovered areas."],
             "weak_requirements": [],
-            "required_actions": [
-                {
-                    "id": "A-00",
-                    "type": "coverage_gap",
-                    "severity": "blocking",
-                    "targets": [],
-                    "area": None,
-                    "instruction": "Add missing requirements for uncovered areas.",
-                }
-            ],
+            "missing_domain_topics": list(missing_areas),
+            "invented_constraints_flags": [],
+            "coverage_findings": {
+                "unmapped_count": int(coverage_counts.get("UNMAPPED", 0)),
+                "missing_areas": list(missing_areas),
+            },
+            "missing_areas": list(missing_areas),
         }
 
     def _artifact_cross_review_prompt(self, artifact: str) -> str:
@@ -3058,7 +3138,7 @@ class RequirementsPipeline:
 
     def _gemini_missing_points(self, review: Dict) -> List[str]:
         points: List[str] = []
-        for entry in review.get("missing_areas", []):
+        for entry in review.get("missing_areas", []) + review.get("missing_domain_topics", []):
             if isinstance(entry, str) and entry.strip():
                 points.append(entry.strip())
         for entry in review.get("blocking_issues", []):
@@ -3068,12 +3148,12 @@ class RequirementsPipeline:
             if isinstance(entry, str) and entry.strip():
                 points.append(f"Weak requirement: {entry.strip()}")
         for action in review.get("required_actions", []):
-            if not isinstance(action, dict):
-                continue
-            action_id = action.get("id")
-            instruction = action.get("instruction")
-            if action_id and instruction:
-                points.append(f"{action_id}: {instruction}")
+            if isinstance(action, str) and action.strip():
+                points.append(f"Required action: {action.strip()}")
+            elif isinstance(action, dict):
+                instruction = action.get("instruction")
+                if isinstance(instruction, str) and instruction.strip():
+                    points.append(f"Required action: {instruction.strip()}")
         seen = set()
         deduped = []
         for point in points:
@@ -3289,6 +3369,145 @@ class RequirementsPipeline:
             "duplicate_candidates": normalize_list(review.get("duplicate_candidates")),
             "top_ambiguities": normalize_list(review.get("top_ambiguities")),
         }
+
+    def _brief_has_budget_or_timeline(self, brief: str) -> bool:
+        lowered = brief.lower()
+        return any(token in lowered for token in ["$", "usd", "€", "budget", "million", "12 months", "timeline"])
+
+    def _filter_invented_assumptions_constraints(
+        self,
+        brief: str,
+        payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        limits: RequirementsLimits,
+        max_tokens: int,
+    ) -> Dict:
+        if self._brief_has_budget_or_timeline(brief):
+            return payload
+        pattern = re.compile(r"(\$|usd|€|budget|million|12\s*months|timeline\s*12)", re.IGNORECASE)
+        removed: Dict[str, List[str]] = {"assumptions": [], "constraints": []}
+        assumptions = [item for item in payload.get("assumptions", []) if isinstance(item, str)]
+        constraints = [item for item in payload.get("constraints", []) if isinstance(item, str)]
+        kept_assumptions = []
+        for item in assumptions:
+            if pattern.search(item):
+                removed["assumptions"].append(item)
+            else:
+                kept_assumptions.append(item)
+        kept_constraints = []
+        for item in constraints:
+            if pattern.search(item):
+                removed["constraints"].append(item)
+            else:
+                kept_constraints.append(item)
+        if not removed["assumptions"] and not removed["constraints"]:
+            return payload
+        write_json(artifacts_dir / "requirements_filtered_out.json", {"filtered_out": removed})
+        filtered_payload = dict(payload)
+        filtered_payload["assumptions"] = kept_assumptions
+        filtered_payload["constraints"] = kept_constraints
+
+        missing_assumptions = max(limits.assumptions_min - len(kept_assumptions), 0)
+        missing_constraints = max(limits.constraints_min - len(kept_constraints), 0)
+        if missing_assumptions <= 0 and missing_constraints <= 0:
+            return filtered_payload
+
+        prompt = read_text(self.prompts_dir / "assumptions_constraints_add_only.md")
+        req_payload = {
+            "brief": brief,
+            "current": {
+                "assumptions": kept_assumptions,
+                "constraints": kept_constraints,
+            },
+            "missing_assumptions": missing_assumptions,
+            "missing_constraints": missing_constraints,
+        }
+        full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(req_payload)}\n"
+        write_text(raw_dir / "assumptions_constraints_add_only_prompt.txt", full_prompt)
+        response = self._complete(adapter, full_prompt, max_tokens)
+        write_text(raw_dir / "assumptions_constraints_add_only_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / "assumptions_constraints_add_only_usage.json", response)
+        extracted = self._extract_wrapped_json(
+            response.raw_text,
+            "ASSUMPTIONS_CONSTRAINTS_JSON",
+            {"assumptions", "constraints"},
+            context="assumptions_constraints_add_only",
+        )
+        new_assumptions = [item for item in extracted.get("assumptions", []) if isinstance(item, str)]
+        new_constraints = [item for item in extracted.get("constraints", []) if isinstance(item, str)]
+        filtered_payload["assumptions"] = (kept_assumptions + new_assumptions)[: max(limits.assumptions_min, len(kept_assumptions + new_assumptions))]
+        filtered_payload["constraints"] = (kept_constraints + new_constraints)[: max(limits.constraints_min, len(kept_constraints + new_constraints))]
+        return filtered_payload
+
+    def _apply_prefix_fix_once(
+        self,
+        brief: str,
+        payload: Dict,
+        limits: RequirementsLimits,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> Dict:
+        if not limits.coverage_prefix_mode:
+            return payload
+        invalid: List[Dict[str, str]] = []
+        for item in payload.get("requirements", []):
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text", "")).strip()
+            match = re.match(r"^\[(.+?)\]\s+", text)
+            if not match or match.group(1).strip() not in limits.coverage_areas:
+                invalid.append(
+                    {
+                        "id": str(item.get("id", "")),
+                        "text": text,
+                        "priority": str(item.get("priority", "should")),
+                    }
+                )
+        if not invalid:
+            return payload
+        prompt = read_text(self.prompts_dir / "requirements_prefix_fix.md")
+        req_payload = {
+            "brief": brief,
+            "coverage_areas": limits.coverage_areas,
+            "invalid_requirements": invalid,
+        }
+        full_prompt = f"{prompt}\n\nINPUT:\n{json.dumps(req_payload)}\n"
+        write_text(raw_dir / "requirements_prefix_fix_prompt.txt", full_prompt)
+        response = self._complete(adapter, full_prompt, max_tokens)
+        write_text(raw_dir / "requirements_prefix_fix_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / "requirements_prefix_fix_usage.json", response)
+        fixed = self._extract_wrapped_json(
+            response.raw_text,
+            "PREFIX_FIXED_JSON",
+            {"requirements"},
+            context="requirements_prefix_fix",
+        )
+        replacements = {
+            str(item.get("id")): item for item in fixed.get("requirements", []) if isinstance(item, dict)
+        }
+        updated: List[Dict] = []
+        for item in payload.get("requirements", []):
+            if not isinstance(item, dict):
+                continue
+            req_id = str(item.get("id", ""))
+            replacement = replacements.get(req_id)
+            if isinstance(replacement, dict):
+                merged = dict(item)
+                merged["text"] = str(replacement.get("text", merged.get("text", "")))
+                merged["priority"] = str(replacement.get("priority", merged.get("priority", "should")))
+                updated.append(merged)
+            else:
+                updated.append(item)
+        next_payload = dict(payload)
+        next_payload["requirements"] = updated
+        unmapped = self._coverage_counts(next_payload, limits).get("UNMAPPED", 0)
+        if unmapped > 0:
+            raise RuntimeError(f"coverage_prefix_mode unmet after prefix fix; unmapped_count={unmapped}")
+        return next_payload
 
     def _add_assumptions_constraints(
         self,
