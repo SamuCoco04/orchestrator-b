@@ -132,6 +132,7 @@ class RequirementsLimits:
     artifact_token_budgets: Dict[str, int]
     lead_token_budgets: Dict[str, int]
     apply_token_budgets: Dict[str, int]
+    cross_review_provider: str
 
 
 class RequirementsPipeline:
@@ -215,6 +216,7 @@ class RequirementsPipeline:
         self._gemini_cross_review_skipped = False
         self._gemini_error_summary: str | None = None
         self._cross_review_degraded = False
+        self._cross_review_provider_used = "none"
         self._list_repair_counts: Dict[str, int] = {
             "requirements": 0,
             "assumptions": 0,
@@ -265,6 +267,7 @@ class RequirementsPipeline:
         self._gemini_cross_review_skipped = False
         self._gemini_error_summary = None
         self._cross_review_degraded = False
+        self._cross_review_provider_used = "none"
         self._list_repair_counts = {
             "requirements": 0,
             "assumptions": 0,
@@ -558,29 +561,84 @@ class RequirementsPipeline:
         write_text(raw_dir / f"{artifact}_cross_review_prompt.txt", cross_full_prompt)
         cross_review_error: str | None = None
         cross_review_skipped = False
+        cross_review_parse_error: str | None = None
+        cross_review: Dict = {}
+        cross_provider_preference = limits.cross_review_provider if artifact == "requirements" else "gemini"
+        if cross_provider_preference == "openai":
+            providers = [("openai", chatgpt)]
+        elif cross_provider_preference == "gemini":
+            providers = [("gemini", gemini)]
+        else:
+            providers = [("gemini", gemini), ("openai", chatgpt)]
+
         cross_response: LLMResponse | None = None
-        try:
-            cross_response = self._complete(gemini, cross_full_prompt, apply_tokens)
-        except (GeminiUnavailableError, RuntimeError) as exc:
-            cross_review_error = str(exc)
+        for provider_name, provider_adapter in providers:
+            response_error: str | None = None
+            try:
+                cross_response = self._complete(provider_adapter, cross_full_prompt, apply_tokens)
+            except (GeminiUnavailableError, RuntimeError) as exc:
+                response_error = str(exc)
+                if provider_name == "gemini":
+                    self._gemini_cross_review_skipped = True
+                    self._gemini_error_summary = response_error
+            if response_error:
+                cross_review_error = response_error
+                if provider_name == "gemini" and hasattr(gemini, "get_diagnostics"):
+                    try:
+                        diagnostics = gemini.get_diagnostics()  # type: ignore[attr-defined]
+                        selected = diagnostics.get("selected_model")
+                        if isinstance(selected, str) and selected:
+                            self._gemini_selected_model = selected
+                    except Exception:
+                        pass
+                continue
+
+            responses.append(cross_response)
+            write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
+            self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
+            write_text(raw_dir / "requirements_cross_review_raw.txt", cross_response.raw_text)
+            try:
+                extracted_review = extract_json_tolerant(cross_response.raw_text)
+            except ValueError as exc:
+                cross_review_parse_error = str(exc)
+                cross_review_error = str(exc)
+                continue
+            if not isinstance(extracted_review, dict):
+                cross_review_parse_error = "Cross-review payload is not a JSON object."
+                cross_review_error = cross_review_parse_error
+                continue
+            strict_keys = {"blocking_issues", "required_actions", "weak_requirements", "missing_areas"}
+            has_strict_shape = strict_keys.issubset(extracted_review.keys())
+            if not has_strict_shape:
+                cross_review_parse_error = "Cross-review payload missing strict keys."
+                cross_review_error = cross_review_parse_error
+                continue
+            write_json(artifacts_dir / "requirements_cross_review_extracted.json", extracted_review)
+            cross_review = self._validate_requirements_review(
+                extracted_review, draft_payload, limits, artifacts_dir
+            )
+            write_json(artifacts_dir / "requirements_cross_review_normalized.json", cross_review)
+            write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
+            self._gemini_review_present = True
+            self._cross_review_provider_used = provider_name
+            if provider_name == "gemini":
+                self._gemini_review_used = True
+            break
+
+        if not cross_review:
+            cross_review = self._fallback_review(draft_payload, limits)
             cross_review_skipped = True
-            self._gemini_cross_review_skipped = True
-            self._gemini_error_summary = cross_review_error
-            diagnostics = {}
-            if hasattr(gemini, "get_diagnostics"):
-                try:
-                    diagnostics = gemini.get_diagnostics()  # type: ignore[attr-defined]
-                except Exception:
-                    diagnostics = {}
-            if artifact == "requirements":
-                write_json(
-                    artifacts_dir / "requirements_cross_review_failed.json",
-                    {
-                        "error": cross_review_error,
-                        "cross_review_skipped": True,
-                        "diagnostics": diagnostics,
-                    },
-                )
+            self._cross_review_provider_used = "none"
+            write_json(
+                artifacts_dir / "requirements_cross_review_failed.json",
+                {
+                    "error": cross_review_error,
+                    "parse_error": cross_review_parse_error,
+                    "cross_review_skipped": True,
+                    "preferred_provider": cross_provider_preference,
+                    "providers_attempted": [name for name, _ in providers],
+                },
+            )
         if hasattr(gemini, "get_diagnostics"):
             try:
                 diagnostics = gemini.get_diagnostics()  # type: ignore[attr-defined]
@@ -589,58 +647,13 @@ class RequirementsPipeline:
                     self._gemini_selected_model = selected
             except Exception:
                 pass
-        cross_review: Dict = {}
-        cross_review_parse_error: str | None = None
-        if cross_response is not None:
-            responses.append(cross_response)
-            write_text(raw_dir / f"{artifact}_cross_review_raw.txt", cross_response.raw_text)
-            self._write_usage(raw_dir / f"{artifact}_cross_review_usage.json", cross_response)
-            cross_review = self._safe_extract_json(cross_response.raw_text)
-            if artifact == "requirements":
-                try:
-                    cross_review = extract_json_tolerant(cross_response.raw_text)
-                except ValueError as exc:
-                    cross_review_parse_error = str(exc)
-                    cross_review = {
-                        "blocking_issues": [],
-                        "required_actions": [],
-                        "weak_requirements": [],
-                        "missing_areas": [],
-                    }
-                    write_json(
-                        artifacts_dir / "requirements_cross_review_failed.json",
-                        {
-                            "error": cross_review_parse_error,
-                            "note": "Continuing without cross-review enforcement.",
-                            "raw_snippet": cross_response.raw_text[:500],
-                        },
-                    )
-                else:
-                    write_json(
-                        artifacts_dir / "requirements_cross_review_extracted.json", cross_review
-                    )
-                    cross_review = self._validate_requirements_review(
-                        cross_review, draft_payload, limits, artifacts_dir
-                    )
-                    write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
-                    write_json(
-                        artifacts_dir / "requirements_cross_review_normalized.json", cross_review
-                    )
-                    self._gemini_review_present = True
         if artifact == "requirements" and cross_review_error:
             self._requirements_warnings.append(
                 {
                     "stage": "cross_review",
-                    "note": "Gemini cross-review failed; continuing without enforcement.",
+                    "note": "Cross-review failed or degraded; fallback used.",
                     "error": cross_review_error,
-                }
-            )
-        if artifact == "requirements" and cross_review_parse_error:
-            self._requirements_warnings.append(
-                {
-                    "stage": "cross_review",
-                    "note": "Cross-review JSON parse failed; continuing without enforcement.",
-                    "error": cross_review_parse_error,
+                    "provider": cross_provider_preference,
                 }
             )
 
@@ -657,7 +670,7 @@ class RequirementsPipeline:
             if cross_response is not None:
                 apply_payload["gemini_review_text"] = cross_response.raw_text
         apply_instruction = ""
-        if artifact == "requirements" and cross_review_error is None and cross_review_parse_error is None:
+        if artifact == "requirements" and self._cross_review_provider_used in {"gemini", "openai"}:
             missing_points = self._gemini_missing_points(cross_review)
             missing_points_list = (
                 "\n".join(f"- {point}" for point in missing_points) if missing_points else "- none"
@@ -677,7 +690,8 @@ class RequirementsPipeline:
                     "\nPrefix each requirement with [<Coverage Area>] using one of: "
                     f"{areas}."
                 )
-            self._gemini_review_used = True
+            if self._cross_review_provider_used == "gemini":
+                self._gemini_review_used = True
         apply_full_prompt = f"{apply_prompt}{apply_instruction}\n\nINPUT:\n{json.dumps(apply_payload)}\n"
         write_text(raw_dir / f"{artifact}_apply_prompt.txt", apply_full_prompt)
         apply_response = self._complete(chatgpt, apply_full_prompt, apply_tokens)
@@ -785,6 +799,17 @@ class RequirementsPipeline:
                 self._requirements_warnings.append(
                     {"stage": "apply", "note": "Missing changelog JSON.", "error": str(exc)}
                 )
+        if artifact == "requirements":
+            final_payload = self._stabilize_final_requirements_json(
+                final_payload=final_payload,
+                apply_raw=apply_response.raw_text,
+                brief=brief,
+                limits=limits,
+                adapter=chatgpt,
+                raw_dir=raw_dir,
+                artifacts_dir=artifacts_dir,
+                max_tokens=apply_tokens,
+            )
         final_payload, final_warnings = self._repair_artifact_payload(
             artifact, final_payload, stage="apply"
         )
@@ -985,8 +1010,12 @@ class RequirementsPipeline:
                     "gemini_error_summary": self._gemini_error_summary,
                     "cross_review_degraded": self._cross_review_degraded,
                     "cross_review_parse_error": cross_review_parse_error,
+                    "cross_review_provider_used": self._cross_review_provider_used,
+                    "cross_review_provider_preference": limits.cross_review_provider,
                     "lead_budget_max_output_tokens": lead_budget,
                     "apply_budget_max_output_tokens": apply_budget,
+                    "add_only_budget_max_output_tokens": apply_budget,
+                    "format_retry_budget_max_output_tokens": apply_budget,
                     "lead_effective_max_output_tokens": lead_tokens,
                     "apply_effective_max_output_tokens": apply_tokens,
                     "lead_max_output_tokens": lead_tokens,
@@ -2341,7 +2370,7 @@ class RequirementsPipeline:
                 if not isinstance(item, dict):
                     continue
                 text = str(item.get("text", "")).strip()
-                match = re.match(r"^\[(.+?)\]\s+", text)
+                match = re.match(r"^\[(.+?)\] ", text)
                 if not match:
                     unmapped += 1
                     continue
@@ -2661,7 +2690,7 @@ class RequirementsPipeline:
         artifacts_dir: Path,
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
-        max_retries = 1
+        max_retries = 2
         existing_texts = {
             self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
@@ -2672,7 +2701,6 @@ class RequirementsPipeline:
         invalid_prefix_samples: List[str] = []
         consecutive_low_count = 0
         consecutive_format_fail = 0
-        min_acceptable = max(1, math.ceil(generate_count * 0.5))
         last_report: Dict[str, object] = {}
         for retry_index in range(1, max_retries + 2):
             strict = retry_index > 1
@@ -2768,7 +2796,7 @@ class RequirementsPipeline:
                     format_failure = True
                     continue
                 if limits.coverage_prefix_mode:
-                    match = re.match(r"^\[(.+?)\]\s+", text)
+                    match = re.match(r"^\[(.+?)\] ", text)
                     if not match or match.group(1).strip() not in limits.coverage_areas:
                         rejected_reasons.append("invalid_prefix")
                         if retry_index <= max_retries:
@@ -2796,7 +2824,7 @@ class RequirementsPipeline:
                 "rejected_count": len(rejected_reasons),
                 "rejected_reasons": rejected_reasons,
                 "shape": shape,
-                "min_acceptable": min_acceptable,
+                "count_strict_expected": generate_count,
             }
             last_report = report
             write_json(
@@ -2818,20 +2846,17 @@ class RequirementsPipeline:
                     )
                 continue
             consecutive_format_fail = 0
-            if accepted_count < min_acceptable:
-                if returned_count < min_acceptable:
-                    consecutive_low_count += 1
-                    if consecutive_low_count >= 2:
-                        snippet = response.raw_text.strip().replace("\n", " ")
-                        if len(snippet) > 200:
-                            snippet = snippet[:200] + "..."
-                        raise RuntimeError(
-                            "Add-only returned too few items for consecutive retries. "
-                            f"Expected {generate_count}, got {accepted_count}. "
-                            f"effective_max_tokens={max_tokens}. Shape: {shape}. Snippet: {snippet}"
-                        )
-                else:
-                    consecutive_low_count = 0
+            if accepted_count != generate_count or returned_count != generate_count:
+                consecutive_low_count += 1
+                if consecutive_low_count >= 3:
+                    snippet = response.raw_text.strip().replace("\n", " ")
+                    if len(snippet) > 200:
+                        snippet = snippet[:200] + "..."
+                    raise RuntimeError(
+                        "Add-only COUNT_STRICT failed after retries. "
+                        f"Expected exactly {generate_count}, got returned={returned_count}, accepted={accepted_count}. "
+                        f"effective_max_tokens={max_tokens}. Shape: {shape}. Snippet: {snippet}"
+                    )
                 continue
             consecutive_low_count = 0
             if not format_failure:
@@ -2848,7 +2873,7 @@ class RequirementsPipeline:
                 "rejected_count": 0,
                 "rejected_reasons": ["no_valid_response"],
                 "shape": "unknown",
-                "min_acceptable": min_acceptable,
+                "count_strict_expected": generate_count,
             }
         additions = {"requirements": [], "assumptions": [], "constraints": []}
         return additions, last_report
@@ -2915,6 +2940,88 @@ class RequirementsPipeline:
             artifacts_dir / "requirements_apply_format_retry_extracted.json", extracted
         )
         return extracted
+
+    def _stabilize_final_requirements_json(
+        self,
+        final_payload: Dict,
+        apply_raw: str,
+        brief: str,
+        limits: RequirementsLimits,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> Dict:
+        repaired = False
+        warnings: List[Dict[str, str]] = []
+        try:
+            parsed = extract_json_tolerant(apply_raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, list) and all(
+            isinstance(item, dict) and self._is_requirement_object(item) for item in parsed
+        ):
+            repaired = True
+            warnings.append({
+                "stage": "final_requirements_json",
+                "note": "Wrapped bare requirements list into FINAL_REQUIREMENTS_JSON.",
+            })
+            write_json(artifacts_dir / "requirements_final_requirements_extracted_candidate.json", parsed)
+            final_payload = {
+                "requirements": parsed,
+                "assumptions": final_payload.get("assumptions", []),
+                "constraints": final_payload.get("constraints", []),
+            }
+
+        assumptions = final_payload.get("assumptions")
+        constraints = final_payload.get("constraints")
+        assumptions_ok = isinstance(assumptions, list) and len(assumptions) >= 3
+        constraints_ok = isinstance(constraints, list) and len(constraints) >= 3
+        if not assumptions_ok or not constraints_ok:
+            repaired = True
+            micro_prompt = (
+                "Return STRICT JSON ONLY: {\"assumptions\":[],\"constraints\":[]}. "
+                "Provide at least 3 assumptions and at least 3 constraints grounded in the brief."
+            )
+            micro_payload = {
+                "brief": brief,
+                "requirements": final_payload.get("requirements", []),
+                "minimums": {
+                    "assumptions": max(3, limits.assumptions_min),
+                    "constraints": max(3, limits.constraints_min),
+                },
+            }
+            full_prompt = f"{micro_prompt}\n\nINPUT:\n{json.dumps(micro_payload)}\n"
+            write_text(raw_dir / "requirements_apply_assumptions_constraints_prompt.txt", full_prompt)
+            response = self._complete(adapter, full_prompt, max_tokens)
+            write_text(raw_dir / "requirements_apply_assumptions_constraints_raw.txt", response.raw_text)
+            self._write_usage(raw_dir / "requirements_apply_assumptions_constraints_usage.json", response)
+            try:
+                parsed_micro = extract_json_tolerant(response.raw_text)
+            except ValueError as exc:
+                warnings.append({
+                    "stage": "final_requirements_json",
+                    "note": f"Micro-pass assumptions/constraints parse failed: {exc}",
+                })
+                parsed_micro = {}
+            if isinstance(parsed_micro, dict):
+                if isinstance(parsed_micro.get("assumptions"), list):
+                    final_payload["assumptions"] = parsed_micro["assumptions"]
+                if isinstance(parsed_micro.get("constraints"), list):
+                    final_payload["constraints"] = parsed_micro["constraints"]
+                write_json(
+                    artifacts_dir / "requirements_apply_assumptions_constraints_extracted.json",
+                    parsed_micro,
+                )
+        if repaired:
+            write_json(artifacts_dir / "requirements_final_requirements_normalized.json", final_payload)
+            if warnings:
+                self._requirements_warnings.extend(warnings)
+                write_json(
+                    artifacts_dir / "requirements_final_requirements_repair_warnings.json",
+                    {"warnings": warnings},
+                )
+        return final_payload
 
     def _format_fix_requirements(
         self,
@@ -3279,11 +3386,11 @@ class RequirementsPipeline:
         missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
         if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-        max_attempts = 10
+        max_attempts = min(2, max(1, limits.add_only_max_rounds))
         while attempts < max_attempts and missing_count > 0:
-            batch_size = min(missing_count, 25)
+            batch_size = missing_count
             self._add_only_batch_size_used = batch_size
-            generate_count = batch_size
+            generate_count = missing_count
             attempts += 1
             requested_counts.append(generate_count)
             before_count = len(payload.get("requirements", []))
@@ -3336,6 +3443,7 @@ class RequirementsPipeline:
                 "missing_count_after": missing_count,
                 "missing_areas_after": missing_coverage,
                 "rounds_executed": attempts,
+                "count_strict": True,
             },
         )
         if missing_count > 0:
@@ -3348,6 +3456,7 @@ class RequirementsPipeline:
                     "per_area_counts_after": coverage_counts,
                     "balance_results": balance_results,
                     "max_rounds": max_attempts,
+                    "count_strict": True,
                     "rounds_executed": attempts,
                 }
             )
@@ -3557,7 +3666,7 @@ class RequirementsPipeline:
             if not isinstance(item, dict):
                 continue
             text = str(item.get("text", "")).strip()
-            match = re.match(r"^\[(.+?)\]\s+", text)
+            match = re.match(r"^\[(.+?)\] ", text)
             if not match or match.group(1).strip() not in limits.coverage_areas:
                 invalid.append(
                     {
@@ -3806,7 +3915,7 @@ class RequirementsPipeline:
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         }
         existing_texts = {
-            str(item.get("text", "")).strip().lower()
+            self._normalize_exact_text(str(item.get("text", "")))
             for item in merged["requirements"]
             if isinstance(item, dict)
         }
@@ -3821,7 +3930,6 @@ class RequirementsPipeline:
             if isinstance(item, dict):
                 item_id = item.get("id")
                 item_text = str(item.get("text", "")).strip()
-                normalized_text = item_text.lower()
                 fingerprint = self._semantic_fingerprint(item_text)
                 normalized_exact = self._normalize_exact_text(item_text)
                 if not ignore_ids and isinstance(item_id, str) and item_id in existing_ids:
@@ -3967,6 +4075,8 @@ class RequirementsPipeline:
             lead_max_tokens = summary.get("lead_max_output_tokens")
             apply_max_tokens = summary.get("apply_max_output_tokens")
             cli_max_tokens = summary.get("cli_max_output_tokens")
+            add_only_budget_tokens = summary.get("add_only_budget_max_output_tokens")
+            format_retry_budget_tokens = summary.get("format_retry_budget_max_output_tokens")
             add_only_max_tokens = summary.get("add_only_max_output_tokens")
             format_retry_max_tokens = summary.get("format_retry_max_output_tokens")
             effective_add_only_tokens = summary.get("effective_add_only_max_output_tokens")
@@ -4019,6 +4129,8 @@ class RequirementsPipeline:
             gemini_error_summary = summary.get("gemini_error_summary")
             cross_review_degraded = summary.get("cross_review_degraded")
             cross_review_parse_error = summary.get("cross_review_parse_error")
+            cross_review_provider_used = summary.get("cross_review_provider_used")
+            cross_review_provider_preference = summary.get("cross_review_provider_preference")
             lines.append(f"- target_min_items: {target_min_items}")
             if final_target_items is not None:
                 lines.append(f"- final_target_items: {final_target_items}")
@@ -4038,6 +4150,10 @@ class RequirementsPipeline:
                 lines.append(f"- apply_max_output_tokens: {apply_max_tokens}")
             if cli_max_tokens is not None:
                 lines.append(f"- cli_max_output_tokens: {cli_max_tokens}")
+            if add_only_budget_tokens is not None:
+                lines.append(f"- add_only_budget_max_output_tokens: {add_only_budget_tokens}")
+            if format_retry_budget_tokens is not None:
+                lines.append(f"- format_retry_budget_max_output_tokens: {format_retry_budget_tokens}")
             if add_only_max_tokens is not None:
                 lines.append(f"- add_only_max_output_tokens: {add_only_max_tokens}")
             if format_retry_max_tokens is not None:
@@ -4169,6 +4285,10 @@ class RequirementsPipeline:
                 lines.append(f"- gemini_cross_review_error: {gemini_cross_review_error}")
             if cross_review_parse_error:
                 lines.append(f"- cross_review_parse_error: {cross_review_parse_error}")
+            if cross_review_provider_preference:
+                lines.append(f"- cross_review_provider_preference: {cross_review_provider_preference}")
+            if cross_review_provider_used:
+                lines.append(f"- cross_review_provider_used: {cross_review_provider_used}")
             if gemini_final_review_used is not None:
                 lines.append(
                     f"- gemini_final_review_used: {'yes' if gemini_final_review_used else 'no'}"
@@ -5806,16 +5926,35 @@ class RequirementsPipeline:
         min_per_area = limits.min_per_area or 1
         if limits.coverage_areas:
             for area in limits.coverage_areas:
-                keywords = self._coverage_keywords_for_area(limits, area)
-                count = sum(
-                    1
-                    for item in req_items
-                    if isinstance(item, dict)
-                    and self._keyword_hits(str(item.get("text", "")), keywords) > 0
-                )
+                if limits.coverage_prefix_mode:
+                    count = sum(
+                        1
+                        for item in req_items
+                        if isinstance(item, dict)
+                        and str(item.get("text", "")).startswith(f"[{area}] ")
+                    )
+                else:
+                    keywords = self._coverage_keywords_for_area(limits, area)
+                    count = sum(
+                        1
+                        for item in req_items
+                        if isinstance(item, dict)
+                        and self._keyword_hits(str(item.get("text", "")), keywords) > 0
+                    )
                 coverage_counts[area] = count
                 if count < min_per_area:
                     missing_areas.append(area)
+            if limits.coverage_prefix_mode:
+                mapped = sum(coverage_counts.get(area, 0) for area in limits.coverage_areas)
+                unmapped_count = max(len([item for item in req_items if isinstance(item, dict)]) - mapped, 0)
+                coverage_counts["UNMAPPED"] = unmapped_count
+                if unmapped_count > 0:
+                    self._requirements_warnings.append(
+                        {
+                            "stage": "coverage_prefix",
+                            "note": f"UNMAPPED requirements detected: {unmapped_count}",
+                        }
+                    )
 
         missing_seeds: List[str] = []
         for seed in limits.seed_requirements:
@@ -6425,6 +6564,14 @@ class RequirementsPipeline:
             area: list(keywords)
             for area, keywords in self._DEFAULT_COVERAGE_KEYWORDS.items()
         }
+        cross_review_provider_raw = frontmatter.get("cross_review_provider", "auto")
+        if isinstance(cross_review_provider_raw, str):
+            cross_review_provider = cross_review_provider_raw.strip().lower()
+        else:
+            cross_review_provider = "auto"
+        if cross_review_provider not in {"gemini", "openai", "auto"}:
+            cross_review_provider = "auto"
+
         coverage_prefix_mode_raw = frontmatter.get("coverage_prefix_mode", False)
         if isinstance(coverage_prefix_mode_raw, str):
             coverage_prefix_mode = coverage_prefix_mode_raw.strip().lower() in {"1", "true", "yes"}
@@ -6482,6 +6629,7 @@ class RequirementsPipeline:
             artifact_token_budgets=artifact_token_budgets,
             lead_token_budgets=lead_token_budgets,
             apply_token_budgets=apply_token_budgets,
+            cross_review_provider=cross_review_provider,
         )
 
     def _limits_payload(self, limits: RequirementsLimits) -> Dict:
@@ -6500,6 +6648,7 @@ class RequirementsPipeline:
             "min_per_area": limits.min_per_area,
             "coverage_prefix_mode": limits.coverage_prefix_mode,
             "seed_requirements": limits.seed_requirements,
+            "cross_review_provider": limits.cross_review_provider,
         }
 
     def _metrics(self, requirements: Dict, limits: RequirementsLimits) -> Dict:
