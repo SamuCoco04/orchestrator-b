@@ -1002,6 +1002,16 @@ class RequirementsPipeline:
                     cli_cap = int(cli_cap_raw)
                 except (TypeError, ValueError):
                     cli_cap = None
+            token_cap_reason = "none"
+            if cli_cap is not None and cli_cap > 0:
+                if apply_tokens < apply_budget and apply_tokens < cli_cap:
+                    token_cap_reason = "effective capped by brief apply budget and CLI cap"
+                elif apply_tokens < apply_budget:
+                    token_cap_reason = "effective capped by CLI cap"
+                elif apply_tokens < cli_cap:
+                    token_cap_reason = "effective capped by brief apply budget"
+                else:
+                    token_cap_reason = "effective equals min(cli_cap, brief_apply_budget)"
             summary.update(
                 {
                     "gemini_cross_review_error": cross_review_error,
@@ -1065,6 +1075,7 @@ class RequirementsPipeline:
                         self._apply_format_retry_used or self._json_parse_repairs
                     ),
                     "cli_max_output_tokens": cli_cap,
+                    "token_cap_reason": token_cap_reason,
                     "add_only_max_output_tokens": add_only_tokens,
                     "format_retry_max_output_tokens": apply_tokens,
                     "assumptions_constraints_max_output_tokens": apply_tokens,
@@ -2511,7 +2522,7 @@ class RequirementsPipeline:
             "missing_count_before": missing_count_before,
             "missing_areas": missing_coverage,
             "per_area_counts": coverage_counts,
-            "effective_tokens": max_tokens,
+            "effective_max_tokens": max_tokens,
         }
         write_json(artifacts_dir / f"add_only_round_{attempt}_requested.json", requested_payload)
         retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
@@ -3386,11 +3397,27 @@ class RequirementsPipeline:
         missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
         if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-        max_attempts = min(2, max(1, limits.add_only_max_rounds))
+        default_batch_size = 12
+        if max_tokens <= 2400:
+            batch_size_hint = 11
+        elif max_tokens >= 4200:
+            batch_size_hint = 16
+        else:
+            batch_size_hint = default_batch_size
+        max_attempts = min(
+            30,
+            max(
+                1,
+                max(
+                    limits.add_only_max_rounds,
+                    2 + math.ceil(max(missing_count, 0) / max(batch_size_hint, 1)),
+                ),
+            ),
+        )
         while attempts < max_attempts and missing_count > 0:
-            batch_size = missing_count
+            batch_size = min(batch_size_hint, missing_count)
             self._add_only_batch_size_used = batch_size
-            generate_count = missing_count
+            generate_count = min(batch_size, missing_count)
             attempts += 1
             requested_counts.append(generate_count)
             before_count = len(payload.get("requirements", []))
@@ -4075,6 +4102,7 @@ class RequirementsPipeline:
             lead_max_tokens = summary.get("lead_max_output_tokens")
             apply_max_tokens = summary.get("apply_max_output_tokens")
             cli_max_tokens = summary.get("cli_max_output_tokens")
+            token_cap_reason = summary.get("token_cap_reason")
             add_only_budget_tokens = summary.get("add_only_budget_max_output_tokens")
             format_retry_budget_tokens = summary.get("format_retry_budget_max_output_tokens")
             add_only_max_tokens = summary.get("add_only_max_output_tokens")
@@ -4150,6 +4178,8 @@ class RequirementsPipeline:
                 lines.append(f"- apply_max_output_tokens: {apply_max_tokens}")
             if cli_max_tokens is not None:
                 lines.append(f"- cli_max_output_tokens: {cli_max_tokens}")
+            if token_cap_reason:
+                lines.append(f"- token_cap_reason: {token_cap_reason}")
             if add_only_budget_tokens is not None:
                 lines.append(f"- add_only_budget_max_output_tokens: {add_only_budget_tokens}")
             if format_retry_budget_tokens is not None:
