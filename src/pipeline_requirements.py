@@ -546,9 +546,9 @@ class RequirementsPipeline:
         if artifact == "requirements":
             write_json(artifacts_dir / "requirements_draft_normalized.json", draft_payload)
 
+        cross_template_default = read_text(self.prompts_dir / "requirements_cross_review.md")
         if artifact == "requirements":
-            cross_template = read_text(self.prompts_dir / "requirements_cross_review.md")
-            cross_review_prompt = self._render_prompt(cross_template, limits)
+            cross_review_prompt = self._render_prompt(cross_template_default, limits)
             cross_payload = {
                 "brief": brief,
                 "requirements": draft_payload,
@@ -574,8 +574,14 @@ class RequirementsPipeline:
         cross_response: LLMResponse | None = None
         for provider_name, provider_adapter in providers:
             response_error: str | None = None
+            provider_prompt = cross_full_prompt
+            if artifact == "requirements" and provider_name == "openai":
+                openai_template = read_text(self.prompts_dir / "requirements_cross_review_openai.md")
+                openai_prompt = self._render_prompt(openai_template, limits)
+                provider_prompt = f"{openai_prompt}\n\nINPUT:\n{json.dumps(cross_payload)}\n"
+                write_text(raw_dir / "requirements_cross_review_openai_prompt.txt", provider_prompt)
             try:
-                cross_response = self._complete(provider_adapter, cross_full_prompt, apply_tokens)
+                cross_response = self._complete(provider_adapter, provider_prompt, apply_tokens)
             except (GeminiUnavailableError, RuntimeError) as exc:
                 response_error = str(exc)
                 if provider_name == "gemini":
@@ -2360,13 +2366,19 @@ class RequirementsPipeline:
         per_area_counts = self._coverage_counts(payload, limits)
         missing_areas = self._missing_coverage_areas(payload, limits)
         req_missing = max(limits.req_min - len(payload.get("requirements", [])), 0)
-        coverage_missing = 0
-        if limits.min_per_area is not None:
-            for area in limits.coverage_areas:
-                area_count = per_area_counts.get(area, 0)
-                coverage_missing += max(limits.min_per_area - area_count, 0)
+        coverage_missing = sum(self._coverage_missing_by_area(per_area_counts, limits).values())
         missing_count = max(req_missing, coverage_missing)
         return missing_count, missing_areas, per_area_counts
+
+    def _coverage_missing_by_area(
+        self, per_area_counts: Dict[str, int], limits: RequirementsLimits
+    ) -> Dict[str, int]:
+        missing_by_area: Dict[str, int] = {}
+        if limits.min_per_area is None:
+            return missing_by_area
+        for area in limits.coverage_areas:
+            missing_by_area[area] = max(limits.min_per_area - per_area_counts.get(area, 0), 0)
+        return missing_by_area
 
     def _coverage_counts(self, payload: Dict, limits: RequirementsLimits) -> Dict[str, int]:
         counts: Dict[str, int] = {}
@@ -2470,6 +2482,7 @@ class RequirementsPipeline:
         generate_count: int,
         missing_count_before: int | None = None,
         batch_size: int | None = None,
+        target_areas: List[Dict[str, object]] | None = None,
     ) -> tuple[Dict, List[str], Dict[str, object], Dict[str, object]]:
         balance_results = self._balance_check(payload, limits)
         missing_coverage = self._missing_coverage_areas(payload, limits)
@@ -2523,6 +2536,7 @@ class RequirementsPipeline:
             "missing_areas": missing_coverage,
             "per_area_counts": coverage_counts,
             "effective_max_tokens": max_tokens,
+            "target_areas": target_areas or [],
         }
         write_json(artifacts_dir / f"add_only_round_{attempt}_requested.json", requested_payload)
         retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
@@ -2543,6 +2557,7 @@ class RequirementsPipeline:
             "existing_texts": existing_texts,
             "existing_fingerprints": existing_fingerprints,
             "gemini_review": gemini_review,
+            "target_areas": target_areas or [],
         }
         missing_balance_lines = [
             f"- {entry['target']}: {entry['missing']}"
@@ -2607,6 +2622,11 @@ class RequirementsPipeline:
             artifacts_dir / f"add_only_round_{attempt}_extracted.json",
             additions,
         )
+        merge_report = dict(merge_report)
+        merge_report["accepted_count"] = int(merge_report.get("accepted_count", 0))
+        merge_report["rejected_count"] = int(merge_report.get("rejected_count", 0))
+        merge_report["shortfall"] = max(generate_count - merge_report["accepted_count"], 0)
+        merge_report["invalid_prefix_count"] = int(merge_report.get("invalid_prefix_count", 0))
         write_json(
             artifacts_dir / f"add_only_round_{attempt}_merge_report.json",
             merge_report,
@@ -2702,6 +2722,7 @@ class RequirementsPipeline:
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
         max_retries = 2
+        max_add_only_n = 10 if max_tokens <= 2400 else 12
         existing_texts = {
             self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
@@ -2824,8 +2845,11 @@ class RequirementsPipeline:
             if not limits.coverage_prefix_mode:
                 valid_prefix_count = len(accepted)
             accepted_count = len(accepted)
-            if returned_count != generate_count:
-                rejected_reasons.append("incorrect_count")
+            shortfall = max(generate_count - accepted_count, 0)
+            if generate_count > max_add_only_n:
+                rejected_reasons.append("requested_count_exceeds_batch_cap")
+            if returned_count > generate_count:
+                rejected_reasons.append("returned_count_exceeds_generate_count")
             report = {
                 "requested_count": generate_count,
                 "parsed_count": parsed_count,
@@ -2836,6 +2860,8 @@ class RequirementsPipeline:
                 "rejected_reasons": rejected_reasons,
                 "shape": shape,
                 "count_strict_expected": generate_count,
+                "invalid_prefix_count": rejected_reasons.count("invalid_prefix"),
+                "shortfall": shortfall,
             }
             last_report = report
             write_json(
@@ -2843,21 +2869,12 @@ class RequirementsPipeline:
                 / f"add_only_round_{attempt}_attempt_{retry_index}_merge_report.json",
                 report,
             )
-            if format_failure:
+            if format_failure and retry_index <= max_retries:
                 consecutive_format_fail += 1
                 consecutive_low_count = 0
-                if consecutive_format_fail >= 2:
-                    snippet = response.raw_text.strip().replace("\n", " ")
-                    if len(snippet) > 200:
-                        snippet = snippet[:200] + "..."
-                    raise RuntimeError(
-                        "Add-only format invalid for consecutive retries. "
-                        f"Expected {generate_count}. effective_max_tokens={max_tokens}. "
-                        f"Shape: {shape}. Snippet: {snippet}"
-                    )
                 continue
             consecutive_format_fail = 0
-            if accepted_count != generate_count or returned_count != generate_count:
+            if returned_count > generate_count or accepted_count <= 0:
                 consecutive_low_count += 1
                 if consecutive_low_count >= 3:
                     snippet = response.raw_text.strip().replace("\n", " ")
@@ -2865,15 +2882,14 @@ class RequirementsPipeline:
                         snippet = snippet[:200] + "..."
                     raise RuntimeError(
                         "Add-only COUNT_STRICT failed after retries. "
-                        f"Expected exactly {generate_count}, got returned={returned_count}, accepted={accepted_count}. "
+                        f"Expected 1..{generate_count}, got returned={returned_count}, accepted={accepted_count}. "
                         f"effective_max_tokens={max_tokens}. Shape: {shape}. Snippet: {snippet}"
                     )
                 continue
             consecutive_low_count = 0
-            if not format_failure:
-                existing_texts.update(new_texts)
-                additions = {"requirements": accepted, "assumptions": [], "constraints": []}
-                return additions, report
+            existing_texts.update(new_texts)
+            additions = {"requirements": accepted, "assumptions": [], "constraints": []}
+            return additions, report
         if not last_report:
             last_report = {
                 "requested_count": generate_count,
@@ -2885,6 +2901,8 @@ class RequirementsPipeline:
                 "rejected_reasons": ["no_valid_response"],
                 "shape": "unknown",
                 "count_strict_expected": generate_count,
+                "invalid_prefix_count": 0,
+                "shortfall": generate_count,
             }
         additions = {"requirements": [], "assumptions": [], "constraints": []}
         return additions, last_report
@@ -3397,13 +3415,8 @@ class RequirementsPipeline:
         missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
         if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-        default_batch_size = 12
-        if max_tokens <= 2400:
-            batch_size_hint = 11
-        elif max_tokens >= 4200:
-            batch_size_hint = 16
-        else:
-            batch_size_hint = default_batch_size
+        max_add_only_n = 10 if max_tokens <= 2400 else 12
+        batch_size_hint = max_add_only_n
         max_attempts = min(
             30,
             max(
@@ -3415,9 +3428,42 @@ class RequirementsPipeline:
             ),
         )
         while attempts < max_attempts and missing_count > 0:
-            batch_size = min(batch_size_hint, missing_count)
+            req_missing = max(limits.req_min - len(payload.get("requirements", [])), 0)
+            coverage_missing_by_area = self._coverage_missing_by_area(coverage_counts, limits)
+            coverage_missing_total = sum(coverage_missing_by_area.values())
+            priority_missing = coverage_missing_total if coverage_missing_total > 0 else req_missing
+            batch_size = min(batch_size_hint, priority_missing if priority_missing > 0 else missing_count)
             self._add_only_batch_size_used = batch_size
-            generate_count = min(batch_size, missing_count)
+            generate_count = min(batch_size, missing_count, max_add_only_n)
+            ranked_areas = sorted(
+                (
+                    {"area": area, "add": need}
+                    for area, need in coverage_missing_by_area.items()
+                    if need > 0
+                ),
+                key=lambda item: int(item["add"]),
+                reverse=True,
+            )
+            chosen_target_areas: List[Dict[str, object]] = []
+            if ranked_areas:
+                remaining = generate_count
+                for entry in ranked_areas[:3]:
+                    if remaining <= 0:
+                        break
+                    add = min(int(entry["add"]), remaining)
+                    if add > 0:
+                        chosen_target_areas.append({"area": entry["area"], "add": add})
+                        remaining -= add
+            write_json(
+                artifacts_dir / f"add_only_round_{attempts + 1}_plan.json",
+                {
+                    "overall_missing": req_missing,
+                    "coverage_missing_by_area": coverage_missing_by_area,
+                    "chosen_target_areas": chosen_target_areas,
+                    "requested_N": generate_count,
+                    "max_tokens_effective": max_tokens,
+                },
+            )
             attempts += 1
             requested_counts.append(generate_count)
             before_count = len(payload.get("requirements", []))
@@ -3439,6 +3485,7 @@ class RequirementsPipeline:
                 generate_count=generate_count,
                 missing_count_before=missing_count,
                 batch_size=batch_size,
+                target_areas=chosen_target_areas,
             )
             missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
             after_count = len(payload.get("requirements", []))
@@ -3471,6 +3518,20 @@ class RequirementsPipeline:
                 "missing_areas_after": missing_coverage,
                 "rounds_executed": attempts,
                 "count_strict": True,
+            },
+        )
+        write_json(
+            artifacts_dir / "add_only_final_state.json",
+            {
+                "final_overall_count": len(payload.get("requirements", [])),
+                "target_min_items": limits.req_min,
+                "per_area_counts": coverage_counts,
+                "unmet_areas": [
+                    area
+                    for area, need in self._coverage_missing_by_area(coverage_counts, limits).items()
+                    if need > 0
+                ],
+                "rounds_executed": attempts,
             },
         )
         if missing_count > 0:
