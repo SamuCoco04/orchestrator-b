@@ -1,5 +1,6 @@
 OUTPUT STRICT JSON ONLY. NO MARKDOWN. NO PROSE.
 
+You are a critic reviewer for requirements quality and coverage.
 Review the provided requirements against the brief.
 
 Return EXACTLY one JSON object with this shape and these keys only:
