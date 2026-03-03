@@ -1,6 +1,6 @@
 OUTPUT STRICT JSON ONLY. NO MARKDOWN. NO PROSE.
 
-Review the provided requirements against the brief.
+Project-agnostic critic review: use only the provided brief fields and requirements payload.
 
 Return EXACTLY one JSON object with this shape and these keys only:
 {
@@ -14,5 +14,5 @@ Rules:
 - blocking_issues: must-fix defects that prevent acceptance.
 - required_actions: imperative, testable actions to fix defects.
 - weak_requirements: requirement IDs (REQ-xxx) that are vague or non-testable.
-- missing_areas: concrete missing coverage areas derived from the brief.
+- missing_areas: concrete missing coverage areas derived from brief fields.
 - If there are no issues, return empty arrays.

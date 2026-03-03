@@ -26,6 +26,9 @@ class RequirementsFormatError(ValueError):
     pass
 
 
+MAX_ADD_ONLY_BATCH_SMALL = 10
+MAX_TOKEN_THRESHOLD = 2400
+
 def parse_json_loose(text: str) -> Dict:
     parsed, repairs = _parse_json_loose_with_repairs(text)
     parse_json_loose.last_repairs = repairs
@@ -627,6 +630,7 @@ class RequirementsPipeline:
             write_json(artifacts_dir / "requirements_gemini_review.json", cross_review)
             self._gemini_review_present = True
             self._cross_review_provider_used = provider_name
+            write_text(artifacts_dir / "requirements_cross_review_provider.txt", f"{provider_name}\n")
             if provider_name == "gemini":
                 self._gemini_review_used = True
             break
@@ -635,6 +639,7 @@ class RequirementsPipeline:
             cross_review = self._fallback_review(draft_payload, limits)
             cross_review_skipped = True
             self._cross_review_provider_used = "none"
+            write_text(artifacts_dir / "requirements_cross_review_provider.txt", "none\n")
             write_json(
                 artifacts_dir / "requirements_cross_review_failed.json",
                 {
@@ -794,6 +799,15 @@ class RequirementsPipeline:
                 artifacts_dir,
                 stage="apply",
             )
+            if apply_report is None:
+                apply_report = self._retry_missing_apply_report(
+                    brief=brief,
+                    final_payload=final_payload,
+                    adapter=chatgpt,
+                    raw_dir=raw_dir,
+                    artifacts_dir=artifacts_dir,
+                    max_tokens=apply_tokens,
+                )
             try:
                 changelog = self._extract_wrapped_json(
                     apply_response.raw_text,
@@ -2722,7 +2736,7 @@ class RequirementsPipeline:
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
         max_retries = 2
-        max_add_only_n = 10 if max_tokens <= 2400 else 12
+        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if max_tokens <= MAX_TOKEN_THRESHOLD else 12
         existing_texts = {
             self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
@@ -2780,6 +2794,10 @@ class RequirementsPipeline:
                 self._add_only_completion_tokens.append(completion_tokens)
             write_text(
                 raw_dir / f"add_only_round_{attempt}_attempt_{retry_index}_raw.txt",
+                response.raw_text,
+            )
+            write_text(
+                artifacts_dir / f"add_only_round_{attempt}_raw.txt",
                 response.raw_text,
             )
             self._write_usage(
@@ -2930,6 +2948,40 @@ class RequirementsPipeline:
         if len(snippet) > 200:
             snippet = snippet[:200] + "..."
         return [], "unexpected_type", f"unexpected_type: {snippet}"
+
+    def _retry_missing_apply_report(
+        self,
+        brief: str,
+        final_payload: Dict,
+        adapter: LLMAdapter,
+        raw_dir: Path,
+        artifacts_dir: Path,
+        max_tokens: int,
+    ) -> Dict | None:
+        retry_prompt = (
+            "Return STRICT JSON ONLY with EXACTLY two top-level keys: "
+            "FINAL_REQUIREMENTS_JSON and APPLY_REPORT_JSON. "
+            "Do not change requirement semantics. "
+            "APPLY_REPORT_JSON must include applied_actions and unapplied_actions arrays."
+        )
+        retry_payload = {"brief": brief, "FINAL_REQUIREMENTS_JSON": final_payload}
+        full_prompt = f"{retry_prompt}\n\nINPUT:\n{json.dumps(retry_payload)}\n"
+        write_text(raw_dir / "requirements_apply_report_format_retry_prompt.txt", full_prompt)
+        response = self._complete(adapter, full_prompt, max_tokens)
+        write_text(raw_dir / "requirements_apply_report_format_retry_raw.txt", response.raw_text)
+        self._write_usage(raw_dir / "requirements_apply_report_format_retry_usage.json", response)
+        write_text(artifacts_dir / "requirements_apply_report_format_retry_raw.txt", response.raw_text)
+        report = self._extract_apply_report(
+            response.raw_text,
+            artifacts_dir,
+            stage="apply_format_retry",
+        )
+        if report is not None:
+            write_json(
+                artifacts_dir / "requirements_apply_report_format_retry_extracted.json",
+                report,
+            )
+        return report
 
     def _format_retry_requirements(
         self,
@@ -3415,7 +3467,7 @@ class RequirementsPipeline:
         missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
         if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-        max_add_only_n = 10 if max_tokens <= 2400 else 12
+        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if max_tokens <= MAX_TOKEN_THRESHOLD else 12
         batch_size_hint = max_add_only_n
         max_attempts = min(
             30,
@@ -3423,7 +3475,7 @@ class RequirementsPipeline:
                 1,
                 max(
                     limits.add_only_max_rounds,
-                    2 + math.ceil(max(missing_count, 0) / max(batch_size_hint, 1)),
+                    3 * math.ceil(max(missing_count, 0) / max(batch_size_hint, 1)),
                 ),
             ),
         )
