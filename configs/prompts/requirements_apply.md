@@ -23,4 +23,4 @@ Rules:
 - assumptions and constraints must be arrays of strings.
 - applied_actions[].action should exactly match required_actions entries when present.
 - applied_actions[].evidence must cite final REQ IDs.
-- Output valid JSON only.
+- Output valid JSON only (single object, no markdown/prose).

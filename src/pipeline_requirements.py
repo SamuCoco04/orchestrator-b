@@ -450,6 +450,19 @@ class RequirementsPipeline:
             else:
                 os.environ["ORCH_MAX_OUTPUT_TOKENS"] = original
 
+    def _get_cross_review_adapter(
+        self,
+        provider: str,
+        openai_adapter: LLMAdapter,
+        gemini_adapter: LLMAdapter,
+    ) -> List[tuple[str, LLMAdapter]]:
+        selected = provider.strip().lower() if isinstance(provider, str) else "openai"
+        if selected == "gemini":
+            return [("gemini", gemini_adapter)]
+        if selected == "auto":
+            return [("gemini", gemini_adapter), ("openai", openai_adapter)]
+        return [("openai", openai_adapter)]
+
     def _run_single_artifact(
         self,
         artifact: str,
@@ -567,12 +580,11 @@ class RequirementsPipeline:
         cross_review_parse_error: str | None = None
         cross_review: Dict = {}
         cross_provider_preference = limits.cross_review_provider if artifact == "requirements" else "gemini"
-        if cross_provider_preference == "openai":
-            providers = [("openai", chatgpt)]
-        elif cross_provider_preference == "gemini":
-            providers = [("gemini", gemini)]
-        else:
-            providers = [("gemini", gemini), ("openai", chatgpt)]
+        providers = self._get_cross_review_adapter(
+            cross_provider_preference,
+            openai_adapter=chatgpt,
+            gemini_adapter=gemini,
+        )
 
         cross_response: LLMResponse | None = None
         for provider_name, provider_adapter in providers:
@@ -2532,15 +2544,15 @@ class RequirementsPipeline:
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         ]
-        existing_texts = [
+        existing_texts_full = [
             str(item.get("text", ""))[:120]
             for item in payload.get("requirements", [])
             if isinstance(item, dict)
         ]
+        existing_texts = existing_texts_full[-15:]
         existing_fingerprints = [
-            self._semantic_fingerprint(str(item.get("text", "")))
-            for item in payload.get("requirements", [])
-            if isinstance(item, dict)
+            self._semantic_fingerprint(text)
+            for text in existing_texts
         ]
         requested_payload = {
             "requested_count": generate_count,
@@ -2556,7 +2568,6 @@ class RequirementsPipeline:
         retry_prompt = read_text(self.prompts_dir / "requirements_add_only.md")
         retry_payload = {
             "brief": brief,
-            "current_requirements": payload,
             "targets": self._requirements_targets_payload(limits),
             "missing_count": max(limits.req_min - len(payload.get("requirements", [])), 0),
             "generate_count": generate_count,
@@ -2607,7 +2618,7 @@ class RequirementsPipeline:
             f"Missing coverage areas: {missing_coverage_summary}\n"
             f"Missing balance targets:\n{missing_balance_summary}\n"
             f"Out-of-scope items (do NOT include): {out_of_scope_summary}\n"
-            f"Generate EXACTLY {generate_count} new requirements.\n"
+            f"RETURN AT LEAST {max(1, generate_count)} and AT MOST {generate_count + 2} new requirements.\n"
             "Each new requirement must mention a concrete actor "
             "(Student/Coordinator/Admin/System) and reference a domain object "
             "(procedure/document/deadline/exception/approval/signature/mobility/"
@@ -2718,6 +2729,11 @@ class RequirementsPipeline:
         write_json(
             artifacts_dir / f"requirements_add_only_warnings_{attempt}.json",
             {"warnings": attempt_warnings},
+        )
+        merge_report["missing_count_after"] = max(limits.req_min - len(payload.get("requirements", [])), 0)
+        write_json(
+            artifacts_dir / f"add_only_round_{attempt}_merge_report.json",
+            merge_report,
         )
         return payload, missing_coverage, balance_results, merge_report
 
@@ -6707,13 +6723,13 @@ class RequirementsPipeline:
             area: list(keywords)
             for area, keywords in self._DEFAULT_COVERAGE_KEYWORDS.items()
         }
-        cross_review_provider_raw = frontmatter.get("cross_review_provider", "auto")
+        cross_review_provider_raw = frontmatter.get("cross_review_provider", "openai")
         if isinstance(cross_review_provider_raw, str):
             cross_review_provider = cross_review_provider_raw.strip().lower()
         else:
-            cross_review_provider = "auto"
+            cross_review_provider = "openai"
         if cross_review_provider not in {"gemini", "openai", "auto"}:
-            cross_review_provider = "auto"
+            cross_review_provider = "openai"
 
         coverage_prefix_mode_raw = frontmatter.get("coverage_prefix_mode", False)
         if isinstance(coverage_prefix_mode_raw, str):

@@ -1,6 +1,6 @@
 OUTPUT STRICT JSON ONLY. NO MARKDOWN. NO PROSE.
 
-Project-agnostic critic review: use only the provided brief fields and requirements payload.
+Project-agnostic critic review: use ONLY provided brief fields and requirements payload.
 
 Return EXACTLY one JSON object with this shape and these keys only:
 {
