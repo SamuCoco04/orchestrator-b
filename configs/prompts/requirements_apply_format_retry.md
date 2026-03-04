@@ -1,13 +1,18 @@
-Wrap the existing content into FINAL_REQUIREMENTS_JSON with requirements:[...], assumptions:[...], constraints:[...].
+Return STRICT JSON ONLY. No markdown, no prose.
 
-Return a SINGLE JSON object (no markdown, no commentary) with this wrapper shape:
-{ "FINAL_REQUIREMENTS_JSON": {"requirements":[],"assumptions":[],"constraints":[]} }
+You are repairing malformed apply output.
+Return exactly one JSON object with this shape:
+{
+  "FINAL_REQUIREMENTS_JSON": {
+    "requirements": [],
+    "assumptions": [],
+    "constraints": []
+  }
+}
 
 Rules:
-- Output MUST be a SINGLE JSON object (no markdown fences, no commentary).
-- JSON must be strictly valid (double quotes, no trailing commas).
-- Re-emit the same requirements, assumptions, and constraints content.
-- Do NOT add new requirements or edit meaning unless required to fit the schema.
-- Output ONLY JSON, no extra keys.
-
-Input includes: brief and the previous apply_raw text.
+- Preserve requirement meaning from input.
+- Ensure requirements is an array of requirement objects.
+- Ensure assumptions has at least 3 items.
+- Ensure constraints has at least 3 items.
+- Output valid JSON only.
