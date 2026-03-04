@@ -35,7 +35,7 @@ class OpenAIAdapter(LLMAdapter):
                 if max_tokens is not None:
                     request_params["max_tokens"] = max_tokens
                 response = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model="gpt-5.1",
                     **request_params,
                 )
                 content = response.choices[0].message.content
@@ -49,7 +49,7 @@ class OpenAIAdapter(LLMAdapter):
                         "total_tokens": getattr(usage, "total_tokens", None),
                     }
                     print(
-                        "[openai] model=gpt-4o-mini "
+                        "[openai] model=gpt-5.1 "
                         f"prompt_tokens={usage_payload['prompt_tokens']} "
                         f"completion_tokens={usage_payload['completion_tokens']} "
                         f"total_tokens={usage_payload['total_tokens']}"
