@@ -1,0 +1,5 @@
+- Force-openai cross-review path now writes provider artifact and run summary provider line.
+- Add-only now uses conservative token-threshold batch constants and per-round shortfall re-request behavior.
+- Apply-report missing case now triggers targeted format-retry for FINAL_REQUIREMENTS_JSON + APPLY_REPORT_JSON wrapper.
+- Default requirements cross_review_provider is now openai; auto still supports gemini->openai fallback.
+- Add-only prompt context reduced (no full requirements payload; compact IDs/counts/recent texts only) with bounded per-round target range.
