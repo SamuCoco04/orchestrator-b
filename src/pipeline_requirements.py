@@ -3523,16 +3523,7 @@ class RequirementsPipeline:
             env_cap = None
         max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if (env_cap is not None and env_cap <= MAX_TOKEN_THRESHOLD) else 12
         batch_size_hint = max_add_only_n
-        max_attempts = min(
-            30,
-            max(
-                1,
-                max(
-                    limits.add_only_max_rounds,
-                    3 * math.ceil(max(missing_count, 0) / max(batch_size_hint, 1)),
-                ),
-            ),
-        )
+        max_attempts = 30
         while attempts < max_attempts and missing_count > 0:
             req_missing = max(limits.req_min - len(payload.get("requirements", [])), 0)
             coverage_missing_by_area = self._coverage_missing_by_area(coverage_counts, limits)
