@@ -2752,7 +2752,12 @@ class RequirementsPipeline:
         max_tokens: int,
     ) -> tuple[Dict, Dict]:
         max_retries = 2
-        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if max_tokens <= MAX_TOKEN_THRESHOLD else 12
+        cap_raw = self._env("ORCH_MAX_OUTPUT_TOKENS", "")
+        try:
+            env_cap = int(cap_raw) if isinstance(cap_raw, str) and cap_raw.strip() else None
+        except (TypeError, ValueError):
+            env_cap = None
+        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if (env_cap is not None and env_cap <= MAX_TOKEN_THRESHOLD) else 12
         existing_texts = {
             self._normalize_exact_text(str(item.get("text", "")))
             for item in payload.get("requirements", [])
@@ -2769,8 +2774,8 @@ class RequirementsPipeline:
             strict_note = ""
             if strict:
                 strict_note = (
-                    "\nCOUNT_STRICT: Output exactly generate_count items. "
-                    "If you output fewer or more, you fail. No prose."
+                    "\nCOUNT_STRICT: Output 1..generate_count items and never exceed generate_count. "
+                    f"Max allowed is {max_add_only_n}. No prose."
                 )
             if limits.coverage_prefix_mode:
                 strict_note += (
@@ -2879,11 +2884,37 @@ class RequirementsPipeline:
             if not limits.coverage_prefix_mode:
                 valid_prefix_count = len(accepted)
             accepted_count = len(accepted)
+            truncated = False
+            truncation_detail: Dict[str, int] | None = None
+            if returned_count > generate_count:
+                truncated = True
+                accepted = accepted[:generate_count]
+                accepted_count = len(accepted)
+                truncation_detail = {"returned": returned_count, "kept": generate_count}
+                snippet = response.raw_text.strip().replace("\n", " ")
+                if len(snippet) > 240:
+                    snippet = snippet[:240] + "..."
+                write_json(
+                    artifacts_dir / "add_only_truncation_warning.json",
+                    {
+                        "attempt": attempt,
+                        "retry": retry_index,
+                        "returned": returned_count,
+                        "kept": generate_count,
+                        "snippet": snippet,
+                    },
+                )
+                self._requirements_warnings.append(
+                    {
+                        "stage": "add_only",
+                        "note": "Model returned more items than requested; truncated.",
+                        "returned": returned_count,
+                        "kept": generate_count,
+                    }
+                )
             shortfall = max(generate_count - accepted_count, 0)
             if generate_count > max_add_only_n:
                 rejected_reasons.append("requested_count_exceeds_batch_cap")
-            if returned_count > generate_count:
-                rejected_reasons.append("returned_count_exceeds_generate_count")
             report = {
                 "requested_count": generate_count,
                 "parsed_count": parsed_count,
@@ -2896,6 +2927,8 @@ class RequirementsPipeline:
                 "count_strict_expected": generate_count,
                 "invalid_prefix_count": rejected_reasons.count("invalid_prefix"),
                 "shortfall": shortfall,
+                "truncated": truncated,
+                "truncation": truncation_detail,
             }
             last_report = report
             write_json(
@@ -2908,7 +2941,7 @@ class RequirementsPipeline:
                 consecutive_low_count = 0
                 continue
             consecutive_format_fail = 0
-            if returned_count > generate_count or accepted_count <= 0:
+            if accepted_count <= 0:
                 consecutive_low_count += 1
                 if consecutive_low_count >= 3:
                     snippet = response.raw_text.strip().replace("\n", " ")
@@ -3483,7 +3516,12 @@ class RequirementsPipeline:
         missing_count, missing_coverage, coverage_counts = self._add_only_missing_state(payload, limits)
         if missing_count <= 0:
             return payload, missing_coverage, attempts, balance_results, requested_counts, round_counts
-        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if max_tokens <= MAX_TOKEN_THRESHOLD else 12
+        cap_raw = self._env("ORCH_MAX_OUTPUT_TOKENS", "")
+        try:
+            env_cap = int(cap_raw) if isinstance(cap_raw, str) and cap_raw.strip() else None
+        except (TypeError, ValueError):
+            env_cap = None
+        max_add_only_n = MAX_ADD_ONLY_BATCH_SMALL if (env_cap is not None and env_cap <= MAX_TOKEN_THRESHOLD) else 12
         batch_size_hint = max_add_only_n
         max_attempts = min(
             30,
